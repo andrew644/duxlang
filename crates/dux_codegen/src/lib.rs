@@ -408,6 +408,10 @@ fn statement_name(stmt: &Stmt) -> &'static str {
         Stmt::Continue { .. } => "`continue`",
         Stmt::Defer { .. } => "`defer`",
         Stmt::Block { .. } => "a nested block",
+        Stmt::If { .. } => "an `if`",
+        Stmt::While { .. } => "a `while`",
+        Stmt::Loop { .. } => "a `loop`",
+        Stmt::For { .. } => "a `for`",
         Stmt::Error { .. } => "an erroneous statement",
     }
 }

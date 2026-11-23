@@ -12,6 +12,13 @@ impl Ident {
     }
 }
 
+/// One piece of a `$".."` literal.
+#[derive(Clone, Debug, PartialEq)]
+pub enum InterpolationPart {
+    Text(String),
+    Hole { written: Option<Expr>, span: Span },
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum StrKind {
     Utf8,
@@ -171,6 +178,34 @@ pub enum Expr {
         fields: Vec<(Ident, Expr)>,
         span: Span,
     },
+    /// The condition of `if P := e` / `while P := e`: a pattern matched against
+    /// a value, binding on success. The pattern is kept as an expression until
+    /// the checker gives it a real pattern representation (M4).
+    CondBinding {
+        pattern: Box<Expr>,
+        value: Box<Expr>,
+        span: Span,
+    },
+    /// A `$".."` literal broken into literal text and holes. A hole with no
+    /// written expression (`{}`) takes its value from the trailing arguments of
+    /// the call it is passed to, in order (README rule 10).
+    InterpString {
+        parts: Vec<InterpolationPart>,
+        span: Span,
+    },
+    If {
+        cond: Box<Expr>,
+        then_arm: Box<Expr>,
+        else_arm: Option<Box<Expr>>,
+        span: Span,
+    },
+    /// A block used where a value is expected; its value is the block's last
+    /// expression statement.
+    Block {
+        block: Block,
+        value: Box<Expr>,
+        span: Span,
+    },
     Unary { op: UnaryOp, operand: Box<Expr>, span: Span },
     Binary { op: BinaryOp, lhs: Box<Expr>, rhs: Box<Expr>, span: Span },
     Cast { value: Box<Expr>, target: Type, span: Span },
@@ -196,6 +231,10 @@ impl Expr {
             | Expr::RepeatedArray { span, .. }
             | Expr::Path { span, .. }
             | Expr::StructLiteral { span, .. }
+            | Expr::InterpString { span, .. }
+            | Expr::CondBinding { span, .. }
+            | Expr::If { span, .. }
+            | Expr::Block { span, .. }
             | Expr::Unary { span, .. }
             | Expr::Binary { span, .. }
             | Expr::Cast { span, .. }
@@ -241,8 +280,45 @@ pub enum Stmt {
         block: Block,
         span: Span,
     },
+    If {
+        cond: Expr,
+        then_branch: Block,
+        else_branch: Option<Box<Stmt>>,
+        span: Span,
+    },
+    While {
+        cond: Expr,
+        body: Block,
+        span: Span,
+    },
+    Loop {
+        body: Block,
+        span: Span,
+    },
+    For {
+        kind: ForKind,
+        body: Block,
+        span: Span,
+    },
     Error {
         span: Span,
+    },
+}
+
+/// `for` has three shapes that share a body: the C-style three clause form
+/// (comma separated, `fizzbuzz.dux`), iteration over values or index+value, and
+/// a bare `for { }` which is an infinite loop.
+#[derive(Clone, Debug, PartialEq)]
+pub enum ForKind {
+    ThreeClause {
+        init: Box<Stmt>,
+        cond: Expr,
+        step: Box<Stmt>,
+    },
+    In {
+        index: Option<Ident>,
+        value: Ident,
+        iterable: Expr,
     },
 }
 
@@ -257,6 +333,10 @@ impl Stmt {
             | Stmt::Continue { span }
             | Stmt::Defer { span, .. }
             | Stmt::Block { span, .. }
+            | Stmt::If { span, .. }
+            | Stmt::While { span, .. }
+            | Stmt::Loop { span, .. }
+            | Stmt::For { span, .. }
             | Stmt::Error { span } => *span,
         }
     }

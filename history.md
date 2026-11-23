@@ -213,3 +213,32 @@ Two rules the examples forced into the open:
 Permanent new gates: `every_example_parses_so_the_review_samples_stay_the_target_surface`,
 plus 11 new parser unit tests. `E0007` is now explicitly documented as "valid Dux, not yet
 implemented — a milestone gap, never a syntax verdict".
+
+
+## Session 5 — control flow and interpolation reach the AST
+
+Parser work, no codegen yet. 75 tests pass, clippy clean, every example still parses with zero
+syntax errors.
+
+New AST: `Stmt::If` / `While` / `Loop` / `For{ForKind::ThreeClause|In}`, `Expr::If` (value
+position, `else` mandatory), `Expr::Block` (block as a value), `Expr::CondBinding` for
+`if P := e` / `while P := e` (design D27 — the pattern stays an expression until the checker owns
+patterns at M4), and `Expr::InterpString { parts }` with `InterpolationPart::{Text, Hole}`.
+
+- **Holes are parsed out of the same file.** `dux_lexer::lex_range` lexes a byte range and keeps
+  spans absolute, so `println($"i={i}")` produces an expression whose span points at `i` in the
+  original line and a diagnostic there lands on the right column. A hole with nothing written
+  (`{}`) is *not* parsed — it means "take the next trailing argument", which is what
+  `println($"{} has {} letters", name, n)` relies on.
+- **A struct value cannot start inside a control-flow head** (`in_condition` depth):
+  `if ready { .. }` must not read `ready { .. }`, and `while Some(node) := cursor { .. }` would
+  otherwise read `cursor { .. }` as the value of the pattern condition.
+- **`for` has three heads and they are told apart without consuming anything**: `for_head_shape`
+  scans for an assignment before the first top-level `,` — that separates
+  `for i := 1, i <= 100, i += 1` from `for i, v in xs`; `for { }` is the same statement as
+  `loop { }`. The init and step of the three clause form are *statements* (`Stmt::Binding` /
+  `Stmt::Assign`), not expressions.
+- `match` is now the only control-flow form that reports `E0007`.
+
+Fixed while writing the tests: an early `for_clauses` treated `for i, v in xs` as three-clause,
+and a pattern condition's value was parsed outside the no-struct-literal guard.

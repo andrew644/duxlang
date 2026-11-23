@@ -303,6 +303,7 @@ impl Lexed {
 
 struct Lexer<'a> {
     file: FileId,
+    base: u32,
     text: &'a str,
     bytes: &'a [u8],
     cursor: usize,
@@ -313,8 +314,21 @@ struct Lexer<'a> {
 
 pub fn lex(sources: &SourceMap, file: FileId) -> Lexed {
     let text = sources.text_of(file);
+    lex_range(sources, file, 0, text.len())
+}
+
+/// Lex a byte range of a file, keeping every span absolute. String
+/// interpolation uses this to read the expression inside `{..}` without ever
+/// copying it into a second file, so a diagnostic in a hole still points at the
+/// line the reader wrote.
+pub fn lex_range(sources: &SourceMap, file: FileId, from: usize, to: usize) -> Lexed {
+    let full = sources.text_of(file);
+    let from = from.min(full.len());
+    let to = to.clamp(from, full.len());
+    let text = &full[from..to];
     let mut lexer = Lexer {
         file,
+        base: from as u32,
         text,
         bytes: text.as_bytes(),
         cursor: 0,
@@ -709,7 +723,11 @@ impl<'a> Lexer<'a> {
     fn diagnostic(&mut self, code: &'static str, message: impl Into<String>, start: usize) {
         self.diagnostics.push(
             Diagnostic::error(code, message)
-                .with_span(Span::new(self.file, start as u32, (self.cursor - start) as u32)),
+                .with_span(Span::new(
+                    self.file,
+                    self.base + start as u32,
+                    (self.cursor - start) as u32,
+                )),
         );
     }
 
@@ -750,7 +768,11 @@ impl<'a> Lexer<'a> {
     fn push(&mut self, kind: TokenKind, start: usize, literal: Option<Literal>) {
         self.tokens.push(Token {
             kind,
-            span: Span::new(self.file, start as u32, (self.cursor - start) as u32),
+            span: Span::new(
+                self.file,
+                self.base + start as u32,
+                (self.cursor - start) as u32,
+            ),
             literal,
             newline_before: std::mem::take(&mut self.newline_before),
         });
@@ -957,6 +979,30 @@ mod tests {
         let lexed = lex(&sources, file);
         assert_eq!(lexed.tokens[0].literal, Some(Literal::Char('0')));
         assert_eq!(lexed.tokens[1].literal, Some(Literal::Char('é')));
+    }
+
+    #[test]
+    fn lexing_a_range_keeps_spans_absolute() {
+        let text = "println(\"a{x + 1}\")";
+        let mut sources = SourceMap::new();
+        let file = sources.add("t.dux", text);
+        let inner = lex_range(&sources, file, 11, 16);
+        let kinds: Vec<(String, u32, u32)> = inner
+            .tokens
+            .iter()
+            .map(|t| (t.kind.describe(), t.span.start, t.span.len))
+            .collect();
+        let expected: Vec<(String, u32, u32)> = [
+            ("identifier", 11, 1),
+            ("`+`", 13, 1),
+            ("integer literal", 15, 1),
+            ("end of input", 16, 0),
+        ]
+        .into_iter()
+        .map(|(kind, start, len)| (kind.to_string(), start, len))
+        .collect();
+        assert_eq!(kinds, expected);
+        assert_eq!(inner.tokens[0].text(&sources), "x");
     }
 
     #[test]
