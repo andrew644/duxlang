@@ -1,0 +1,54 @@
+package main
+
+fn main() {
+    // C-style for: init, condition, step, comma separated (fizzbuzz.dux).
+    for i := 1, i <= 3, i += 1 {
+        println($"i={i}")
+    }
+
+    x: i32 = 0
+    while x < 3 {
+        x += 1
+    }
+
+    for v in [10, 20, 30] {                   // values
+        print($"{v} ")
+    }
+    println("")
+    for i, v in [10, 20, 30] {                // index + value
+        print($"[{i}]={v} ")
+    }
+    println("")
+    for _ in 0..3 {                           // half-open range
+        print("tick ")
+    }
+    println("")
+    for _ in 0..=2 {                          // inclusive range
+        print("tock ")
+    }
+    println("")
+
+    for {                                    // infinite; break / continue bind to it
+        x += 1
+        if x >= 5 {
+            break
+        }
+    }
+    println($"x={x}")
+
+    // if / match are expressions in value position; the else arm is mandatory
+    // there, and every arm must produce the same type.
+    label := if x % 2 == 0 { "even" } else { "odd" }
+    size := match x {
+        0..=4 => "small",
+        5..=8 => "medium",
+        _     => "large",
+    }
+    println($"{label} {size}")
+
+    // defer: LIFO at the end of the enclosing block, arguments captured at the
+    // defer statement, and skipped entirely by panic() -- there is no unwinding.
+    defer println("runs second")
+    defer println("runs first")
+    println("body")
+}

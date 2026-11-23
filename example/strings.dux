@@ -1,0 +1,38 @@
+package main
+
+import "std/fmt"
+
+// `string` is an immutable UTF-8 view: { data: *u8, len: usize }, no NUL.
+// Concatenation allocates, so it uses `context`'s allocator (see memory.dux).
+
+fn describe(name: string, bytes: usize) -> string {
+    return $"{name} is {bytes} bytes"     // captured from scope
+}
+
+fn main() {
+    let name = "dux"
+    let n: i64 = 4
+
+    println($"{} has {} letters", name, n)   // positional holes
+    println($"{name} has {n} letters")       // holes filled from scope
+    println(describe(name, name.len()))
+
+    let path = "/usr/" + name               // allocates with the context allocator
+    let head = path[0..4]                   // byte slicing, panics if out of range
+    let raw = r"C:\dux\std"                  // raw: no escapes, no interpolation
+    let escaped = "tab:\t quote:\" brace:$"  // `$` alone is literal; `$"..."` interpolates
+    let cstr = c"to the C boundary"          // NUL-terminated, `*c_char` compatible
+
+    for b in path.bytes() {                  // bytes: u8
+        print($"{b} ")
+    }
+    println("")
+    for r in "héllo".runes() {               // runes: unicode code points
+        print($"{r}")
+    }
+    println("")
+
+    println($"path={} head={} raw={} escaped={} cstr_len={}",
+            path, head, raw, escaped, cstr.len())
+    fmt.println("std/fmt also exports println, for when you want the import")
+}

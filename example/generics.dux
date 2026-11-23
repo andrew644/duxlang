@@ -1,0 +1,59 @@
+package main
+
+// Monomorphisation only. The body is type-checked once against symbolic types,
+// then instantiated per distinct type-argument list; uninstantiated generics
+// are never code-generated. There are no traits, so an operation that is
+// invalid for a substitution is reported at the call site, with a note that
+// points back at the generic body.
+
+fn max<T>(a: T, b: T) -> T {
+    return if a > b { a } else { b }
+}
+
+struct Pair<A, B> {
+    first: A,
+    second: B,
+}
+
+enum Either<L, R> {
+    Left(L),
+    Right(R),
+}
+
+// `const` parameters are compile-time values, which is how a generic gets to
+// name an array size. There is no comptime interpreter beyond this.
+fn zeros<const N: usize>() -> [f32; N] {
+    return [0.0; N]
+}
+
+fn sum(xs: []i32) -> i32 {
+    mut total: i32 = 0
+    for v in xs {
+        total += v
+    }
+    return total
+}
+
+fn main() {
+    println($"{}", max(3, 7))                 // instantiates max<i32>
+    println($"{}", max(2.5, 1.5))             // instantiates max<f64>
+    println($"{}", max<i64>(9, 4))            // type argument written out explicitly
+
+    let p = Pair<i32, string> { first: 1, second: "one" }
+    let e: Either<string, i32> = Either::Right(42)
+    grid := zeros<4>()                        // [f32; 4], N is a const parameter
+    println($"pair={p.first} {p.second} grid0={grid[0]}")
+
+    match e {
+        Either::Left(s)  => println($"left {s}"),
+        Either::Right(n) => println($"right {n}"),
+    }
+
+    // Generic containers are ordinary stdlib types written against `context`,
+    // not built-in syntax (README open item 5).
+    mut bag: HashMap<string, i32> = HashMap<string, i32>.new()
+    bag.insert("hp", 30)
+    bag.insert("mp", 10)
+    println($"sum={} hp={} mp={} keys={}",
+            sum(&[1, 2, 3]), bag.get("hp").unwrap_or(0), bag.get("mp").unwrap_or(0), bag.len())
+}

@@ -1,0 +1,64 @@
+package main
+
+// Sum types are Rust-shaped: one keyword, `enum`, payload in the variant.
+// Integer/payload-less `enum` (C-enum / bitflags base) is deliberately
+// deferred -- see example/README.md open item 10.
+
+struct Vec3 {
+    x: f32,
+    y: f32,
+}
+
+enum Shape {
+    Circle(f32),                 // tuple payload
+    Rect { w: f32, h: f32 },     // named payload (an anonymous struct)
+    Polygon([]Vec3),             // []T is a { ptr, len } view
+    Empty,                       // no payload
+}
+
+// `match` is an expression; arms are `,` separated; the compiler demands every
+// variant, or an explicit `_`.
+fn area(s: Shape) -> f32 {
+    return match s {
+        Shape::Circle(r)      => 3.14159265 * r * r,
+        Shape::Rect { w, h }  => w * h,
+        Shape::Polygon(_)     => 0.0,
+        Shape::Empty          => 0.0,
+    }
+}
+
+// Guards, or-patterns, ranges and wildcards are patterns too.
+fn describe(n: i32) -> string {
+    return match n {
+        0            => "zero",
+        1 | 2 | 3    => "small",
+        4..=9        => "single digit",
+        x if x < 0   => $"negative {x}",
+        _            => "big",
+    }
+}
+
+enum Command {
+    Quit,
+    Move { delta: Vec3 },
+    Load { path: string, retry: Option<i32> },   // sum types nest freely
+}
+
+fn run(c: Command) {
+    match c {
+        Command::Quit              => println("bye"),
+        Command::Move { delta }    => println($"move {}", delta),
+        Command::Load { path, .. } => println($"load {}", path),
+    }
+}
+
+fn main() {
+    shapes := [Shape::Circle(2.0), Shape::Rect { w: 3.0, h: 4.0 }, Shape::Empty]
+    for s in shapes {
+        println($"area={}", area(s))
+    }
+    for n in [0, 2, 7, -5, 42] {
+        println($"{} -> {}", n, describe(n))
+    }
+    run(Command::Load { path: "save1.dux", retry: Some(3) })
+}

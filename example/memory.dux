@@ -1,0 +1,61 @@
+package main
+
+import "std/mem"
+
+// `Vec`, `String`, `HashMap`, `Option`, `Result` need no import: they live in
+// the implicitly-imported prelude (DESIGN.md §3.1).
+
+// Every function that (transitively) allocates carries a hidden trailing
+// `context: *Context` parameter -- Odin's model. `context` is an ordinary,
+// rebindable name in scope and it holds the allocator, the source location and
+// a user slot. `#[no_context]` opts out (see `doubling` below).
+
+fn build_labels(n: i32) -> []string {
+    out: Vec<string> = Vec<string>.new()     // allocated from context.allocator
+    for i in 0..n {
+        out.push($"label-{i}")                       // string `+` and `$".."` allocate too
+    }
+    return out.slice()                               // Vec<T> -> []T view
+}
+
+fn main() {
+    single := new(i32)                // *i32   from context.allocator
+    *single = 7
+    defer free(single)
+
+    counts := make(i32, 4)            // []i32  zero initialised
+    counts[0] = 1
+    defer del(counts)
+
+    // Rebinding `context` redirects every later allocation in this block --
+    // including stdlib calls and string concatenation -- into the arena.
+    arena := mem.Arena.new(4 * 1024)
+    defer arena.destroy()             // one free for everything the arena handed out
+    context = arena.ctx()
+
+    labels := build_labels(3)
+    for l in labels {
+        print($"{l} ")
+    }
+    println("")
+
+    {
+        // A nested block gives the outer context back automatically.
+        scratch := mem.Arena.new(1024)
+        defer scratch.destroy()
+        context = scratch.ctx()
+        bump := new(i64)          // gone when `scratch` is destroyed
+        *bump = 1
+        println($"scratch={*bump}")
+    }
+
+    cb: fn(i32) -> i32 = &doubling    // no hidden parameter => C ABI clean
+    println($"single={} counts0={} labels={} cb={}", *single, counts[0], labels.len(), cb(21))
+}
+
+// Callbacks handed to C must drop the hidden parameter, or the signature is
+// one pointer wider than the C function pointer type.
+#[no_context]
+fn doubling(x: i32) -> i32 {
+    return x * 2
+}

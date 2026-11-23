@@ -1,0 +1,54 @@
+package main
+
+// Pointer taxonomy. `*T` can never be null; the only nullable pointer is
+// `Option<*T>`, and the only spelling of null is `None`. That is what lets
+// `Option<*Node>` be a niche-optimised single word (the tag hides in a
+// bit pattern no valid address has).
+
+struct Node {
+    value: i32,
+    next: Option<*Node>,        // recursion goes through a pointer, as always
+}
+
+fn main() {
+    mut n: i32 = 1
+    p := &n                     // *i32, `&x` is address-of, `*p` is dereference
+    *p = 2
+    n += 1                      // 3
+    println($"n={} through the pointer={}", n, *p)
+
+    // A one-element linked list, built and walked without a null anywhere.
+    tail := Node { value: 2, next: None }
+    head := Node { value: 1, next: Some(&tail) }
+    mut cursor: Option<*Node> = Some(&head)
+    mut hops: i32 = 0
+    while let Some(node) = cursor {         // `while let` = loop + match
+        hops += 1
+        cursor = node.next                  // `node.value` auto-dereferences
+    }
+    println($"hops={}", hops)
+
+    // Slices: `[]T` is a { data, len } view, 16 bytes, no capacity.
+    let dims: [i32; 4] = [10, 20, 30, 40]   // fixed arrays are `[T; N]` value types
+    let window: []i32 = &dims               // array -> slice coercion at the boundary
+    println($"len={} first={} last={}", window.len(), window[0], window[window.len() - 1])
+    print_span(&dims[1..3])                 // subslicing produces another []i32
+
+    // Pointer arithmetic is plain arithmetic on *T. No `unsafe` keyword: with
+    // no borrow checker there is nothing for a block to switch off.
+    let base = &dims[0]
+    let third = base + 2
+    println($"base={} third={}", *base, *third)
+
+    // rawptr is the untyped, arithmetic-free case; you must cast to touch it.
+    let bits: rawptr = third as rawptr
+    let back = bits as *i32
+    println($"through rawptr={}", *back)
+}
+
+fn print_span(xs: []i32) {
+    for i, v in xs {              // index + value, Odin style
+        println($"[{i}]={}", v)   // {} takes trailing args, {name} reads the scope
+    }
+    println("")
+}

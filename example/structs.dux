@@ -1,0 +1,54 @@
+package main
+
+import "std/math"
+
+struct Vec3 {
+    x: f32,
+    y: f32,
+    z: f32,
+}
+
+// Methods live in `impl` blocks. `self` is a copy; `self: *Vec3` is a pointer
+// receiver, and the call site takes the address for you (so `v.scale(2.0)`
+// works on a mutable `v`). There is no borrow checker: `*Vec3` is just a
+// non-null pointer.
+impl Vec3 {
+    fn len_sq(self) -> f32 {
+        return self.x * self.x + self.y * self.y + self.z * self.z
+    }
+
+    fn len(self) -> f32 {
+        return math.sqrt(self.len_sq())
+    }
+
+    fn scale(self: *Vec3, k: f32) {
+        self.x = self.x * k
+        self.y = self.y * k
+        self.z = self.z * k
+    }
+}
+
+struct AABB {
+    min: Vec3,
+    max: Vec3,
+}
+
+const UNIT: Vec3 = Vec3 { x: 1.0, y: 1.0, z: 1.0 }
+
+fn main() {
+    v := Vec3 { x: 3.0, y: 4.0, z: 0.0 }   // named-field literal, order is free
+    box := AABB { min: Vec3 { x: 0.0, y: 0.0, z: 0.0 }, max: UNIT }
+
+    let before = v.len()
+    v.scale(0.5)                            // auto-& because scale takes *Vec3
+
+    copy := v                              // assignment is a bitwise copy
+    copy.z = 9.0
+
+    // `p.field` auto-dereferences; there is no `->` and no `unsafe` block.
+    let p = &v
+    p.x = 1.0               // writing through a pointer needs no `mut`
+    println($"len {} -> {} after scale, copy.z={} p.z={}",
+            before, v.len(), copy.z, p.z)
+    println($"box diagonal={box.max.len() - box.min.len()}")
+}

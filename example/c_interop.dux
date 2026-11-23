@@ -1,0 +1,70 @@
+package main
+
+import "std/c"
+
+// One attribute block, one namespace: the declarations in the header are
+// *there*. No binding file, no generated crate, no build step to commit. The
+// translation unit is compiled (definitions included), so `static inline`
+// functions and header-only libraries are usable, not skipped.
+
+#[c_include("stdio.h")]
+#[c_link("c")]
+mod cs;
+
+#[c_include("time.h")]
+mod ctime;
+
+// Header-only library: the define selects the one translation unit that emits
+// the definitions, exactly as it does in C.
+#[c_include("stb_image.h")]
+#[c_flag("-DSTB_IMAGE_IMPLEMENTATION")]
+mod stb;
+
+// Escape hatch for the 2% the importer gets wrong, written in place: a manual
+// declaration with an explicit symbol name and library.
+#[link(name = "m")]
+extern "C" {
+    fn fma(x: c_double, y: c_double, z: c_double) -> c_double
+
+    #[c_name("glm_vec3_scale")]
+    fn vec3_scale(v: *Vec3, s: c_float)
+}
+
+struct Vec3 {
+    x: c_float,
+    y: c_float,
+    z: c_float,
+}
+
+fn main() {
+    // C ints stay distinct: `c_long` is not `i64` and `c_int` is not `i32`,
+    // even when the widths agree, so LLP64 or a 32-bit time_t is a type error
+    // rather than quietly wrong bytes. Crossing over is always a written `as`.
+    let secs: i64 = ctime.time(None) as i64      // NULL for "no result wanted"
+    let wide: c_long = 40000
+    let back: i64 = wide as i64
+
+    // C hands back NULL for "no value". `T *` imports as `Option<*T>`, so the
+    // check is a match instead of a nil comparison.
+    let f: Option<*cs.FILE> = cs.fopen(c"slot.txt", c"w")
+    match f {
+        Some(h) => {
+            cs.fprintf(h, c"saved at {} seconds\n", secs)     // varargs, callable directly
+            cs.fclose(h)
+        }
+        None => println("could not open slot.txt"),
+    }
+
+    let text = "duxlang"
+    let n: usize = cs.strlen(text)                            // string -> *c_char
+
+    match c.to_string(cs.getenv(c"HOME")) {                   // std/c converts both ways
+        Some(home) => println($"HOME={home}"),
+        None => println("HOME is not set"),
+    }
+
+    v := Vec3 { x: 1.0, y: 2.0, z: 3.0 }
+    vec3_scale(&v, 2.0)
+    println($"len={} secs={} wide={}->{back} fma={} v=({v.x}, {v.y}, {v.z})",
+            n, secs, wide, fma(2.0, 3.0, 4.0))
+}
