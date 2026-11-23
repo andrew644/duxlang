@@ -1,0 +1,30 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/dux_source",
+    "crates/dux_diag",
+    "crates/dux_lexer",
+    "crates/dux_ast",
+    "crates/dux_parser",
+    "crates/dux_codegen",
+    "crates/dux_driver",
+    "crates/duxc",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+[workspace.metadata.llvm]
+version = "23.1"
+note = "inkwell feature llvm23-1 -> llvm-sys 231; must match the system LLVM in ADMIN.md"
+
+[workspace.dependencies]
+dux_source = { path = "crates/dux_source" }
+dux_diag = { path = "crates/dux_diag" }
+dux_lexer = { path = "crates/dux_lexer" }
+dux_ast = { path = "crates/dux_ast" }
+dux_parser = { path = "crates/dux_parser" }
+dux_codegen = { path = "crates/dux_codegen" }
+inkwell = { version = "0.11.0", default-features = false, features = ["llvm23-1"] }

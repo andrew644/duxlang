@@ -1,0 +1,15 @@
+[package]
+name = "dux_codegen"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dev-dependencies]
+dux_lexer = { workspace = true }
+dux_parser = { workspace = true }
+
+[dependencies]
+dux_source = { workspace = true }
+dux_diag = { workspace = true }
+dux_ast = { workspace = true }
+inkwell = { workspace = true }

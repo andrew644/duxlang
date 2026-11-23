@@ -1,0 +1,9 @@
+[package]
+name = "dux_lexer"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+dux_source = { workspace = true }
+dux_diag = { workspace = true }

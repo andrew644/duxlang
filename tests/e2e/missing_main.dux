@@ -1,0 +1,6 @@
+//@expect-error E0100
+package main
+
+fn helper() {
+    println("never runs")
+}

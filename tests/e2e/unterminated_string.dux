@@ -1,0 +1,6 @@
+//@expect-error E0002
+package main
+
+fn main() {
+    println("no closing quote
+}

@@ -1,0 +1,11 @@
+[package]
+name = "dux_parser"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+dux_source = { workspace = true }
+dux_diag = { workspace = true }
+dux_lexer = { workspace = true }
+dux_ast = { workspace = true }

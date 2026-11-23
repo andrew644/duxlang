@@ -89,8 +89,12 @@ Consequences, all decided:
 - **Prelude.** `std/prelude` is imported implicitly into every file: `Option`, `Result`, `Vec`,
   `String`, `HashMap` and the inherent methods on primitives (`len`, `push`, `unwrap`, …). It is
   ordinary Dux source, not compiler magic, apart from the two predeclared enums in §4.5.
-- No significant whitespace, no semicolons at statement level. `,` separates `for` clauses
-  and `match` arms; `,` or newline separates fields inside `{}` bodies.
+- **No significant whitespace, and no required semicolons.** A statement ends at a newline, at
+  `;`, or at the enclosing `}`; `;` is accepted and is *required* to separate clauses that share a
+  line (a `for` header, two statements on one line). The lexer records only "a newline preceded this
+  token"; the parser decides at statement boundaries, so an expression may always break after an
+  operator (`x := 1 +` / newline / `2` is one statement). `,` separates `for` clauses and `match`
+  arms; `,` or newline separates fields inside `{}` bodies.
 
 ### 3.2 Surface syntax — normative
 
@@ -569,16 +573,42 @@ tests/e2e/
   c_import.dux / c_import.expected        + native/*.h, native/*.c compiled by the harness
 ```
 
-- Each `.dux` is self-contained: no network, no `$HOME` writes, no absolute paths.
-- Directive comments inside the `.dux` (or a sidecar) select expectations:
-  `//@stdout-file x.expected`, `//@stderr-substr …`, `//@exit 1`,
-  `//@expect-error E0133` for negative tests.
+- Each `.dux` is self-contained: no network, no `$HOME` writes, no absolute paths. Scratch output
+  goes to `CARGO_TARGET_TMPDIR` (`target/tmp`), never next to the fixture.
+- Directive comments inside the `.dux` select expectations (implemented in
+  `crates/duxc/tests/e2e.rs`):
+  - `//@exit 1` — expected exit code (default 0)
+  - `//@expect-error E0100` — the build must fail and stderr must contain that code
+  - `//@stderr "unused"` — stderr substring for warnings that must survive
+  - `//@release` — build with `--release`, i.e. through `default<O2>`
+  - `//@args a b` — arguments forwarded to the program after `--`
+  stdout is compared against `<fixture>.expected`; a run fixture without one fails the gate.
 - `UPDATE_EXPECTED=1 cargo test` regenerates `.expected`.
+- Two permanent gates beyond the corpus: the normative `example/hello.dux` must compile, run and
+  print exactly `Hello, world!\n`, and no `example/*.dux` may make the compiler hang or panic
+  (checked under `timeout 20`) — that test has already paid for itself once.
 - **`example/*.dux` are promoted into `tests/e2e/` as milestones land**: a file moves when the
   language covers everything it demonstrates, so the review samples become the regression
-  suite. Files that are not yet fully supported stay in `example/` and are listed in
-  `docs/status.md` with the reason.
+  suite. Files that are not yet fully supported stay in `example/`.
 - Gate: `cargo test` = unit tests + e2e, all green before any commit (`AGENTS.md`).
+
+### 8.1a Diagnostic codes in use
+
+| Code | Meaning | Phase |
+|---|---|---|
+| `E0001` | unexpected character | lexer |
+| `E0002` | unterminated string | lexer |
+| `E0003` | bad escape | lexer |
+| `E0004` | number out of range | lexer |
+| `E0005` | unexpected token | parser |
+| `E0006` | unexpected end of input | parser |
+| `E0007` | syntax is valid but this build cannot compile it yet — *milestone* limitation, never a language verdict | parser/codegen |
+| `E0008` | statement not terminated (`;` or newline required) | parser |
+| `E0100` | no `main` | program shape |
+| `E0101` | `main` has the wrong signature | program shape |
+| `E0900` | link failure | driver |
+| `E0901` | source/output I/O failure | driver |
+| `E0902` | LLVM failure | codegen |
 
 ### 8.2 Unit tests
 
@@ -630,7 +660,7 @@ Each milestone ends green (`cargo test` + e2e) before the next starts.
 
 | # | Deliverable | E2E proof |
 |---|---|---|
-| M0 | Workspace, `duxc --version`, e2e harness, `inkwell llvm23-1` linked against system LLVM 23.1.5 (**binding risk retired**: verified on this box), `hello.dux` codegen'd through libLLVM and linked | `hello.dux` → `Hello, world!` |
+| M0 | **Done.** Workspace, `duxc version/check/build/run`, e2e harness, `inkwell llvm23-1` linked against system LLVM 23.1.5 (**binding risk retired**: verified on this box), `hello.dux` codegen'd through libLLVM and linked | `hello.dux` → `Hello, world!` |
 | M1 | Lexer, parser, AST dump, error-tolerant diagnostics, `dux fmt` skeleton | snapshot tests, `--emit=ast` |
 | M2 | Resolver + checker for `fn`/calls/primitives, `if`/`for`/`while`/`defer`, line-table debug info | `types.dux`, `control_flow.dux`, arithmetic stdout |
 | M3 | `struct`/`impl`/methods, `*T`, `&`/`*`, `[]T`, `string`, `rawptr`, context + `new`/`make`/`free`/`del`, debug allocator | `structs.dux`, `pointers.dux`, `memory.dux`, `strings.dux` |
@@ -698,6 +728,8 @@ registry, hot reload.
 | D25 | E2E harness with `.expected` files gate every commit; `example/*.dux` graduate into it | decided |
 | D26 | Declaration forms `x := e` / `x: T = e` / `x: T`, plain `=` assigns, **no `let`, no `mut`**; `const` + `global` at module scope | decided (owner, round 2) |
 | D27 | Pattern conditions `if P := e` / `while P := e` instead of `if let` / `while let` | decided (owner, round 2) |
+| D28 | Statements end at a newline, `;` or `}` — no semicolon required, none forbidden; `;` is mandatory only between clauses on one line. The lexer flags "newline preceded this token", the parser applies it at statement boundaries | decided (implemented in M0) |
+| D29 | `println(s)` lowers to `puts(s)`, `print(s)` to `fputs(s, stdout)` — the compiler never appends a newline to a literal it is already emitting | decided (M0) |
 
 ---
 

@@ -1,0 +1,6 @@
+//@release
+package main
+
+fn main() {
+    println("Hello, world!")
+}

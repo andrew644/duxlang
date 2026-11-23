@@ -52,6 +52,18 @@ Decided across two review rounds, written down so a disagreement is easy to poin
 14. LSP is a goal, so the front end is arena-allocated, immutable and error tolerant.
 15. Prelude: `Option`, `Result`, `Vec`, `String`, `HashMap` and the methods on primitives need
     no import. Everything else (`mem`, `fmt`, `math`, `fs`, `c`) is a namespace from an import.
+16. **Statements end at a newline.** No semicolon is needed at the end of a line, and none is
+    forbidden: `;` also ends a statement, and it is *required* between clauses that share one
+    line (`for i := 1, i <= 100, i += 1`). A line that ends mid-expression continues on the next
+    line (`x := 1 +` newline `2` is one statement), so wrapping long expressions is fine.
+
+## What the M0 compiler already does
+
+`cargo run -p duxc -- run example/hello.dux` compiles `hello.dux` through LLVM 23 and runs it.
+`duxc check <file>` reports lexer/parser diagnostics only. Today the compiler lowers `fn main()`
+with `print`/`println` of literals; everything else is reported as `E0007` — *"not supported by
+this compiler build yet"*, which is a milestone gap and never a verdict on the syntax. Parsing of
+`struct`/`enum`/`const`/`global`/`impl`/`match`/loops is M1-M4 work, tracked in DESIGN.md §10.
 
 ## Open items — rule on these ("all defaults" is a valid answer)
 

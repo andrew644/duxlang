@@ -136,3 +136,46 @@ DESIGN.md (D26, D27):
 
 `example/README.md` was restructured: rules 1-15 (what is settled) and open items 1-10 (what the
 owner still has to rule on — `[OPEN-1]`..`[OPEN-10]` map 1:1 to DESIGN.md §13.1).
+
+
+## Session 3 — M0 lands: the pipeline is real
+
+`cargo test` is green: 55 tests (14 parser, 13 lexer, 7 codegen IR, 8 CLI, 3 driver, 3 diag,
+3 source-map, 5 e2e). `example/hello.dux` compiles through system LLVM 23.1.5, links with clang
+and prints `Hello, world!`.
+
+Workspace: `dux_source`, `dux_diag`, `dux_lexer`, `dux_ast`, `dux_parser`, `dux_codegen`,
+`dux_driver`, `duxc`. Only `dux_codegen` may know LLVM exists; `duxc` never links LLVM directly.
+CLI is `duxc version|check|build|run` with `--emit=ir|obj|exe`, `--release`, `-o`, `--out-dir`,
+and `run file -- program args`. Scratch goes to `--out-dir` (default `.dux-cache`), the harness to
+`target/tmp`.
+
+Decisions and bugs worth remembering, all now under tests:
+
+- **Statement termination (D28).** The examples never wrote `;`, so requiring them was never the
+  language. The lexer now records "a newline preceded this token" and the parser ends a statement
+  at a newline, `;` or `}` (`E0008` when a line would otherwise hold two statements). Expressions
+  may still wrap after an operator.
+- **`println` double newline.** `println` appended `\n` *and* called `puts`, which appends its
+  own. Now: `println` → `puts(text)`, `print` → `fputs(text, stdout)` (D29) — the compiler never
+  adds a newline to a literal it was already printing.
+- **Top-level recovery loop.** `recover_to_top_level` returned at the offending token, so an
+  unparsed `struct`/`enum`/`const`/`global`/`impl` spun the `program()` loop forever — every
+  example except `hello.dux` hung. Recovery now always consumes at least one token and the top
+  level asserts forward progress. `no_example_hangs_or_panics_the_compiler` is now a permanent
+  gate (it runs the whole `example/` corpus under `timeout 20`).
+- **Semicolon policy in blocks.** `;` is a terminator handled by the block loop, so statements are
+  indexed cleanly; a stray `;` is `E0008 "a statement cannot be empty"`.
+- Raw strings must survive newlines: `string_body` used to report "not closed before end of line"
+  even in raw mode.
+- `as` binds tightest (`1 + 2 as i32` is `1 + (2 as i32)`); `*` tighter than `+`; verified.
+- Codegen facts confirmed: `module.set_triple` + `set_data_layout` from the `TargetMachine`,
+  `i32 main()` returning 0, `default<O2>` via `run_passes`, inkwell types are `!Sync` so the LLVM
+  `Context` lives in a `thread_local!` (leaked) rather than a `static`.
+
+Tests found the two codegen bugs and the parser's `=`-assignment regression above; the e2e harness
+supports `//@exit`, `//@expect-error`, `//@stderr`, `//@release`, `//@args` and
+`UPDATE_EXPECTED=1`.
+
+Not done (next): top-level `const`/`global`/`struct`/`enum`/`type`/`impl`/attributes in the AST +
+parser (M1) — today they are `E0005`/`E0007`; `match`, patterns, ranges and control flow are M2/M4.
