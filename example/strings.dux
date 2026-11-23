@@ -10,18 +10,18 @@ fn describe(name: string, bytes: usize) -> string {
 }
 
 fn main() {
-    let name = "dux"
-    let n: i64 = 4
+    name := "dux"
+    n: i64 = 4
 
     println($"{} has {} letters", name, n)   // positional holes
     println($"{name} has {n} letters")       // holes filled from scope
     println(describe(name, name.len()))
 
-    let path = "/usr/" + name               // allocates with the context allocator
-    let head = path[0..4]                   // byte slicing, panics if out of range
-    let raw = r"C:\dux\std"                  // raw: no escapes, no interpolation
-    let escaped = "tab:\t quote:\" brace:$"  // `$` alone is literal; `$"..."` interpolates
-    let cstr = c"to the C boundary"          // NUL-terminated, `*c_char` compatible
+    path := "/usr/" + name               // allocates with the context allocator
+    head := path[0..4]                   // byte slicing, panics if out of range
+    raw := r"C:\dux\std"                  // raw: no escapes, no interpolation
+    escaped := "tab:\t quote:\" brace:$"  // `$` alone is literal; `$"..."` interpolates
+    cstr := c"to the C boundary"          // NUL-terminated, `*c_char` compatible
 
     for b in path.bytes() {                  // bytes: u8
         print($"{b} ")

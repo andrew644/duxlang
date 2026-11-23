@@ -102,3 +102,20 @@ cargo is fine (recorded in `ADMIN.md` §4).
 `duxc --version`, e2e harness (`.dux` → compile → run → stdout compare, `UPDATE_EXPECTED=1`), and
 `hello.dux` codegen'd through inkwell against system LLVM 23.1.5 → prints `Hello, world!`. M0 is
 not started; nothing under `crates/` exists.
+
+### M0 pre-flight spike (scratch, `/tmp/spike`, not committed): D3 verified
+
+`inkwell 0.11.0` + feature `llvm23-1` **builds and works against system LLVM 23.1.5 on this
+box**: module → new-PM `default<O2>` → `.o` → `clang` link → correct stdout. So "link libLLVM"
+(D3) is no longer a risk, and M0 can start with the real back end. Four findings are now in
+DESIGN.md §6.2 so they are not re-learned at M2:
+
+- LLVM 23 removed the legacy pass manager: optimisation is `Module::run_passes("default<O2>",
+  &tm, PassBuilderOptions)` (pipeline strings), inkwell's per-pass `add_*_pass` helpers are gone.
+- `tm.set_data_layout(&module)` is not automatic — a fresh module's data layout is empty, which
+  would silently mis-layout `Option<T>`/sum types.
+- **`main` must be emitted as `i32 main()` returning 0**: a void `main` left `puts`' return value
+  in `rax` and the hello binary exited 34 (its own byte count). That is a codegen rule, not trivia.
+- `Context::ptr_type()` (inkwell's `IntType::ptr_type` is deprecated); DIBuilder entry point is
+  `module.create_debug_info_builder(...)` with `DWARFSourceLanguage::C99` +
+  `DWARFEmissionKind::LineTablesOnly`.

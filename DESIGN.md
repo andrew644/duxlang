@@ -485,7 +485,21 @@ dux run x.dux
 
 ### 6.2 Codegen rules
 
-- Opaque pointers throughout, typed at the Dux level.
+- Opaque pointers throughout, typed at the Dux level (`Context::ptr_type()`; inkwell's
+  `IntType::ptr_type` is deprecated).
+- **Verified against inkwell 0.11.0 / LLVM 23.1.5 on this box** (scratch spike: module →
+  `default<O2>` → `.o` → `clang` link → correct stdout). Facts worth not re-learning:
+  - Optimiser entry point is `Module::run_passes("default<O2>", &tm, PassBuilderOptions)`, the
+    textual new-PM pipeline. The legacy `PassManager` per-pass helpers are gone in LLVM 23, so
+    `-O` levels map to pipeline strings, not to Rust method calls.
+  - The `TargetMachine` has to exist before passes run, and
+    `tm.set_data_layout(&module)` must be called explicitly — a module's own data layout is
+    empty until then, which would silently mis-layout `Option<T>`.
+  - **Emit `main` as `i32 main()` returning 0.** A `void` main leaves the previous call's
+    return value in `rax`: the spike's hello exited 34 (the byte count `puts` reported).
+  - DWARF comes from `module.create_debug_info_builder(...)`, which takes the full CU
+    description; `DWARFSourceLanguage::C99` for C-interop frames, `DWARFEmissionKind::LineTablesOnly`
+    for the early milestone.
 - Aggregates pass by value and LLVM legalises per the target ABI (no hand-rolled `CCState`).
 - `bool` is `i1` in locals, `i8` in any C-ABI-visible signature, with truncation at the edge.
 - Sum-type lowering: `{ tag, padding, payload }` struct; `match` → `switch` on the tag with a
@@ -613,7 +627,7 @@ Each milestone ends green (`cargo test` + e2e) before the next starts.
 
 | # | Deliverable | E2E proof |
 |---|---|---|
-| M0 | Workspace, `duxc --version`, e2e harness, `inkwell llvm23-1` linked against system LLVM 23.1.5, `hello.dux` codegen'd through libLLVM and linked | `hello.dux` → `Hello, world!` |
+| M0 | Workspace, `duxc --version`, e2e harness, `inkwell llvm23-1` linked against system LLVM 23.1.5 (**binding risk retired**: verified on this box), `hello.dux` codegen'd through libLLVM and linked | `hello.dux` → `Hello, world!` |
 | M1 | Lexer, parser, AST dump, error-tolerant diagnostics, `dux fmt` skeleton | snapshot tests, `--emit=ast` |
 | M2 | Resolver + checker for `fn`/calls/primitives, `if`/`for`/`while`/`defer`, line-table debug info | `types.dux`, `control_flow.dux`, arithmetic stdout |
 | M3 | `struct`/`impl`/methods, `*T`, `&`/`*`, `[]T`, `string`, `rawptr`, context + `new`/`make`/`free`/`del`, debug allocator | `structs.dux`, `pointers.dux`, `memory.dux`, `strings.dux` |
@@ -634,7 +648,8 @@ registry, hot reload.
    AST compatibility. Mitigations: the internal `CDecl` layer, layout read from clang metadata
    only, `#[c_name]` in-place override, `dux cimports`, and the hostile-header corpus (§5.4).
 2. **Bleeding-edge LLVM bindings.** `inkwell 0.11.0` + `llvm23-1` matches system LLVM 23.1.5
-   today; a Fedora LLVM bump breaks the exact-version match. Mitigation: LLVM version pinned
+   today **and has been measured on this box** (module → `default<O2>` → `.o` → `clang` →
+   correct stdout); a Fedora LLVM bump is still the risk. Mitigation: LLVM version pinned
    in workspace metadata, `llvm-sys 231` pinned, `ADMIN.md` records the pairing, and
    `dux_codegen` stays the only crate that touches LLVM so a bump is one crate's diff.
 3. **Context parameter vs C ABI.** Resolved by `#[no_context]` (D10) + a checker rule that
