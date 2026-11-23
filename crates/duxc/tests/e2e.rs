@@ -189,6 +189,50 @@ fn the_normative_hello_example_compiles_runs_and_prints_exactly_hello_world() {
 }
 
 #[test]
+fn every_example_parses_so_the_review_samples_stay_the_target_surface() {
+    let mut offenders = Vec::new();
+    for entry in std::fs::read_dir(EXAMPLE_DIR).expect("example/ exists") {
+        let path = entry.expect("readable entry").path();
+        if path.extension().is_some_and(|e| e != "dux") {
+            continue;
+        }
+        let run = duxc_check(&path);
+        let syntax: Vec<&str> = run
+            .stderr
+            .lines()
+            .filter(|line| {
+                line.contains("error[E0001]")
+                    || line.contains("error[E0002]")
+                    || line.contains("error[E0005]")
+                    || line.contains("error[E0006]")
+                    || line.contains("error[E0008]")
+            })
+            .collect();
+        if !syntax.is_empty() {
+            offenders.push(format!("{}:\n{}", path.display(), syntax.join("\n")));
+        }
+    }
+    assert!(
+        offenders.is_empty(),
+        "the parser cannot read these normative examples:\n\n{}",
+        offenders.join("\n\n")
+    );
+}
+
+fn duxc_check(path: &Path) -> Run {
+    let output = Command::new(env!("CARGO_BIN_EXE_duxc"))
+        .arg("check")
+        .arg(path)
+        .output()
+        .expect("duxc is runnable");
+    Run {
+        stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+        code: output.status.code().unwrap_or(-1),
+    }
+}
+
+#[test]
 fn no_example_hangs_or_panics_the_compiler() {
     for entry in std::fs::read_dir(EXAMPLE_DIR).expect("example/ exists") {
         let path = entry.expect("readable entry").path();

@@ -86,6 +86,10 @@ Consequences, all decided:
 - Entry point: `fn main()`. `fn main() -> i32` is also accepted. A freestanding `_start`
   mode is a post-v1 concern. `[OPEN-11]`
 - UTF-8 source, LF or CRLF. Identifiers are ASCII alnum + `_` in v1. `[OPEN-12]`
+- **Unsupported ≠ invalid.** `E0007` means "valid Dux that this build cannot compile yet";
+  it is always a milestone gap with a note, never a verdict on the syntax. Syntax errors are
+  `E0005`/`E0006`/`E0008`. `duxc check example/hello.dux` prints `no errors: …` while a file that
+  only needs M4 features prints `E0007` for each unlowered construct.
 - **Prelude.** `std/prelude` is imported implicitly into every file: `Option`, `Result`, `Vec`,
   `String`, `HashMap` and the inherent methods on primitives (`len`, `push`, `unwrap`, …). It is
   ordinary Dux source, not compiler magic, apart from the two predeclared enums in §4.5.
@@ -661,7 +665,7 @@ Each milestone ends green (`cargo test` + e2e) before the next starts.
 | # | Deliverable | E2E proof |
 |---|---|---|
 | M0 | **Done.** Workspace, `duxc version/check/build/run`, e2e harness, `inkwell llvm23-1` linked against system LLVM 23.1.5 (**binding risk retired**: verified on this box), `hello.dux` codegen'd through libLLVM and linked | `hello.dux` → `Hello, world!` |
-| M1 | Lexer, parser, AST dump, error-tolerant diagnostics, `dux fmt` skeleton | snapshot tests, `--emit=ast` |
+| M1 | *In progress:* lexer, parser and AST now cover the whole declared surface — declarations (`const`/`global`/`struct`/`enum`/`type`/`impl`/`mod`/`extern`), attributes, expressions (struct values, paths, arrays, ranges, tuple members, function-pointer types) — with error-tolerant recovery. Remaining: resolver/checker, `--emit=ast`, `dux fmt` | every `example/*.dux` parses (`every_example_parses_so_the_review_samples_stay_the_target_surface`) |
 | M2 | Resolver + checker for `fn`/calls/primitives, `if`/`for`/`while`/`defer`, line-table debug info | `types.dux`, `control_flow.dux`, arithmetic stdout |
 | M3 | `struct`/`impl`/methods, `*T`, `&`/`*`, `[]T`, `string`, `rawptr`, context + `new`/`make`/`free`/`del`, debug allocator | `structs.dux`, `pointers.dux`, `memory.dux`, `strings.dux` |
 | M4 | `enum` sum types + `match`, `Option`, `Result`, pattern conditions (`if P := e`), niche layout, exhaustiveness | `sum_types.dux`, `option_result.dux` + negative tests |

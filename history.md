@@ -179,3 +179,37 @@ supports `//@exit`, `//@expect-error`, `//@stderr`, `//@release`, `//@args` and
 
 Not done (next): top-level `const`/`global`/`struct`/`enum`/`type`/`impl`/attributes in the AST +
 parser (M1) — today they are `E0005`/`E0007`; `match`, patterns, ranges and control flow are M2/M4.
+
+
+## Session 4 — the front end reaches the normative examples
+
+M0 committed (`36d0ad9`). This step made the parser able to read **every** file in `example/`
+with zero syntax errors, which is what turns those files into a specification instead of a wish
+list. `cargo test`: 68 passing, clippy clean.
+
+Added to the AST and parser:
+
+- Declarations: `const`, `global` (value optional — `global scratch: [i32; 8]` is
+  zero-initialised), `struct`, `enum` with tuple/named/empty variant payloads, `type` aliases,
+  `impl` blocks, `mod cs;` and `extern "C" { .. }` with body-less declarations.
+- Attributes as data: `#[c_include("stdio.h")]`, `#[c_flag("-DSTB_IMAGE_IMPLEMENTATION")]`,
+  `#[link(name = "m")]` (named argument), attached to the declaration that follows.
+- Expressions: struct values (`Vec3 { x: 1.0 }`, also qualified `Shape::Rect { .. }`),
+  `A::B` paths, array values `[1, 2, 3]` and repeated `[0.0; N]`, ranges `0..4` / `4..=9`,
+  tuple members `pair.0`, nested block statements, `&x`, `*p = 2`.
+- Types: function-pointer types `fn(i32) -> i32`, qualified type arguments `Option<*cs.FILE>`,
+  const generic arguments `zeros<4>()`, and `TypeParam { is_const }` for `<const N: usize>`.
+- `self` is a parameter with no written type; `self: *Vec3` is an explicit pointer receiver.
+
+Two rules the examples forced into the open:
+
+- **A binary operator must start on the same line as its left operand.** `x := a` newline
+  `+ b` is two statements (as in Go); breaking *after* an operator is how an expression wraps.
+  Without this, `p := &n` followed by `*p = 2` glued into `&n * p = 2`.
+- **`match` / `if` in expression position report one `E0007` and are skipped as a unit**
+  (`skip_expression_blocks`, `else` chains included), so an M4 gap produces one milestone
+  diagnostic instead of a cascade.
+
+Permanent new gates: `every_example_parses_so_the_review_samples_stay_the_target_surface`,
+plus 11 new parser unit tests. `E0007` is now explicitly documented as "valid Dux, not yet
+implemented — a milestone gap, never a syntax verdict".

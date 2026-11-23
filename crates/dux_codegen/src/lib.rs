@@ -407,6 +407,7 @@ fn statement_name(stmt: &Stmt) -> &'static str {
         Stmt::Break { .. } => "`break`",
         Stmt::Continue { .. } => "`continue`",
         Stmt::Defer { .. } => "`defer`",
+        Stmt::Block { .. } => "a nested block",
         Stmt::Error { .. } => "an erroneous statement",
     }
 }

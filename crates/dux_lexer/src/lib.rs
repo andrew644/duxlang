@@ -107,6 +107,7 @@ impl Keyword {
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub enum Punct {
     ColonEq,
+    ColonColon,
     FatArrow,
     Arrow,
     EqEq,
@@ -150,6 +151,7 @@ impl Punct {
     pub fn as_str(self) -> &'static str {
         match self {
             Punct::ColonEq => ":=",
+            Punct::ColonColon => "::",
             Punct::FatArrow => "=>",
             Punct::Arrow => "->",
             Punct::EqEq => "==",
@@ -676,6 +678,9 @@ impl<'a> Lexer<'a> {
         }
         if two == ".." {
             return Some((Punct::DotDot, 2));
+        }
+        if two == "::" {
+            return Some((Punct::ColonColon, 2));
         }
         if two == "%=" {
             return Some((Punct::PercentEq, 2));
