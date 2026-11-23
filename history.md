@@ -119,3 +119,20 @@ DESIGN.md §6.2 so they are not re-learned at M2:
 - `Context::ptr_type()` (inkwell's `IntType::ptr_type` is deprecated); DIBuilder entry point is
   `module.create_debug_info_builder(...)` with `DWARFSourceLanguage::C99` +
   `DWARFEmissionKind::LineTablesOnly`.
+
+## Session 2b — owner's syntax edit pass folded in
+
+The owner edited `types.dux`, `strings.dux`, `structs.dux`, `pointers.dux` (those edits landed
+inside commit `6e2fe48`, which swept up the whole tree — worth remembering: `git add -A` here
+also commits their in-flight edits). Their preferences, now applied to **all** examples and to
+DESIGN.md (D26, D27):
+
+- No `let`, no `mut`. `x := e` infers, `x: T = e` states the type, `x: T` declares
+  zero-initialised storage, plain `=` assigns. Bindings are mutable.
+- Module storage: they deleted `static hits: i32 = 0`. I re-added it as Odin's `global` and
+  flagged it as `[OPEN-1]` together with the one `mask: u64 := 0xff00` (normalised to `: T =`).
+- **Pattern conditions**: `while Some(node) := cursor { }`, `if Ok(n) := parse_slot("42") { }`
+  replace `if let` / `while let` everywhere (README rule 2, DESIGN §4.4, M4).
+
+`example/README.md` was restructured: rules 1-15 (what is settled) and open items 1-10 (what the
+owner still has to rule on — `[OPEN-1]`..`[OPEN-10]` map 1:1 to DESIGN.md §13.1).

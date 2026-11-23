@@ -135,16 +135,17 @@ Summary of the surface (details and rationale in `example/README.md`):
 
 | area | spelling |
 |---|---|
-| declaration | `fn name(a: T) -> R { }`, `struct S { }`, `enum E { A, B(T) }`, `type A = B`, `const`, `static` |
-| binding | `x := e` mut·inferred · `let x = e` immut·inferred · `let x: T = e` immut·explicit · `mut x: T = e` mut·explicit |
+| declaration | `fn name(a: T) -> R { }`, `struct S { }`, `enum E { A, B(T) }`, `type A = B`, `const` (compile time), `global` (storage) |
+| binding | `x := e` inferred · `x: T = e` explicit · `x: T` zero-initialised · `x = e` assigns (no `let`, no `mut`: bindings are mutable) |
 | generics | `fn f<T>`, `struct P<A, B>`, `enum Either<L, R>`, `fn zeros<const N: usize>()`, call `zeros<4>()` |
 | methods | `impl S { fn m(self) -> R, fn set(self: *S, …) }`, call site auto-`&` for pointer receivers |
 | pointers | `&x` address-of, `*p` load/store, `p.field` auto-deref, `p + 1` arithmetic, `rawptr` untyped |
 | optionality | `*T` never null; `Option<*T>` is the only nullable pointer; `None` is the only null |
+| patterns | condition position takes a pattern: `if Some(x) := opt { }`, `while Some(node) := cursor { }` — runs on match, binds the payload, else falls through |
 | aggregates | `[T; N]` array (value), `[]T` slice `{ ptr, len }`, `&arr`, `&arr[a..b]`, `(A, B)` tuple |
 | control flow | `if`/`else if`, `while`, `for init, cond, step`, `for v in xs`, `for i, v in xs`, `for _ in 0..n`, `for _ in 0..=n`, `loop`, `break`, `continue`, `defer` |
 | expressions | `match` and `if … else` are expressions in value position, statements elsewhere |
-| sum types | `match v { E::A => …, E::B(x) => …, 1..=3 => …, x if x < 0 => …, _ => … }`, `if let`/`while let` |
+| sum types | `match v { E::A => …, E::B(x) => …, 1..=3 => …, x if x < 0 => …, _ => … }` |
 | strings | `"…"`, `r"…"`, `c"…"` (NUL-terminated), `$"…{}…{name}…"` interpolation, `+` allocates |
 | conversion | implicit iff lossless; otherwise `expr as T`, always written |
 | attributes | `#[repr(C)]`, `#[no_context]`, `#[cc("stdcall")]`, `#[link(name = "m")]`, `#[test]` |
@@ -173,7 +174,8 @@ impl        := "impl" type "{" fn+ "}"
 struct      := "struct" Ident ("<" idents ">")? "{" (Ident ":" type ",")* "}"
 enum        := "enum" Ident ("<" idents ">")? "{" variant ("," variant)* "}"
 variant     := Ident ("(" type ("," type)* ")" | "{" fields "}")?
-binding     := (Ident ":=" expr) | ("let" Ident (":" type)? "=" expr) | ("mut" Ident ":" type "=" expr)
+binding     := Ident ":=" expr | Ident ":" type ("=" expr)? | "global" Ident ":" type "=" expr | "const" Ident ":" type "=" expr
+cond        := expr | pattern ":=" expr              // if / while accept a pattern condition
 type        := "*" type | "[]" type | "[" type ";" expr "]" | Ident ("<" types ">")? | "(" types ")" | "fn" sig
 stmt        := binding | expr | "return" expr? | "defer" stmt | "break" | "continue" | block | attr_item
 for         := "for" (c_for | iter | iter_indexed)? block
@@ -267,8 +269,9 @@ enum Shape { Circle(f32), Rect { w: f32, h: f32 }, Empty }
 - Variant indices are declaration order, stable per source file.
 - `match` must be exhaustive; `_ =>` or an `else =>` tail makes it total. Non-exhaustive
   without a wildcard is an error (`E0133`), demotable to a warning by flag only.
-- `if let P = e` / `while let P = e` desugar to `match` with a non-matching fallthrough arm;
-  they are in v1 because `Option` is the only null.
+- Pattern conditions — `if P := e { … }`, `while P := e { … }` — desugar to `match` with a
+  non-matching fallthrough arm. They are in v1 because `Option` is the only null, so single
+  variant probing is the most common shape in the language. (Owner's syntax, round 2.)
 - Checked / unchecked variant access: `v.to(Circle) -> Option<f32>` and
   `unsafe`-free but documented `v.as(Circle) -> f32` (wrong tag = trap). `[OPEN-3]` naming.
 - Zero-payload variants do not get a niche of their own (except the `Option`/`Result`
@@ -631,7 +634,7 @@ Each milestone ends green (`cargo test` + e2e) before the next starts.
 | M1 | Lexer, parser, AST dump, error-tolerant diagnostics, `dux fmt` skeleton | snapshot tests, `--emit=ast` |
 | M2 | Resolver + checker for `fn`/calls/primitives, `if`/`for`/`while`/`defer`, line-table debug info | `types.dux`, `control_flow.dux`, arithmetic stdout |
 | M3 | `struct`/`impl`/methods, `*T`, `&`/`*`, `[]T`, `string`, `rawptr`, context + `new`/`make`/`free`/`del`, debug allocator | `structs.dux`, `pointers.dux`, `memory.dux`, `strings.dux` |
-| M4 | `enum` sum types + `match`, `Option`, `Result`, `if let`/`while let`, niche layout, exhaustiveness | `sum_types.dux`, `option_result.dux` + negative tests |
+| M4 | `enum` sum types + `match`, `Option`, `Result`, pattern conditions (`if P := e`), niche layout, exhaustiveness | `sum_types.dux`, `option_result.dux` + negative tests |
 | M5 | Generics + monomorphisation (`<T>`, `const N`), `Vec<T>`, `HashMap<K, V>`, stdlib `fmt`/`strings`/`mem` | `generics.dux` |
 | M6 | `#[c_include]` via libclang: structs, enums, typedefs, funcs, varargs, macros, `static inline` bitcode archive, `#[c_link]`/`#[c_flag]`/`#[c_pkgconfig]`, `dux cimports` | `c_interop.dux` against harness-shipped headers |
 | M7 | Full DWARF type DIEs, `-O2` pipeline, `dux test` runner + leak report, negative-test corpus | `lldb -batch` smoke; release stdout identical |
@@ -692,7 +695,9 @@ registry, hot reload.
 | D22 | Generics are monomorphisation-only, no constraints | decided |
 | D23 | LSP is a stated goal; front end is arena/immutable/error-tolerant to serve it | decided |
 | D24 | No `unsafe` keyword | decided |
-| D25 | E2E harness with `.expected` files gates every commit; `example/*.dux` graduate into it | decided |
+| D25 | E2E harness with `.expected` files gate every commit; `example/*.dux` graduate into it | decided |
+| D26 | Declaration forms `x := e` / `x: T = e` / `x: T`, plain `=` assigns, **no `let`, no `mut`**; `const` + `global` at module scope | decided (owner, round 2) |
+| D27 | Pattern conditions `if P := e` / `while P := e` instead of `if let` / `while let` | decided (owner, round 2) |
 
 ---
 
@@ -700,7 +705,9 @@ registry, hot reload.
 
 ### 13.1 Syntax, needing the owner's ruling (mirrors `example/README.md`)
 
-1. `[OPEN-1]` Binding spellings: keep `:=` / `let` / `let: T` / `mut: T`, or drop `mut`?
+1. `[OPEN-1]` Two leftovers from the owner's edit pass: (a) typed declarations normalised to
+   `x: T = value` (one place read `x: T := value` — intentional?) and (b) module storage
+   spelled `global hits: i32 = 0` (was `static`, deleted in review; confirm `global`).
 2. `[OPEN-2]` Sum-type tag: default `u16` vs smallest fitting width.
 3. `[OPEN-3]` Checked/unchecked variant access naming (`v.to(Variant)`, `v.as(Variant)`).
 4. `[OPEN-4]` Integer-backed `enum` (discriminants, bitflags) — when does it come back?

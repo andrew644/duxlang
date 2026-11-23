@@ -40,13 +40,13 @@ fn main() {
     // C ints stay distinct: `c_long` is not `i64` and `c_int` is not `i32`,
     // even when the widths agree, so LLP64 or a 32-bit time_t is a type error
     // rather than quietly wrong bytes. Crossing over is always a written `as`.
-    let secs: i64 = ctime.time(None) as i64      // NULL for "no result wanted"
-    let wide: c_long = 40000
-    let back: i64 = wide as i64
+    secs: i64 = ctime.time(None) as i64      // NULL for "no result wanted"
+    wide: c_long = 40000
+    back: i64 = wide as i64
 
     // C hands back NULL for "no value". `T *` imports as `Option<*T>`, so the
     // check is a match instead of a nil comparison.
-    let f: Option<*cs.FILE> = cs.fopen(c"slot.txt", c"w")
+    f: Option<*cs.FILE> = cs.fopen(c"slot.txt", c"w")
     match f {
         Some(h) => {
             cs.fprintf(h, c"saved at {} seconds\n", secs)     // varargs, callable directly
@@ -55,8 +55,8 @@ fn main() {
         None => println("could not open slot.txt"),
     }
 
-    let text = "duxlang"
-    let n: usize = cs.strlen(text)                            // string -> *c_char
+    text := "duxlang"
+    n: usize = cs.strlen(text)                            // string -> *c_char
 
     match c.to_string(cs.getenv(c"HOME")) {                   // std/c converts both ways
         Some(home) => println($"HOME={home}"),

@@ -22,7 +22,7 @@ fn main() {
     head := Node { value: 1, next: Some(&tail) }
     cursor: Option<*Node> = Some(&head)
     hops: i32 = 0
-    while Some(node) := cursor {
+    while Some(node) := cursor {            // pattern condition: bind while it matches
         hops += 1
         cursor = node.next                  // `node.value` auto-dereferences
     }
@@ -42,7 +42,7 @@ fn main() {
 
     // rawptr is the untyped, arithmetic-free case; you must cast to touch it.
     bits: rawptr = third as rawptr
-    back = bits as *i32
+    back := bits as *i32
     println($"through rawptr={}", *back)
 }
 

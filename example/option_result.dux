@@ -51,12 +51,13 @@ fn main() {
         Err(e) => println($"error: {e}"),
     }
 
-    // `if let` is the one piece of sugar we want early: match a single variant.
-    if let Ok(n) = parse_slot("42") {
+    // Pattern conditions are the one piece of sugar we want early: match one
+    // variant, bind its payload, fall through otherwise.
+    if Ok(n) := parse_slot("42") {
         println($"parsed {n}")
     }
 
-    let opt = find("needle")
+    opt := find("needle")
     println($"value={}", opt.unwrap_or(-1))
     match opt {
         Some(v) => println($"found {v}"),
@@ -66,5 +67,5 @@ fn main() {
     // unwrap() panics on None: print + trap, no unwinding, defers do not run.
     println($"forced={}", opt.unwrap())
 
-    let _ = parse_slot("nope")          // ignoring a Result is a warning, so say so
+    _ := parse_slot("nope")          // ignoring a Result is a warning, so say so on purpose
 }

@@ -9,9 +9,9 @@ struct Vec3 {
 }
 
 // Methods live in `impl` blocks. `self` is a copy; `self: *Vec3` is a pointer
-// receiver, and the call site takes the address for you (so `v.scale(2.0)`
-// There is no borrow checker: `*Vec3` is just a
-// non-null pointer.
+// receiver, and the call site takes the address for you, so `v.scale(2.0)`
+// just works. There is no borrow checker: `*Vec3` is an ordinary non-null
+// pointer.
 impl Vec3 {
     fn len_sq(self) -> f32 {
         return self.x * self.x + self.y * self.y + self.z * self.z
@@ -47,7 +47,7 @@ fn main() {
 
     // `p.field` auto-dereferences; there is no `->` and no `unsafe` block.
     p := &v
-    p.x = 1.0               
+    p.x = 1.0                           // no `unsafe`, no borrow check
     println($"len {} -> {} after scale, copy.z={} p.z={}",
             before, v.len(), copy.z, p.z)
     println($"box diagonal={box.max.len() - box.min.len()}")

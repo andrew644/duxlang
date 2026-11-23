@@ -27,7 +27,7 @@ fn zeros<const N: usize>() -> [f32; N] {
 }
 
 fn sum(xs: []i32) -> i32 {
-    mut total: i32 = 0
+    total: i32 = 0
     for v in xs {
         total += v
     }
@@ -39,8 +39,8 @@ fn main() {
     println($"{}", max(2.5, 1.5))             // instantiates max<f64>
     println($"{}", max<i64>(9, 4))            // type argument written out explicitly
 
-    let p = Pair<i32, string> { first: 1, second: "one" }
-    let e: Either<string, i32> = Either::Right(42)
+    p := Pair<i32, string> { first: 1, second: "one" }
+    e: Either<string, i32> = Either::Right(42)
     grid := zeros<4>()                        // [f32; 4], N is a const parameter
     println($"pair={p.first} {p.second} grid0={grid[0]}")
 
@@ -51,7 +51,7 @@ fn main() {
 
     // Generic containers are ordinary stdlib types written against `context`,
     // not built-in syntax (README open item 5).
-    mut bag: HashMap<string, i32> = HashMap<string, i32>.new()
+    bag: HashMap<string, i32> = HashMap<string, i32>.new()
     bag.insert("hp", 30)
     bag.insert("mp", 10)
     println($"sum={} hp={} mp={} keys={}",

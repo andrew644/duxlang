@@ -2,13 +2,17 @@ package main
 
 // Bindings, primitives, literals, and the implicit-conversion rule.
 
-const KI: usize = 1024      // const  = compile-time value, no storage
+const KI: usize = 1024        // const  = compile-time value, no storage
+global hits: i32 = 0          // global = one instance of storage, mutable
 
 fn main() {
-    count := 42             
-    ratio := 0.75        
-    mask: u64 := 0xff00  
-    total: i64 := 0      
+    // Two declaration forms: `:=` infers the type, `: T =` states it. A bare
+    // `=` assigns to a binding that already exists. Bindings are mutable.
+    count := 42             // inferred  (integer literals default to i32)
+    ratio := 0.75           // inferred  (float literals default to f64)
+    mask: u64 = 0xff00      // explicit
+    total: i64 = 0          // explicit
+    scratch: [i32; 4]       // no initialiser => zero-initialised
 
     count += 1
     hits += 1
@@ -16,7 +20,7 @@ fn main() {
 
     // Conversion rule: implicit exactly when the destination can hold every
     // value of the source. Lossless => free; anything else needs `as`.
-    small: u16 = 7
+    small: u16 = 7          // u16 -> i32 is lossless
     wider: i32 = small          // ok: u16 fits in i32
     widest: i64 = wider         // ok: i32 fits in i64
     narrow: i8 = widest as i8   // explicit: wraps in release, traps in debug
@@ -27,7 +31,9 @@ fn main() {
     dims: [i32; 3] = [10, 20, 30]  // fixed array is a value type, `[T; N]`
     pair: (i32, bool) = (1, true)  // tuple, so `-> (i32, bool)` is still one return
 
-    total += wider + widest + narrow as i64 + unsigned as i64 + page as i64 + dims[0] as i64 + pair.0
+    scratch[0] = mask as i32
+    total += wider + widest + narrow as i64 + unsigned as i64 + page as i64
+    total += dims[0] + pair.0 + scratch[0]
     println($"count={count} ratio={ratio} mask={mask} total={total}")
     println($"narrow={} unsigned={} pair={}", narrow, unsigned, pair)
 }
