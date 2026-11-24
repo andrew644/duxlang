@@ -14,6 +14,7 @@ use dux_diag::{code, Diagnostic};
 use dux_source::Span;
 use std::collections::HashMap;
 
+pub mod sums;
 pub mod ty;
 
 pub use ty::check;

@@ -14,6 +14,7 @@ pub mod code {
     pub const UNDECLARED: &str = "E0110";
     pub const DUPLICATE_DEFINITION: &str = "E0111";
     pub const WRONG_ARITY: &str = "E0112";
+    pub const NON_EXHAUSTIVE: &str = "E0133";
     pub const LOSSY_CONVERSION: &str = "E0200";
     pub const TYPE_MISMATCH: &str = "E0201";
     pub const NOT_BOOLEAN: &str = "E0202";

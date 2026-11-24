@@ -11,9 +11,12 @@
 use std::collections::HashMap;
 
 use dux_ast::{
-    AssignOp, BinaryOp, Block, Decl, Expr, ForKind, ImplDecl, Program, Stmt, Type, TypeAliasDecl,
-    UnaryOp,
+    AssignOp, BinaryOp, Block, Decl, Expr, FieldPattern, ForKind, ImplDecl, MatchArm, Pattern,
+    Program, Stmt, Type, TypeAliasDecl, UnaryOp,
 };
+use crate::sums::{self, Payload, Shape};
+
+/// A variant's payload once an instantiation has filled it in.
 use dux_diag::code;
 use dux_diag::Diagnostic;
 use dux_source::Span;
@@ -46,6 +49,12 @@ pub enum Ty {
     /// `[]T`: a `{ data, len }` view over elements of `T`.
     Slice(Box<Ty>),
     Struct(String),
+    /// A declared `enum`, with the arguments it was made of: `Shape` carries
+    /// none, `Option<i32>` carries the one. Nominal, like a record.
+    Enum { name: String, args: Vec<Ty> },
+    /// `return`, `break`, `panic`: a value that cannot arrive, so an arm that
+    /// ends in one has whatever type the other arms agree on (DESIGN 4.5).
+    Never,
     /// Unknown to the checker today: an imported or C type, a generic
     /// instantiation, a pointer target, a field of a shape M3 will know.
     /// Silences every rule it touches.
@@ -75,6 +84,12 @@ impl Ty {
             Ty::Array(element) => format!("[{}]", element.name()),
             Ty::Slice(element) => format!("[]{}", element.name()),
             Ty::Struct(name) => name.clone(),
+            Ty::Enum { name, args } if args.is_empty() => name.clone(),
+            Ty::Enum { name, args } => format!(
+                "{name}<{}>",
+                args.iter().map(Ty::name).collect::<Vec<_>>().join(", ")
+            ),
+            Ty::Never => "never".to_string(),
             Ty::Opaque => "<opaque>".to_string(),
         }
     }
@@ -211,6 +226,114 @@ impl Ty {
     }
 }
 
+/// How many values a variant is made from, in the source's own spelling.
+fn payload_arity(payload: &Payload) -> usize {
+    match payload {
+        Payload::Empty => 0,
+        Payload::Tuple(types) => types.len(),
+        Payload::Named(fields) => fields.len(),
+    }
+}
+
+/// What the arms of a `match` reach. An arm with a guard proves nothing about
+/// the rest of the type, so a guarded arm marks nothing here.
+struct Coverage {
+    /// Is there anything to prove? A value the checker cannot name has no
+    /// variants to enumerate.
+    check: bool,
+    enum_name: Option<String>,
+    variants: Vec<(String, bool)>,
+    catch_all: bool,
+    guarded: bool,
+}
+
+impl Coverage {
+    /// Say what no arm reaches (E0133). A guarded arm is not evidence, which is
+    /// why `Some(x) if x > 0 =>` leaves `Some` unhandled.
+    fn finish(self, checker: &mut Checker, subject: &Ty, span: Span) {
+        if !self.check || self.catch_all {
+            return;
+        }
+        let missing = self.missing();
+        if missing.is_empty() {
+            if !self.variants.is_empty() {
+                return;
+            }
+            checker.report(
+                span,
+                Diagnostic::error(
+                    code::NON_EXHAUSTIVE,
+                    format!("a `match` on a `{}` needs an arm for every value", subject.name()),
+                )
+                .with_note("add a `_ =>` arm for whatever the others leave"),
+            );
+            return;
+        }
+        let which = missing
+            .iter()
+            .map(|variant| match &self.enum_name {
+                Some(owner) => format!("`{owner}::{variant}`"),
+                None => format!("`{variant}`"),
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        let (word, verb) = if missing.len() == 1 {
+            ("variant", "is")
+        } else {
+            ("variants", "are")
+        };
+        checker.report(
+            span,
+            Diagnostic::error(
+                code::NON_EXHAUSTIVE,
+                format!("`match` is not exhaustive: {word} {which} {verb} not handled"),
+            )
+            .with_note("handle what is left, or add a `_ =>` arm"),
+        );
+    }
+
+    fn for_subject(shape: Option<&Shape>, check: bool) -> Coverage {
+        Coverage {
+            check,
+            enum_name: shape.map(|shape| shape.name.clone()),
+            variants: shape
+                .map(|shape| {
+                    shape
+                        .variants
+                        .iter()
+                        .map(|(name, _)| (name.clone(), false))
+                        .collect()
+                })
+                .unwrap_or_default(),
+            catch_all: false,
+            guarded: false,
+        }
+    }
+
+    fn mark(&mut self, variant: &str) {
+        if self.guarded {
+            return;
+        }
+        if let Some((_, covered)) = self.variants.iter_mut().find(|(name, _)| name == variant) {
+            *covered = true;
+        }
+    }
+
+    fn missing(&self) -> Vec<String> {
+        self.variants
+            .iter()
+            .filter(|(_, covered)| !*covered)
+            .map(|(name, _)| name.clone())
+            .collect()
+    }
+}
+
+/// The variant half of a `Shape::Rect` spelling, or the name itself when the
+/// enum was left out.
+fn variant_of_name(name: &str) -> &str {
+    name.rsplit("::").next().unwrap_or(name)
+}
+
 fn primitive(name: &str) -> Option<Ty> {
     Some(match name {
         "bool" => Ty::Bool,
@@ -226,7 +349,7 @@ fn primitive(name: &str) -> Option<Ty> {
         "f64" | "float" => Ty::F64,
         "string" => Ty::Str,
         "rawptr" => Ty::Ptr,
-        "never" => return Some(Ty::Opaque),
+        "never" => Ty::Never,
         _ => return None,
     })
 }
@@ -266,7 +389,8 @@ pub(crate) struct Checker<'a> {
     methods: HashMap<(String, String), Signature>,
     structs: HashMap<String, Vec<(String, Type)>>,
     aliases: HashMap<String, Type>,
-    enums: Vec<String>,
+    /// Every `enum` in the file, over the two the universe predeclares.
+    enums: HashMap<String, Shape>,
     globals: HashMap<String, Context>,
     scopes: Vec<Vec<Context>>,
     result: Ty,
@@ -282,7 +406,10 @@ impl<'a> Checker<'a> {
             methods: HashMap::new(),
             structs: HashMap::new(),
             aliases: HashMap::new(),
-            enums: Vec::new(),
+            enums: sums::prelude()
+                .into_iter()
+                .map(|shape| (shape.name.clone(), shape))
+                .collect(),
             globals: HashMap::new(),
             scopes: Vec::new(),
             result: Ty::Unit,
@@ -310,7 +437,10 @@ impl<'a> Checker<'a> {
                         self.aliases.insert(name.name.clone(), aliased.clone());
                     }
                 }
-                Decl::Enum(decl) => self.enums.push(decl.name.name.clone()),
+                Decl::Enum(decl) => {
+                    let shape = Shape::from_decl(decl);
+                    self.enums.insert(shape.name.clone(), shape);
+                }
                 _ => {}
             }
         }
@@ -351,43 +481,65 @@ impl<'a> Checker<'a> {
     }
 
     fn resolve_type(&self, ty: &Type) -> Ty {
-        self.resolve_type_depth(ty, 0)
+        self.resolve_type_in(ty, 0, &[])
     }
 
-    fn resolve_type_depth(&self, ty: &Type, depth: u32) -> Ty {
+    /// A source type, with the enclosing enum's parameters replaced by the
+    /// arguments of an instantiation. A parameter name is only a type while
+    /// that substitution is in hand, which is why it travels as a binding.
+    fn resolve_type_in(&self, ty: &Type, depth: u32, params: &[(String, Ty)]) -> Ty {
         if depth > 8 {
             return Ty::Opaque;
         }
         match ty {
             Type::Named { name, args, .. } => {
-                if !args.is_empty() {
-                    return Ty::Opaque;
+                if args.is_empty() {
+                    if let Some((_, to)) = params.iter().find(|(known, _)| known == name) {
+                        return to.clone();
+                    }
                 }
                 if let Some(primitive) = primitive(name) {
                     return primitive;
                 }
+                if let Some(shape) = self.enums.get(name) {
+                    let resolved: Vec<Ty> = args
+                        .iter()
+                        .map(|arg| self.resolve_type_in(arg, depth + 1, params))
+                        .collect();
+                    // `Option` without its argument is a value the checker has
+                    // to learn from context, so an omission stays silent.
+                    if !shape.takes(args.len()) {
+                        return Ty::Opaque;
+                    }
+                    return Ty::Enum {
+                        name: name.clone(),
+                        args: resolved,
+                    };
+                }
+                if !args.is_empty() {
+                    return Ty::Opaque;
+                }
                 if self.structs.contains_key(name.as_str()) {
                     return Ty::Struct(name.clone());
                 }
-                if self.enums.iter().any(|known| known == name) {
-                    return Ty::Opaque;
-                }
                 match self.aliases.get(name) {
-                    Some(target) => self.resolve_type_depth(target, depth + 1),
+                    Some(target) => self.resolve_type_in(target, depth + 1, params),
                     None => Ty::Opaque,
                 }
             }
             Type::Pointer { pointee, .. } => {
-                let target = self.resolve_type_depth(pointee, depth + 1);
+                let target = self.resolve_type_in(pointee, depth + 1, params);
                 if target == Ty::Opaque {
                     Ty::Ptr
                 } else {
                     Ty::Targeted(Box::new(target))
                 }
             }
-            Type::Array { element, .. } => Ty::Array(Box::new(self.resolve_type_depth(element, depth + 1))),
+            Type::Array { element, .. } => {
+                Ty::Array(Box::new(self.resolve_type_in(element, depth + 1, params)))
+            }
             Type::Slice { element, .. } => {
-                Ty::Slice(Box::new(self.resolve_type_depth(element, depth + 1)))
+                Ty::Slice(Box::new(self.resolve_type_in(element, depth + 1, params)))
             }
             Type::Tuple { .. } | Type::Function { .. } | Type::ConstArgument { .. } => Ty::Opaque,
             Type::Error { .. } => Ty::Opaque,
@@ -426,6 +578,9 @@ impl<'a> Checker<'a> {
         if *expected == Ty::Opaque || value == Ty::Opaque {
             return expected.clone();
         }
+        if value == Ty::Never {
+            return expected.clone();
+        }
         match (&value, expected) {
             (Ty::IntConst(literal), to) if to.is_integral() || *to == Ty::Bool => {
                 if to.fits(*literal) {
@@ -457,6 +612,12 @@ impl<'a> Checker<'a> {
                     )
                     .with_note("write `as` to state the conversion you mean"),
                 );
+                to.clone()
+            }
+            (Ty::Enum { name, args }, to @ Ty::Enum { .. }) => {
+                if !self.enum_fits(name, args, to) {
+                    self.mismatch(span, to, &value);
+                }
                 to.clone()
             }
             (_, to) => {
@@ -494,6 +655,31 @@ impl<'a> Checker<'a> {
         }
     }
 
+    /// Can a value of one enum stand where another is wanted? The name is the
+    /// type (two look-alike enums are different types); an argument the checker
+    /// never learned (`None` alone, a generic left to context) asks for nothing.
+    fn enum_fits(&self, name: &str, args: &[Ty], to: &Ty) -> bool {
+        let Ty::Enum {
+            name: want,
+            args: want_args,
+        } = to
+        else {
+            return false;
+        };
+        if name != want {
+            return false;
+        }
+        if want_args.is_empty() || args.is_empty() {
+            return true;
+        }
+        if args.len() != want_args.len() {
+            return false;
+        }
+        args.iter().zip(want_args).all(|(got, want)| {
+            *got == *want || *got == Ty::Opaque || *want == Ty::Opaque || *got == Ty::Never
+        })
+    }
+
     fn mismatch(&mut self, span: Span, expected: &Ty, got: &Ty) {
         let from = got.defaulted();
         self.report(
@@ -507,10 +693,17 @@ impl<'a> Checker<'a> {
 
     /// Two arms of an `if` expression must agree on one type.
     fn unify(&mut self, a: Ty, b: Ty, span: Span) -> Ty {
+        self.meet(a, b, span, "an `if` value")
+    }
+
+    /// Join two branches that must answer with one type. `what` names the
+    /// construct, so the complaint reads `the arms of a \`match\` must agree`.
+    fn meet(&mut self, a: Ty, b: Ty, span: Span, what: &str) -> Ty {
         if a == Ty::Opaque || b == Ty::Opaque {
             return Ty::Opaque;
         }
         match (&a, &b) {
+            (Ty::Never, other) | (other, Ty::Never) => other.clone(),
             (Ty::IntConst(left), Ty::IntConst(right)) => {
                 if left == right {
                     Ty::IntConst(*left)
@@ -541,7 +734,7 @@ impl<'a> Checker<'a> {
                         Diagnostic::error(
                             code::TYPE_MISMATCH,
                             format!(
-                                "the arms of an `if` value must agree: `{}` vs `{}`",
+                                "the arms of {what} must agree: `{}` vs `{}`",
                                 a.name(),
                                 b.name()
                             ),
@@ -887,6 +1080,627 @@ impl<'a> Checker<'a> {
         }
     }
 
+    // ------------------------------------------------------------ sum types
+
+    /// The enum a value belongs to, when it belongs to one.
+    fn sum_of<'t>(&self, ty: &'t Ty) -> Option<(&'t str, &'t [Ty])> {
+        match ty {
+            Ty::Enum { name, args } => Some((name, args)),
+            _ => None,
+        }
+    }
+
+    /// Which enum a name written without its enum belongs to. The prelude's two
+    /// answer first; a program's own enum may own the name, and where more than
+    /// one does the spelling is ambiguous, so nothing is claimed.
+    fn owner_of_variant(&self, variant: &str) -> Option<String> {
+        for name in ["Option", "Result"] {
+            if let Some(shape) = self.enums.get(name) {
+                if shape.has_variant(variant) {
+                    return Some(name.to_string());
+                }
+            }
+        }
+        let owners: Vec<&String> = self
+            .enums
+            .iter()
+            .filter(|(_, shape)| shape.has_variant(variant))
+            .map(|(name, _)| name)
+            .collect();
+        match owners.as_slice() {
+            [one] => Some((*one).clone()),
+            _ => None,
+        }
+    }
+
+    /// A variant named with no parentheses and no fields: `Shape::Empty`,
+    /// `ParseError::OutOfRange`, `None`. A payload-carrying variant spelled this
+    /// way is a call missing its argument, which is worth one diagnostic.
+    fn nullary_variant_of(
+        &mut self,
+        owner: &str,
+        variant: &str,
+        span: Span,
+        expected: Option<&Ty>,
+    ) -> Ty {
+        let Some(shape) = self.enums.get(owner).cloned() else {
+            return Ty::Opaque;
+        };
+        let Some((_, payload)) = shape.variant(variant) else {
+            return Ty::Opaque;
+        };
+        if !payload.is_empty() {
+            self.error(
+                code::TYPE_MISMATCH,
+                format!("`{owner}::{variant}` needs its payload: write `{owner}::{variant}(..)`"),
+                span,
+            );
+            return Ty::Opaque;
+        }
+        self.enum_value(&shape, expected)
+    }
+
+    /// The same, where the enum is not written: `None`, or a bare `Active`.
+    fn nullary_variant(&mut self, name: &str, span: Span, expected: Option<&Ty>) -> Ty {
+        let Some(owner) = self.owner_of_variant(name) else {
+            return Ty::Opaque;
+        };
+        self.nullary_variant_of(&owner, name, span, expected)
+    }
+
+    /// The instantiation a sum-type value takes: the one the surrounding
+    /// program asks for, or parameters the checker has no way to know yet. With
+    /// none of them known the value is left unknown too, which is how a `None`
+    /// beside a C pointer stays quiet (DESIGN 2). A raw pointer is a position a
+    /// `None` can fill with its null, and that is what it fills.
+    fn enum_value(&self, shape: &Shape, expected: Option<&Ty>) -> Ty {
+        match expected {
+            Some(Ty::Enum { name, args }) if name == &shape.name && shape.takes(args.len()) => {
+                Ty::Enum {
+                    name: shape.name.clone(),
+                    args: args.clone(),
+                }
+            }
+            Some(Ty::Ptr) => Ty::Ptr,
+            _ => {
+                if shape.params.is_empty() {
+                    return Ty::Enum {
+                        name: shape.name.clone(),
+                        args: Vec::new(),
+                    };
+                }
+                Ty::Opaque
+            }
+        }
+    }
+
+    /// `Shape::Circle(2.0)`, `Some(3)`, `Err(ParseError::OutOfRange)`.
+    fn constructor(
+        &mut self,
+        owner: &str,
+        variant: &str,
+        args: &[Expr],
+        span: Span,
+        expected: Option<&Ty>,
+    ) -> Ty {
+        let Some(shape) = self.enums.get(owner).cloned() else {
+            return Ty::Opaque;
+        };
+        let Some((_, payload)) = shape.variant(variant).map(|(i, p)| (i, p.clone())) else {
+            self.report(
+                span,
+                Diagnostic::error(code::UNDECLARED, format!("`{owner}` has no variant `{variant}`"))
+                    .with_note(format!(
+                        "the variants of `{owner}` are {}",
+                        shape
+                            .variants
+                            .iter()
+                            .map(|(name, _)| format!("{owner}::{name}"))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    )),
+            );
+            for argument in args {
+                let _ = self.infer(argument);
+            }
+            return Ty::Opaque;
+        };
+        let written = payload_arity(&payload);
+        if written != args.len() {
+            self.report(
+                span,
+                Diagnostic::error(
+                    code::WRONG_ARITY,
+                    format!(
+                        "`{owner}::{variant}` takes {written} payload(s), the call gives {}",
+                        args.len()
+                    ),
+                ),
+            );
+            for argument in args {
+                let _ = self.infer(argument);
+            }
+            return self.enum_value(&shape, expected);
+        }
+        let inferred: Vec<Ty> = args
+            .iter()
+            .map(|argument| self.infer(argument).defaulted())
+            .collect();
+        let instantiation = self.instantiation(&shape, &payload, &inferred, expected);
+        let resolved = self.payload_of(&shape, &instantiation, &payload);
+        for (argument, want) in args.iter().zip(resolved) {
+            self.expect(argument, &want);
+        }
+        Ty::Enum {
+            name: shape.name.clone(),
+            args: instantiation,
+        }
+    }
+
+    /// Which parameters an instantiation uses. The context decides when it has
+    /// a say; otherwise a parameter is whatever the payload written for it is.
+    fn instantiation(
+        &self,
+        shape: &Shape,
+        payload: &Payload,
+        inferred: &[Ty],
+        expected: Option<&Ty>,
+    ) -> Vec<Ty> {
+        if let Some(Ty::Enum { name, args }) = expected {
+            if name == &shape.name && shape.takes(args.len()) {
+                return args.clone();
+            }
+        }
+        let written: Vec<&Type> = match payload {
+            Payload::Empty => Vec::new(),
+            Payload::Tuple(types) => types.iter().collect(),
+            Payload::Named(fields) => fields.iter().map(|(_, ty)| ty).collect(),
+        };
+        let mut known: Vec<(String, Ty)> = Vec::new();
+        for (spelled, got) in written.iter().zip(inferred) {
+            if let Type::Named { name, args, .. } = spelled {
+                if args.is_empty()
+                    && shape.params.iter().any(|param| param == name)
+                    && !known.iter().any(|(known, _)| known == name)
+                {
+                    known.push((name.clone(), got.clone()));
+                }
+            }
+        }
+        shape
+            .params
+            .iter()
+            .map(|param| {
+                known
+                    .iter()
+                    .find(|(known, _)| known == param)
+                    .map(|(_, ty)| ty.clone())
+                    .unwrap_or(Ty::Opaque)
+            })
+            .collect()
+    }
+
+    /// `Shape::Rect { w: 3.0, h: 4.0 }`: a variant whose payload is named, made
+    /// field by field. Every field the payload declares has to be written.
+    fn named_constructor(
+        &mut self,
+        owner: &str,
+        written: &str,
+        fields: &[(dux_ast::Ident, Expr)],
+        span: Span,
+        expected: Option<&Ty>,
+    ) -> Ty {
+        let Some(shape) = self.enums.get(owner).cloned() else {
+            return Ty::Opaque;
+        };
+        let variant = variant_of_name(written);
+        let Some(payload) = shape.variant(variant).map(|(_, payload)| payload.clone()) else {
+            return Ty::Opaque;
+        };
+        if !matches!(payload, Payload::Named(_)) && !payload.is_empty() {
+            self.error(
+                code::TYPE_MISMATCH,
+                format!("`{written}` takes its payload by position: write `{written}(..)`"),
+                span,
+            );
+        }
+        let declared = self.payload_fields(&shape, &self.made_of(&shape, expected), &payload);
+        for (field, value) in fields {
+            match declared.iter().find(|(known, _)| known == &field.name) {
+                Some((_, ty)) => {
+                    self.expect(value, ty);
+                }
+                None => {
+                    let _ = self.infer(value);
+                    self.missing_field(written, &field.name, field.span);
+                }
+            }
+        }
+        let left: Vec<&String> = declared
+            .iter()
+            .filter(|(known, _)| !fields.iter().any(|(field, _)| field.name == *known))
+            .map(|(known, _)| known)
+            .collect();
+        if !left.is_empty() {
+            self.report(
+                span,
+                Diagnostic::error(
+                    code::TYPE_MISMATCH,
+                    format!(
+                        "`{written}` needs {}",
+                        left.iter()
+                            .map(|field| format!("`{field}`"))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ),
+                )
+                .with_note("a sum-type value writes every field of its payload"),
+            );
+        }
+        self.enum_value(&shape, expected)
+    }
+
+    /// The arguments an enum is made of where nothing says otherwise: its own
+    /// parameters, standing in for whatever the checker is not told.
+    fn made_of(&self, shape: &Shape, expected: Option<&Ty>) -> Vec<Ty> {
+        match expected {
+            Some(Ty::Enum { name, args }) if name == &shape.name && shape.takes(args.len()) => {
+                args.clone()
+            }
+            _ => shape.params.iter().map(|_| Ty::Opaque).collect(),
+        }
+    }
+
+    /// A variant's payload with the enum's parameters replaced by an
+    /// instantiation's arguments.
+    fn payload_of(&self, shape: &Shape, args: &[Ty], payload: &Payload) -> Vec<Ty> {
+        let bindings: Vec<(String, Ty)> = shape
+            .params
+            .iter()
+            .cloned()
+            .zip(args.iter().cloned())
+            .collect();
+        match payload {
+            Payload::Empty => Vec::new(),
+            Payload::Tuple(types) => types
+                .iter()
+                .map(|ty| self.resolve_type_in(ty, 1, &bindings))
+                .collect(),
+            Payload::Named(fields) => fields
+                .iter()
+                .map(|(_, ty)| self.resolve_type_in(ty, 1, &bindings))
+                .collect(),
+        }
+    }
+
+    /// The fields a struct-payload variant declares, resolved the same way.
+    fn payload_fields(
+        &self,
+        shape: &Shape,
+        args: &[Ty],
+        payload: &Payload,
+    ) -> Vec<(String, Ty)> {
+        let bindings: Vec<(String, Ty)> = shape
+            .params
+            .iter()
+            .cloned()
+            .zip(args.iter().cloned())
+            .collect();
+        match payload {
+            Payload::Named(fields) => fields
+                .iter()
+                .map(|(name, ty)| (name.clone(), self.resolve_type_in(ty, 1, &bindings)))
+                .collect(),
+            _ => Vec::new(),
+        }
+    }
+
+    /// What the arms of a `match` on this type have to cover.
+    fn coverage(&self, subject: &Ty) -> Coverage {
+        match subject {
+            Ty::Opaque => Coverage::for_subject(None, false),
+            Ty::Bool => Coverage {
+                check: true,
+                enum_name: None,
+                variants: vec![("true".to_string(), false), ("false".to_string(), false)],
+                catch_all: false,
+                guarded: false,
+            },
+            Ty::Enum { name, .. } => Coverage::for_subject(self.enums.get(name), true),
+            _ => Coverage::for_subject(None, true),
+        }
+    }
+
+    /// Check a pattern against the value it will be matched against, binding
+    /// the names it introduces. The answer says whether the pattern refutes
+    /// nothing: a wildcard, an `else`, a name that binds the whole value.
+    fn pattern(&mut self, pattern: &Pattern, subject: &Ty, coverage: &mut Coverage) -> bool {
+        match pattern {
+            Pattern::Wildcard { .. } | Pattern::Else { .. } | Pattern::Error { .. } => true,
+            Pattern::Literal { value, span } => {
+                let spelled = self.infer(value);
+                self.coerce(spelled, subject, *span);
+                if let Expr::Bool { value, .. } = &**value {
+                    coverage.mark(if *value { "true" } else { "false" });
+                }
+                false
+            }
+            Pattern::Range { start, end, .. } => {
+                for bound in [start, end] {
+                    match &**bound {
+                        Pattern::Literal { value, span } => {
+                            let spelled = self.infer(value);
+                            self.coerce(spelled, subject, *span);
+                        }
+                        other => {
+                            let _ = self.pattern(other, subject, coverage);
+                        }
+                    }
+                }
+                false
+            }
+            Pattern::Or { alternatives, .. } => {
+                let mut covers = false;
+                for alternative in alternatives {
+                    covers |= self.pattern(alternative, subject, coverage);
+                }
+                covers
+            }
+            Pattern::Name { name, span } => {
+                match self.enum_variant_of(subject, &name.name) {
+                    Some(true) => {
+                        coverage.mark(&name.name);
+                        false
+                    }
+                    Some(false) => {
+                        self.error(
+                            code::TYPE_MISMATCH,
+                            format!(
+                                "`{}` carries a payload: write `{}(..)` to take it apart",
+                                name.name, name.name
+                            ),
+                            *span,
+                        );
+                        false
+                    }
+                    None => {
+                        self.define(&name.name, subject.clone(), false);
+                        true
+                    }
+                }
+            }
+            Pattern::Path { qualifier, name, span } => {
+                let Some((_, _, payload)) =
+                    self.variant_of_pattern(Some(qualifier), name, subject, *span)
+                else {
+                    return false;
+                };
+                coverage.mark(name);
+                if !payload.is_empty() {
+                    self.error(
+                        code::TYPE_MISMATCH,
+                        format!(
+                            "`{qualifier}::{name}` carries a payload: write `{qualifier}::{name}(..)`",
+                        ),
+                        *span,
+                    );
+                }
+                false
+            }
+            Pattern::Tuple {
+                qualifier,
+                name,
+                elements,
+                span,
+            } => {
+                let resolved = self.variant_of_pattern(qualifier.as_deref(), name, subject, *span);
+                let want = match &resolved {
+                    Some((shape, args, payload)) => {
+                        coverage.mark(name);
+                        self.payload_of(shape, args, payload)
+                    }
+                    None => elements.iter().map(|_| Ty::Opaque).collect(),
+                };
+                if resolved.is_some() && want.len() != elements.len() {
+                    self.error(
+                        code::WRONG_ARITY,
+                        format!(
+                            "`{name}` carries {} payload(s), the pattern gives {}",
+                            want.len(),
+                            elements.len()
+                        ),
+                        *span,
+                    );
+                }
+                for (element, want) in elements.iter().zip(want) {
+                    let _ = self.pattern(element, &want, coverage);
+                }
+                false
+            }
+            Pattern::Struct {
+                qualifier,
+                name,
+                fields,
+                rest,
+                span,
+            } => {
+                let resolved = self.variant_of_pattern(qualifier.as_deref(), name, subject, *span);
+                let declared = match &resolved {
+                    Some((shape, args, payload)) => {
+                        coverage.mark(name);
+                        if matches!(payload, Payload::Tuple(_)) && !payload.is_empty() {
+                            self.error(
+                                code::TYPE_MISMATCH,
+                                format!(
+                                    "`{name}` carries its payload by position: write `{name}(..)`",
+                                ),
+                                *span,
+                            );
+                        }
+                        self.payload_fields(shape, args, payload)
+                    }
+                    None => Vec::new(),
+                };
+                for field in fields {
+                    match field {
+                        FieldPattern::Shorthand { name: field, span } => {
+                            match declared.iter().find(|(known, _)| known == &field.name) {
+                                Some((_, ty)) => self.define(&field.name, ty.clone(), false),
+                                None => {
+                                    if resolved.is_some() {
+                                        self.error(
+                                            code::TYPE_MISMATCH,
+                                            format!("`{name}` has no field `{}`", field.name),
+                                            *span,
+                                        );
+                                    }
+                                    self.define(&field.name, Ty::Opaque, false);
+                                }
+                            }
+                        }
+                        FieldPattern::Nested {
+                            name: field,
+                            pattern,
+                            ..
+                        } => {
+                            let want = declared
+                                .iter()
+                                .find(|(known, _)| known == &field.name)
+                                .map(|(_, ty)| ty.clone())
+                                .unwrap_or(Ty::Opaque);
+                            if want == Ty::Opaque && resolved.is_some() {
+                                self.error(
+                                    code::TYPE_MISMATCH,
+                                    format!("`{name}` has no field `{}`", field.name),
+                                    field.span,
+                                );
+                            }
+                            let _ = self.pattern(pattern, &want, coverage);
+                        }
+                    }
+                }
+                if !rest {
+                    let missing: Vec<&String> = declared
+                        .iter()
+                        .filter(|(known, _)| {
+                            !fields.iter().any(|field| match field {
+                                FieldPattern::Shorthand { name, .. }
+                                | FieldPattern::Nested { name, .. } => name.name == *known,
+                            })
+                        })
+                        .map(|(known, _)| known)
+                        .collect();
+                    if !missing.is_empty() {
+                        self.report(
+                            *span,
+                            Diagnostic::error(
+                                code::TYPE_MISMATCH,
+                                format!(
+                                    "the pattern for `{name}` leaves out {}",
+                                    missing
+                                        .iter()
+                                        .map(|field| format!("`{field}`"))
+                                        .collect::<Vec<_>>()
+                                        .join(", ")
+                                ),
+                            )
+                            .with_note("write every field, or `..` to leave the rest alone"),
+                        );
+                    }
+                }
+                false
+            }
+        }
+    }
+
+    /// Is a bare name a variant of the enum being matched? `Some(true)` says it
+    /// is and carries nothing, so the pattern matches without binding.
+    fn enum_variant_of(&self, subject: &Ty, name: &str) -> Option<bool> {
+        let (owner, _) = self.sum_of(subject)?;
+        let shape = self.enums.get(owner)?;
+        shape.variant(name).map(|(_, payload)| payload.is_empty())
+    }
+
+    /// Resolve a variant written in a pattern against the type being matched.
+    /// `None` means the pattern is already reported, or the subject is a value
+    /// the checker cannot name — and a pattern over an unknown still binds.
+    fn variant_of_pattern(
+        &mut self,
+        owner: Option<&str>,
+        variant: &str,
+        subject: &Ty,
+        span: Span,
+    ) -> Option<(Shape, Vec<Ty>, Payload)> {
+        let owner = match owner {
+            Some(owner) => owner.to_string(),
+            None => match self.owner_of_variant(variant) {
+                Some(owner) => owner,
+                None => {
+                    self.error(
+                        code::UNDECLARED,
+                        format!("`{variant}` is not a variant of anything in scope"),
+                        span,
+                    );
+                    return None;
+                }
+            },
+        };
+        let Some(shape) = self.enums.get(&owner).cloned() else {
+            self.error(
+                code::TYPE_MISMATCH,
+                format!("`{owner}` is not a sum type, so `{owner}::{variant}` matches nothing"),
+                span,
+            );
+            return None;
+        };
+        let Some(payload) = shape.variant(variant).map(|(_, payload)| payload.clone()) else {
+            self.report(
+                span,
+                Diagnostic::error(code::UNDECLARED, format!("`{owner}` has no variant `{variant}`"))
+                    .with_note(format!(
+                        "the variants of `{owner}` are {}",
+                        shape
+                            .variants
+                            .iter()
+                            .map(|(name, _)| format!("{owner}::{name}"))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    )),
+            );
+            return None;
+        };
+        if !matches!(subject, Ty::Opaque) {
+            let (named, args) = match self.sum_of(subject) {
+                Some((named, args)) => (named.to_string(), args.to_vec()),
+                None => {
+                    self.error(
+                        code::TYPE_MISMATCH,
+                        format!(
+                            "`{owner}::{variant}` cannot match a value of type `{}`",
+                            subject.name()
+                        ),
+                        span,
+                    );
+                    return None;
+                }
+            };
+            if named != owner {
+                self.error(
+                    code::TYPE_MISMATCH,
+                    format!("this arm is a `{owner}`, the `match` is on a `{named}`"),
+                    span,
+                );
+                return None;
+            }
+            return Some((shape, args, payload));
+        }
+        Some((
+            shape.clone(),
+            shape.params.iter().map(|_| Ty::Opaque).collect(),
+            payload,
+        ))
+    }
+
     // ---------------------------------------------------------- expressions
 
     /// Infer the type of `expr` with no particular expectation.
@@ -931,9 +1745,9 @@ impl<'a> Checker<'a> {
                 dux_ast::StrKind::CString => Ty::Ptr,
                 _ => Ty::Str,
             },
-            Expr::Ident { name, .. } => match self.lookup(name).map(|context| context.ty.clone()) {
+            Expr::Ident { name, span } => match self.lookup(name).map(|context| context.ty.clone()) {
                 Some(ty) => ty,
-                None => Ty::Opaque,
+                None => self.nullary_variant(name, *span, expected),
             },
             Expr::Paren { inner, .. } => self.typed(inner, expected),
             Expr::Unary { op, operand, span } => self.unary(*op, operand, *span),
@@ -945,7 +1759,7 @@ impl<'a> Checker<'a> {
                 let _ = self.infer(value);
                 self.resolve_type(target)
             }
-            Expr::Call { callee, args, span } => self.call(callee, args, *span),
+            Expr::Call { callee, args, span } => self.call(callee, args, *span, expected),
             Expr::Field { base, name, .. } => {
                 let base = self.infer(base);
                 self.field_type(&base, &name.name, name.span)
@@ -1025,8 +1839,13 @@ impl<'a> Checker<'a> {
                 let _ = span;
                 Ty::Array(Box::new(element.defaulted()))
             }
-            Expr::Path { .. } => Ty::Opaque,
+            Expr::Path { qualifier, name, span } => self.nullary_variant_of(qualifier, name, *span, expected),
             Expr::StructLiteral { name, fields, span } => {
+                if !self.structs.contains_key(name.as_str()) {
+                    if let Some(owner) = self.owner_of_variant(variant_of_name(name)) {
+                        return self.named_constructor(&owner, name, fields, *span, expected);
+                    }
+                }
                 let declared = self.structs.get(name).cloned();
                 for (field, value) in fields {
                     match &declared {
@@ -1059,17 +1878,23 @@ impl<'a> Checker<'a> {
                 }
                 Ty::Str
             }
-            Expr::CondBinding { pattern, .. } => {
-                let _ = pattern;
+            Expr::CondBinding { pattern, value, .. } => {
+                let subject = self.infer(value);
+                self.scopes.push(Vec::new());
+                let _ = self.pattern(pattern, &subject, &mut Coverage::for_subject(None, false));
+                self.scopes.pop();
                 Ty::Bool
             }
             Expr::Match { subject, arms, span } => {
-                let _ = self.infer(subject);
-                self.arms(arms, expected, *span)
+                let subject = self.infer(subject);
+                self.arms(arms, &subject, expected, *span)
             }
             Expr::If { cond, then_arm, else_arm, span } => {
-                self.condition(cond);
+                let bound = self.condition(cond);
                 let then_ty = self.expression_in(then_arm, expected);
+                if bound {
+                    self.scopes.pop();
+                }
                 match else_arm {
                     Some(other) => {
                         let else_ty = self.expression_in(other, expected);
@@ -1183,7 +2008,7 @@ impl<'a> Checker<'a> {
         (resolved != Ty::Opaque).then_some(resolved)
     }
 
-    fn call(&mut self, callee: &Expr, args: &[Expr], span: Span) -> Ty {
+    fn call(&mut self, callee: &Expr, args: &[Expr], span: Span, expected: Option<&Ty>) -> Ty {
         let name = match callee {
             Expr::Ident { name, .. } => Some(name.clone()),
             Expr::Paren { inner, .. } => match inner.as_ref() {
@@ -1214,14 +2039,20 @@ impl<'a> Checker<'a> {
                     return result;
                 }
             }
-            if matches!(name.as_str(), "Some" | "None" | "Ok" | "Err") {
-                for arg in args {
-                    let _ = self.infer(arg);
+            // `Some(3)` and `Err(e)` are spelled without their enum, which is
+            // how a predeclared sum type is meant to read.
+            if !self.functions.contains_key(name) {
+                if let Some(owner) = self.owner_of_variant(name) {
+                    return self.constructor(&owner, name, args, span, expected);
                 }
-                return Ty::Opaque;
             }
             if let Some(signature) = self.functions.get(name).cloned() {
                 return self.call_signature(&signature, args, span);
+            }
+        }
+        if let Expr::Path { qualifier, name, .. } = callee {
+            if self.enums.contains_key(qualifier) {
+                return self.constructor(qualifier, name, args, span, expected);
             }
         }
         if let Expr::Field { base, name, .. } = callee {
@@ -1370,8 +2201,11 @@ impl<'a> Checker<'a> {
             Stmt::Defer { stmt, .. } => self.statement(stmt),
             Stmt::Block { block, .. } => self.block(block),
             Stmt::If { cond, then_branch, else_branch, .. } => {
-                self.condition(cond);
+                let bound = self.condition(cond);
                 self.block(then_branch);
+                if bound {
+                    self.scopes.pop();
+                }
                 if let Some(other) = else_branch {
                     match &**other {
                         Stmt::Block { block, .. } => self.block(block),
@@ -1380,8 +2214,11 @@ impl<'a> Checker<'a> {
                 }
             }
             Stmt::While { cond, body, .. } => {
-                self.condition(cond);
+                let bound = self.condition(cond);
                 self.block(body);
+                if bound {
+                    self.scopes.pop();
+                }
             }
             Stmt::Loop { body, .. } => self.block(body),
             Stmt::For { kind, body, span } => {
@@ -1390,12 +2227,15 @@ impl<'a> Checker<'a> {
                 match kind {
                     ForKind::ThreeClause { init, cond, step } => {
                         self.statement(init);
-                        self.condition(cond);
+                        let bound = self.condition(cond);
                         self.scopes.push(Vec::new());
                         for statement in &body.stmts {
                             self.statement(statement);
                         }
                         self.scopes.pop();
+                        if bound {
+                            self.scopes.pop();
+                        }
                         self.statement(step);
                     }
                     ForKind::In { index, value, iterable } => {
@@ -1421,22 +2261,32 @@ impl<'a> Checker<'a> {
                 }
                 self.scopes.pop();
             }
-            Stmt::Match { subject, arms, .. } => {
-                let _ = self.infer(subject);
-                let _ = self.arms(arms, None, subject.span());
+            Stmt::Match { subject, arms, span } => {
+                let subject = self.infer(subject);
+                let _ = self.arms(arms, &subject, None, *span);
             }
             Stmt::Error { .. } => {}
         }
     }
 
-    /// Walk the arms of a `match`. Each arm binds its own names and its body
-    /// must agree with the others on one type when the `match` is a value.
-    fn arms(&mut self, arms: &[dux_ast::MatchArm], expected: Option<&Ty>, span: Span) -> Ty {
+    /// Walk the arms of a `match`. Each arm binds its own names, its body must
+    /// agree with the others on one type when the `match` is a value, and
+    /// together the arms must reach every value of the subject (DESIGN 4.4).
+    fn arms(
+        &mut self,
+        arms: &[MatchArm],
+        subject: &Ty,
+        expected: Option<&Ty>,
+        span: Span,
+    ) -> Ty {
         let mut joined: Option<Ty> = None;
+        let mut coverage = self.coverage(subject);
         for arm in arms {
             self.scopes.push(Vec::new());
-            for binder in arm.pattern.binders() {
-                self.define(&binder.name, Ty::Opaque, false);
+            coverage.guarded = arm.guard.is_some();
+            let covers = self.pattern(&arm.pattern, subject, &mut coverage);
+            if covers && !coverage.guarded {
+                coverage.catch_all = true;
             }
             if let Some(guard) = &arm.guard {
                 let ty = self.infer(guard);
@@ -1447,15 +2297,21 @@ impl<'a> Checker<'a> {
                 dux_ast::MatchBody::Block(block) => self.block_value(block, expected),
                 dux_ast::MatchBody::Stmt(stmt) => {
                     self.statement(stmt);
-                    Ty::Opaque
+                    match stmt {
+                        Stmt::Return { .. } | Stmt::Break { .. } | Stmt::Continue { .. } => {
+                            Ty::Never
+                        }
+                        _ => Ty::Unit,
+                    }
                 }
             };
             joined = Some(match joined {
                 None => arm_ty,
-                Some(known) => self.unify(known, arm_ty, arm.span),
+                Some(known) => self.meet(known, arm_ty, arm.span, "a `match`"),
             });
             self.scopes.pop();
         }
+        coverage.finish(self, subject, span);
         match joined {
             Some(ty) => ty,
             None => {
@@ -1493,15 +2349,21 @@ impl<'a> Checker<'a> {
         ty
     }
 
-    fn condition(&mut self, cond: &Expr) {
-        if matches!(cond, Expr::CondBinding { .. }) {
-            return;
+    /// Check a control-flow head. A pattern condition binds, so it pushes the
+    /// scope its bindings live in and answers `true` to say the caller owns the
+    /// matching pop, which happens when the body has been checked.
+    fn condition(&mut self, cond: &Expr) -> bool {
+        if let Expr::CondBinding { pattern, value, .. } = cond {
+            let subject = self.infer(value);
+            self.scopes.push(Vec::new());
+            let _ = self.pattern(pattern, &subject, &mut Coverage::for_subject(None, false));
+            return true;
         }
         let ty = self.infer(cond);
-        if ty == Ty::Opaque || ty == Ty::Bool {
-            return;
+        if ty != Ty::Opaque && ty != Ty::Bool {
+            self.require_bool(ty, cond.span(), "this condition needs a `bool`");
         }
-        self.require_bool(ty, cond.span(), "this condition needs a `bool`");
+        false
     }
 
     fn binding(&mut self, name: &str, ty: Option<&Type>, value: Option<&Expr>, span: Span) {
