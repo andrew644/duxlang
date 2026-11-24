@@ -1,0 +1,41 @@
+package main
+
+struct Node {
+    value: i32,
+    next: i64,
+}
+
+fn bump(p: *i32) {
+    *p += 1
+}
+
+fn main() {
+    n: i32 = 1
+    p := &n
+    *p = 2
+    n += 1
+    bump(&n)
+    println($"n={} through the pointer={}", n, *p)
+
+    dims: [i32; 4] = [10, 20, 30, 40]
+    base := &dims[0]
+    third := base + 2
+    println($"base={} third={}", *base, *third)
+
+    bits: rawptr = third as rawptr
+    back := bits as *i32
+    println($"through rawptr={}", *back)
+
+    node := Node { value: 7, next: 0 }
+    q := &node
+    q.value = 9
+    q.next = 12
+    println($"value={} next={} seen through q: {} {}", node.value, node.next, q.value, q.next)
+    other := &node
+    if q == other {
+        println("q and other point at the same node")
+    }
+    tail := &node.next
+    *tail = 21
+    println($"node.next={} through tail={}", node.next, *tail)
+}

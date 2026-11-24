@@ -486,3 +486,120 @@ fn main() {
     assert!(errors[0].message.contains("has no field `z`"), "{errors:?}");
     assert!(errors[0].message.contains("Vec3"), "{errors:?}");
 }
+
+#[test]
+fn address_of_borrows_the_binding_and_deref_reads_through_it() {
+    let ir = build(
+        "package main
+fn main() {
+    n: i32 = 1
+    p := &n
+    *p = 2
+    println($\"{}\", *p)
+}",
+    )
+    .expect("builds")
+    .ir_text();
+    assert!(
+        ir.contains("store ptr %n, ptr %p"),
+        "`&n` is the binding's own slot:\n{ir}"
+    );
+    assert!(
+        ir.contains("store i32 2, ptr %load"),
+        "`*p = 2` stores through the pointer:\n{ir}"
+    );
+    assert!(ir.contains("load i32, ptr %load"), "{ir}");
+}
+
+#[test]
+fn pointer_arithmetic_steps_by_whole_targets() {
+    let ir = build(
+        "package main
+fn main() {
+    dims: [i32; 4] = [10, 20, 30, 40]
+    base := &dims[0]
+    third := base + 2
+    println($\"{}\", *third)
+}",
+    )
+    .expect("builds")
+    .ir_text();
+    assert!(
+        ir.contains("getelementptr inbounds i32, ptr %idx, i64 %addtmp")
+            || ir.contains("getelementptr i32, ptr"),
+        "the step is typed by the target, so `+ 2` is two i32:\n{ir}"
+    );
+}
+
+#[test]
+fn a_field_of_a_pointer_auto_dereferences() {
+    let ir = build(
+        "package main
+struct Vec3 {
+    x: f32,
+}
+fn main() {
+    v := Vec3 { x: 1.0 }
+    p := &v
+    p.x = 2.0
+    println($\"{}\", p.x)
+}",
+    )
+    .expect("builds")
+    .ir_text();
+    assert!(
+        ir.contains("load ptr, ptr %p") || ir.contains("load ptr, ptr"),
+        "the pointer is read out of its slot before the field is stepped:\n{ir}"
+    );
+    assert!(
+        ir.contains("getelementptr %Vec3, ptr %deref, i32 0, i32 0"),
+        "{ir}"
+    );
+}
+
+#[test]
+fn rawptr_needs_a_cast_before_it_is_read_or_stepped() {
+    let errors = build(
+        "package main
+fn main() {
+    dims: [i32; 2] = [1, 2]
+    base := &dims[0]
+    bits: rawptr = base as rawptr
+    println($\"{}\", *bits)
+}",
+    )
+    .unwrap_err();
+    assert_eq!(errors[0].code, dux_diag::code::TYPE_MISMATCH, "{errors:?}");
+    assert!(errors[0].message.contains("`rawptr`"), "{errors:?}");
+
+    let errors = build(
+        "package main
+fn main() {
+    dims: [i32; 2] = [1, 2]
+    base := &dims[0]
+    bits: rawptr = base as rawptr
+    later := bits + 1
+    println($\"{}\", *later)
+}",
+    )
+    .unwrap_err();
+    assert_eq!(errors[0].code, dux_diag::code::TYPE_MISMATCH, "{errors:?}");
+    assert!(errors[0].message.contains("cast"), "{errors:?}");
+}
+
+#[test]
+fn the_address_of_a_temporary_is_refused() {
+    let errors = build(
+        "package main
+fn one() -> i32 {
+    return 1
+}
+fn main() {
+    p := &one()
+    println($\"{}\", *p)
+}",
+    )
+    .unwrap_err();
+    assert_eq!(errors[0].code, dux_diag::code::TYPE_MISMATCH, "{errors:?}");
+    assert!(errors[0].message.contains("address"), "{errors:?}");
+}

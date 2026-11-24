@@ -1,0 +1,6 @@
+n=4 through the pointer=4
+base=10 third=30
+through rawptr=30
+value=9 next=12 seen through q: 9 12
+q and other point at the same node
+node.next=21 through tail=21

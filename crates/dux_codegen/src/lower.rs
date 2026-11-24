@@ -55,6 +55,9 @@ pub(crate) enum DuxType {
     Str,
     /// `*T` and `rawptr`, both an untyped pointer here.
     Ptr,
+    /// `*T` with a known target: `&x` makes one, `*p` reads and writes it,
+    /// `p.field` auto-dereferences and `p + n` steps by whole targets.
+    Pointer(&'static DuxType),
     /// A fixed array `[T; N]`. The LLVM representation is always a pointer to
     /// `[N x T]` storage; bindings and assignments that must copy do so
     /// element by element.
@@ -169,6 +172,12 @@ impl DuxType {
         matches!(self, DuxType::F32 | DuxType::F64)
     }
 
+    /// Anything that holds an address: `*T` with a target, or a `rawptr`
+    /// without one.
+    fn is_pointer_like(self) -> bool {
+        matches!(self, DuxType::Ptr | DuxType::Pointer(_))
+    }
+
     fn is_numeric(self) -> bool {
         self.is_integral() || self.is_float()
     }
@@ -195,6 +204,7 @@ impl DuxType {
             DuxType::Str | DuxType::Ptr | DuxType::Error => {
                 context.ptr_type(AddressSpace::default()).into()
             }
+            DuxType::Pointer(_) => context.ptr_type(AddressSpace::default()).into(),
             DuxType::Array(info) => info.elem.llvm(context).array_type(info.len as u32).into(),
             DuxType::Struct(info) => info.llvm.into(),
         }
@@ -232,6 +242,7 @@ impl DuxType {
             DuxType::F64 => "f64".to_string(),
             DuxType::Str => "string".to_string(),
             DuxType::Ptr => "rawptr".to_string(),
+            DuxType::Pointer(target) => format!("*{}", target.name()),
             DuxType::Array(info) => format!("[{}; {}]", info.elem.name(), info.len),
             DuxType::Struct(info) => info.name.to_string(),
             DuxType::Error => "<error>".to_string(),
@@ -251,6 +262,7 @@ impl DuxType {
             DuxType::U64 => 1 << 64,
             DuxType::F32 | DuxType::F64 => return true,
             DuxType::Array(..) | DuxType::Struct(..) | DuxType::Str | DuxType::Ptr => return false,
+            DuxType::Pointer(_) => return false,
             DuxType::Error => return false,
         };
         if self.is_signed() {
@@ -584,10 +596,10 @@ impl Emitter {
                 Some(primitive) => Some(primitive),
                 None => self.struct_type_of(name),
             },
-            Type::Pointer { pointee, .. } => {
-                let _ = self.type_of(pointee)?;
-                Some(DuxType::Ptr)
-            }
+            Type::Pointer { pointee, .. } => match self.type_of(pointee) {
+                Some(target) => Some(self.pointer_to(target)),
+                None => Some(DuxType::Ptr),
+            },
             Type::Array { element, len, .. } => {
                 let element = self.type_of(element)?;
                 let Expr::Int { value, .. } = len.as_ref() else {
@@ -666,6 +678,29 @@ impl Emitter {
     fn struct_of(&self, ty: DuxType) -> Option<&'static StructInfo> {
         match ty {
             DuxType::Struct(info) => Some(info),
+            _ => None,
+        }
+    }
+
+    /// `*T` made of `T`.
+    fn pointer_to(&self, ty: DuxType) -> DuxType {
+        DuxType::Pointer(Box::leak(Box::new(ty)))
+    }
+
+    /// What a pointer points at, when the type says.
+    fn pointee_of(&self, ty: DuxType) -> Option<DuxType> {
+        match ty {
+            DuxType::Pointer(target) => Some(*target),
+            _ => None,
+        }
+    }
+
+    /// The record a value reaches: a record, or a pointer to one. `p.field`
+    /// auto-dereferences, so both spellings land here.
+    fn record_of(&self, ty: DuxType) -> Option<&'static StructInfo> {
+        match ty {
+            DuxType::Struct(info) => Some(info),
+            DuxType::Pointer(target) => self.struct_of(*target),
             _ => None,
         }
     }
@@ -1065,10 +1100,28 @@ impl Emitter {
                     }
                 }
             },
+            Expr::Unary {
+                op: UnaryOp::Load,
+                operand,
+                ..
+            } => match self.place_of_expr(module, target) {
+                Some(place) => place,
+                None => {
+                    self.diagnostics.push(
+                        Diagnostic::error(
+                            code::TYPE_MISMATCH,
+                            "`*` writes through a pointer to one value",
+                        )
+                        .with_span(operand.span())
+                        .with_note("a `rawptr` is written through a `*T`: cast it with `as` first"),
+                    );
+                    return;
+                }
+            },
             _ => {
                 self.unsupported(
                     target.span(),
-                    "assigning to anything but a local or an array element",
+                    "assigning to anything but a local, an element or a field",
                 );
                 return;
             }
@@ -1277,6 +1330,11 @@ impl Emitter {
             Typed::float(value.into_float_value(), common)
         } else if common == DuxType::Ptr || common == DuxType::Str {
             Typed::pointer(value.into_pointer_value(), common)
+        } else if self.struct_of(common).is_some() {
+            Typed {
+                core: Core::Aggregate(value.into_struct_value()),
+                ty: common,
+            }
         } else if common.is_numeric() {
             Typed::int(value.into_int_value(), common)
         } else {
@@ -2126,7 +2184,8 @@ impl Emitter {
         self.load(elem, at)
     }
 
-    /// Resolve `base[index]` to the element's address.
+    /// Resolve `base[index]` to the element's address: an element of a fixed
+    /// array, or the `n`th target of a `*T`.
     fn place_of(
         &mut self,
         module: &Module<'static>,
@@ -2135,15 +2194,21 @@ impl Emitter {
     ) -> Option<(DuxType, PointerValue<'static>)> {
         let base_span = base.span();
         let base = self.expr(module, base, None)?;
-        let Some(info) = base.ty.array_info() else {
-            self.unsupported(
-                base_span,
-                &format!(
-                    "indexing a `{}` (strings and slices land at M3)",
-                    base.ty.name()
-                ),
-            );
-            return None;
+        let (element, is_array) = match base.ty.array_info() {
+            Some(info) => (info.elem, true),
+            None => match self.pointee_of(base.ty) {
+                Some(target) => (target, false),
+                None => {
+                    self.unsupported(
+                        base_span,
+                        &format!(
+                            "indexing a `{}` (strings and slices land at M3)",
+                            base.ty.name()
+                        ),
+                    );
+                    return None;
+                }
+            },
         };
         let Core::Ptr(array) = base.core else {
             return None;
@@ -2157,7 +2222,7 @@ impl Emitter {
                 Diagnostic::error(
                     code::TYPE_MISMATCH,
                     format!(
-                        "an array index must be an integer, found `{}`",
+                        "an index must be an integer, found `{}`",
                         index_value.ty.name()
                     ),
                 )
@@ -2170,14 +2235,23 @@ impl Emitter {
         } else {
             self.convert(index_value, DuxType::I64)?
         };
-        let array_ty = info.elem.llvm(self.context).array_type(info.len as u32);
-        let zero = self.context.i64_type().const_zero();
-        let at = unsafe {
-            self.builder
-                .build_gep(array_ty, array, &[zero, index64.int_value()?], "idx")
-        }
-        .ok()?;
-        Some((info.elem, at))
+        let at = if is_array {
+            let info = base.ty.array_info()?;
+            let array_ty = info.elem.llvm(self.context).array_type(info.len as u32);
+            let zero = self.context.i64_type().const_zero();
+            unsafe {
+                self.builder
+                    .build_gep(array_ty, array, &[zero, index64.int_value()?], "idx")
+            }
+            .ok()?
+        } else {
+            unsafe {
+                self.builder
+                    .build_gep(element.llvm(self.context), array, &[index64.int_value()?], "idx")
+            }
+            .ok()?
+        };
+        Some((element, at))
     }
 
     fn copy_array(
@@ -2250,11 +2324,43 @@ impl Emitter {
             Expr::Ident { name, .. } => self.slot_of(name),
             Expr::Field { base, name, .. } => {
                 let (ty, at) = self.place_of_expr(module, base)?;
-                let info = self.struct_of(ty)?;
+                let (info, at) = self.record_address(ty, at)?;
                 let (index, field_ty) = self.field_of(info, &name.name, name.span)?;
                 Some((field_ty, self.field_address(info, at, index)?))
             }
             Expr::Index { base, index, .. } => self.place_of(module, base, index),
+            Expr::Unary {
+                op: UnaryOp::Load,
+                operand,
+                ..
+            } => {
+                let value = self.expr(module, operand, None)?;
+                let target = self.pointee_of(value.ty)?;
+                Some((target, value.pointer_value()?))
+            }
+            _ => None,
+        }
+    }
+
+    /// The record a place reaches and the address of that record. A place of
+    /// record type is the record; a place of `*T` type holds the address, so
+    /// `p.field` reads the pointer out before stepping into the target.
+    fn record_address(
+        &mut self,
+        ty: DuxType,
+        at: PointerValue<'static>,
+    ) -> Option<(&'static StructInfo, PointerValue<'static>)> {
+        match ty {
+            DuxType::Struct(info) => Some((info, at)),
+            DuxType::Pointer(target) => {
+                let info = self.struct_of(*target)?;
+                let pointer = self
+                    .builder
+                    .build_load(self.pointer_to(*target).llvm(self.context), at, "deref")
+                    .ok()?
+                    .into_pointer_value();
+                Some((info, pointer))
+            }
             _ => None,
         }
     }
@@ -2305,7 +2411,7 @@ impl Emitter {
         span: Span,
     ) -> Option<Typed> {
         if let Some((ty, at)) = self.place_of_expr(module, base) {
-            let Some(info) = self.struct_of(ty) else {
+            let Some((info, at)) = self.record_address(ty, at) else {
                 self.unsupported(
                     span,
                     &format!("reading `.{name}` on a `{}`", ty.name()),
@@ -2317,7 +2423,7 @@ impl Emitter {
             return self.load(field_ty, at);
         }
         let value = self.expr(module, base, None)?;
-        let Some(info) = self.struct_of(value.ty) else {
+        let Some(info) = self.record_of(value.ty) else {
             self.unsupported(
                 span,
                 &format!("reading `.{name}` on a `{}`", value.ty.name()),
@@ -2325,6 +2431,10 @@ impl Emitter {
             return None;
         };
         let (index, field_ty) = self.field_of(info, name, name_span)?;
+        if self.pointee_of(value.ty).is_some() {
+            let at = self.field_address(info, value.pointer_value()?, index)?;
+            return self.load(field_ty, at);
+        }
         let slot = self.alloca(value.ty, "record");
         let basic = value.basic()?;
         let _ = self.builder.build_store(slot, basic).ok()?;
@@ -2725,13 +2835,41 @@ impl Emitter {
                     None
                 }
             }
-            UnaryOp::AddressOf => {
-                self.unsupported(operand.span(), "`&x` (pointers land at M3)");
-                None
-            }
+            UnaryOp::AddressOf => match self.place_of_expr(module, operand) {
+                Some((target, at)) => Some(Typed::pointer(at, self.pointer_to(target))),
+                None => {
+                    self.diagnostics.push(
+                        Diagnostic::error(
+                            code::TYPE_MISMATCH,
+                            "`&` takes the address of a binding, a field or an element",
+                        )
+                        .with_span(operand.span())
+                        .with_note("a temporary has no address to keep: bind it first"),
+                    );
+                    None
+                }
+            },
             UnaryOp::Load => {
-                self.unsupported(operand.span(), "`^p` (pointers land at M3)");
-                None
+                let value = self.expr(module, operand, None)?;
+                match self.pointee_of(value.ty) {
+                    Some(target) => self.load(target, value.pointer_value()?),
+                    None => {
+                        let note = if value.ty == DuxType::Ptr {
+                            "`rawptr` carries no type to read through: write `as *i32` first"
+                        } else {
+                            "`*` reads through a `*T`"
+                        };
+                        self.diagnostics.push(
+                            Diagnostic::error(
+                                code::TYPE_MISMATCH,
+                                format!("`*` needs a pointer, found `{}`", value.ty.name()),
+                            )
+                            .with_span(span)
+                            .with_note(note),
+                        );
+                        None
+                    }
+                }
             }
         }
     }
@@ -2750,6 +2888,9 @@ impl Emitter {
         let (left, right) = self.operands(module, lhs, rhs)?;
         if left.ty == DuxType::Error || right.ty == DuxType::Error {
             return Some(Typed::error());
+        }
+        if left.ty.is_pointer_like() || right.ty.is_pointer_like() {
+            return self.pointer_binary(op, left, right, span);
         }
         if left.ty == DuxType::Str || right.ty == DuxType::Str {
             self.unsupported(
@@ -2888,6 +3029,131 @@ impl Emitter {
             }
         };
         Some(Typed::int(value, common))
+    }
+
+    /// `p + n`, `p - n` and pointer comparisons. Arithmetic is scaled by the
+    /// target, so `base + 2` is two whole values away. A `rawptr` has no
+    /// target to scale by and refuses until it is cast.
+    fn pointer_binary(
+        &mut self,
+        op: BinaryOp,
+        left: Typed,
+        right: Typed,
+        span: Span,
+    ) -> Option<Typed> {
+        if op.is_comparison() && left.ty.is_pointer_like() && right.ty.is_pointer_like() {
+            if left.ty != right.ty && left.ty != DuxType::Ptr && right.ty != DuxType::Ptr {
+                self.diagnostics.push(
+                    Diagnostic::error(
+                        code::TYPE_MISMATCH,
+                        format!(
+                            "`{}` compares pointers to different things: `{}` and `{}`",
+                            op.symbol(),
+                            left.ty.name(),
+                            right.ty.name()
+                        ),
+                    )
+                    .with_span(span),
+                );
+                return None;
+            }
+            let predicate = match op {
+                BinaryOp::Eq => IntPredicate::EQ,
+                BinaryOp::NotEq => IntPredicate::NE,
+                BinaryOp::Lt => IntPredicate::ULT,
+                BinaryOp::Gt => IntPredicate::UGT,
+                BinaryOp::Le => IntPredicate::ULE,
+                _ => IntPredicate::UGE,
+            };
+            let left_address = self.pointer_as_address(left)?;
+            let right_address = self.pointer_as_address(right)?;
+            let result = self
+                .builder
+                .build_int_compare(predicate, left_address, right_address, "cmptmp")
+                .ok()?;
+            return Some(Typed::int(result, DuxType::Bool));
+        }
+        let (pointer, count, negative) = match (left.ty.is_pointer_like(), right.ty.is_pointer_like()) {
+            (true, false) if op == BinaryOp::Add => (left, right, false),
+            (true, false) if op == BinaryOp::Sub => (left, right, true),
+            (false, true) if op == BinaryOp::Add => (right, left, false),
+            _ => {
+                self.diagnostics.push(
+                    Diagnostic::error(
+                        code::TYPE_MISMATCH,
+                        format!(
+                            "there is no `{}` between `{}` and `{}`",
+                            op.symbol(),
+                            left.ty.name(),
+                            right.ty.name()
+                        ),
+                    )
+                    .with_span(span)
+                    .with_note("a pointer steps with `+`/`-` by a whole number of targets"),
+                );
+                return None;
+            }
+        };
+        self.step(pointer, count, negative, span)
+    }
+
+    fn pointer_as_address(&mut self, value: Typed) -> Option<IntValue<'static>> {
+        self.convert(value, DuxType::U64)?.int_value()
+    }
+
+    /// `pointer` moved by `count` targets (`count` is an integer value).
+    fn step(
+        &mut self,
+        pointer: Typed,
+        count: Typed,
+        negative: bool,
+        span: Span,
+    ) -> Option<Typed> {
+        let Some(target) = self.pointee_of(pointer.ty) else {
+            self.diagnostics.push(
+                Diagnostic::error(
+                    code::TYPE_MISMATCH,
+                    format!(
+                        "a `{}` takes no arithmetic: cast it `as *T` first",
+                        pointer.ty.name()
+                    ),
+                )
+                .with_span(span),
+            );
+            return None;
+        };
+        if !count.ty.is_integral() || count.ty == DuxType::Bool {
+            self.diagnostics.push(
+                Diagnostic::error(
+                    code::TYPE_MISMATCH,
+                    format!("pointer arithmetic steps by an integer, not a `{}`", count.ty.name()),
+                )
+                .with_span(span),
+            );
+            return None;
+        }
+        let mut steps = self.convert(count, DuxType::I64)?;
+        if negative {
+            steps = self.unary_negate(steps)?;
+        }
+        let at = unsafe {
+            self.builder.build_gep(
+                target.llvm(self.context),
+                pointer.pointer_value()?,
+                &[steps.int_value()?],
+                "next",
+            )
+        }
+        .ok()?;
+        Some(Typed::pointer(at, pointer.ty))
+    }
+
+    fn unary_negate(&mut self, value: Typed) -> Option<Typed> {
+        let negated = self
+            .builder
+            .build_int_neg(value.int_value()?, "negtmp")
+            .ok()?;
+        Some(Typed::int(negated, value.ty))
     }
 
     fn common_type(&mut self, a: DuxType, b: DuxType, span: Span) -> Option<DuxType> {
@@ -3141,6 +3407,30 @@ impl Emitter {
                 core: value.core,
                 ty: to,
             });
+        }
+        if from.is_pointer_like() && to.is_pointer_like() {
+            return Some(Typed {
+                core: value.core,
+                ty: to,
+            });
+        }
+        if from.is_pointer_like() && to.is_integral() {
+            let cast = self
+                .builder
+                .build_ptr_to_int(value.pointer_value()?, to.int_type(self.context), "ptoi")
+                .ok()?;
+            return Some(Typed::int(cast, to));
+        }
+        if from.is_integral() && to.is_pointer_like() {
+            let cast = self
+                .builder
+                .build_int_to_ptr(
+                    value.int_value()?,
+                    self.context.ptr_type(AddressSpace::default()),
+                    "itop",
+                )
+                .ok()?;
+            return Some(Typed::pointer(cast, to));
         }
         if from == DuxType::Ptr && to == DuxType::U64 {
             let cast = self
@@ -4064,7 +4354,7 @@ fn spec_for(ty: DuxType) -> Option<&'static str> {
         DuxType::U64 => "lu",
         DuxType::F32 | DuxType::F64 => "g",
         DuxType::Str => "s",
-        DuxType::Ptr => "p",
+        DuxType::Ptr | DuxType::Pointer(_) => "p",
         DuxType::Array(..) | DuxType::Struct(..) | DuxType::Error => return None,
     })
 }

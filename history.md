@@ -513,3 +513,31 @@ why `copy.z = 9.0` no longer touches `v`.
 Proof: `records.dux` runs with pinned stdout, `record_field_typo.dux` and
 `record_const_field.dux` pin the diagnostics; three new IR tests, five new
 checker tests. 154 tests, clippy clean, corpus still silent.
+
+## Session 11b — M3 step 2: `*T`, `&`, `*`, `rawptr`
+
+Pointers came next because everything else in M3 is built out of addresses:
+slices are `{ data, len }`, a string view is `{ data, len }`, `new(T)` is a
+pointer, and a pointer receiver is how methods mutate.
+
+`DuxType::Pointer(&'static DuxType)` carries the target, which is the whole
+difference between an address and a *pointer*:
+
+- `&x` is the slot of a place; asking for the address of a temporary is an
+  error, because a temporary has no address that outlives the expression.
+- `*p` loads and stores through the pointer, and `*p = v` is an ordinary
+  assignment to a place — which is why it needed no new assignment path.
+- `p.field` reads the pointer out of its slot before stepping into the target,
+  so `p.x = 1.0` writes the record the pointer points at, not the pointer.
+- `p + n` is a typed `getelementptr`, so a step is a whole target wide. A
+  `rawptr` has no target to scale by and says so: *"cast it `as *T` first"*.
+- `rawptr` ⇄ `*T` and pointer ⇄ integer are `as` conversions, never free.
+
+The checker learned `Ty::Targeted`. `*c_char` keeps resolving to the opaque
+`Ty::Ptr`, so C pointers stay as silent as D24 wants, while `*i32` now knows
+enough to refuse `*p = "text"` and to say *"a `*i64` does not fit a `*i32` for
+free; write `as *i32`"*.
+
+Proof: `pointer_basics.dux` runs with pinned stdout; five new IR tests cover
+address-of, deref, auto-deref, scaled arithmetic and the two refusals; two new
+checker tests cover the target type. 168 tests, clippy clean, corpus silent.

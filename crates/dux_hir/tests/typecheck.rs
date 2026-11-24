@@ -662,3 +662,96 @@ fn the_normative_corpus_typechecks_without_a_single_diagnostic() {
         offenders.join("\n")
     );
 }
+
+#[test]
+fn a_pointer_carries_its_target() {
+    assert_eq!(
+        codes(
+            "fn main() {
+    n: i32 = 1
+    p := &n
+    *p = 2
+    wide: i64 = *p
+    p += 1
+    println($\"{}\", wide)
+}
+"
+        ),
+        Vec::<&'static str>::new()
+    );
+    assert_eq!(
+        codes(
+            "fn main() {
+    n: i32 = 1
+    p := &n
+    *p = \"text\"
+    println($\"{}\", *p)
+}
+"
+        ),
+        vec!["E0201"]
+    );
+    assert_eq!(
+        codes(
+            "fn main() {
+    n: i32 = 1
+    wide: i64 = 2
+    p := &n
+    q: *i64 = p
+    println($\"{} {}\", *p, *q)
+}
+"
+        ),
+        vec!["E0200"]
+    );
+    assert_eq!(
+        codes(
+            "fn main() {
+    n: i32 = 1
+    p := &n
+    bits: rawptr = p
+    println($\"{}\", *bits)
+}
+"
+        ),
+        vec!["E0200"]
+    );
+}
+
+#[test]
+fn a_field_reached_through_a_pointer_is_the_targets_field() {
+    assert_eq!(
+        codes(
+            "struct Vec3 {
+    x: f32,
+}
+
+fn main() {
+    v := Vec3 { x: 1.0 }
+    p := &v
+    p.x = 2.0
+    wide: f64 = p.x
+    p.z = 3.0
+    println($\"{}\", wide)
+}
+"
+        ),
+        vec!["E0201"]
+    );
+    assert_eq!(
+        codes(
+            "struct Vec3 {
+    x: f32,
+}
+
+fn main() {
+    v := Vec3 { x: 1.0 }
+    p := &v
+    p.x = 2.0
+    println($\"{}\", p.x)
+}
+"
+        ),
+        Vec::<&'static str>::new()
+    );
+}

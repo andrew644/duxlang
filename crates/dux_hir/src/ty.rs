@@ -37,6 +37,8 @@ pub enum Ty {
     F64,
     Str,
     Ptr,
+    /// `*T`: a non-null pointer with a known target. `rawptr` is `Ptr`.
+    Targeted(Box<Ty>),
     Unit,
     IntConst(i128),
     FloatConst(f64),
@@ -64,6 +66,7 @@ impl Ty {
             Ty::F64 => "f64".to_string(),
             Ty::Str => "string".to_string(),
             Ty::Ptr => "rawptr".to_string(),
+            Ty::Targeted(target) => format!("*{}", target.name()),
             Ty::Unit => "()".to_string(),
             Ty::IntConst(value) => format!("integer literal {value}"),
             Ty::FloatConst(value) => format!("float literal {value}"),
@@ -86,6 +89,19 @@ impl Ty {
 
     fn is_float(&self) -> bool {
         matches!(self, Ty::F32 | Ty::F64)
+    }
+
+    /// `*T` or `rawptr`: both hold an address.
+    fn is_pointer(&self) -> bool {
+        matches!(self, Ty::Ptr | Ty::Targeted(_))
+    }
+
+    /// What a pointer points at, when the type says.
+    fn target(&self) -> Option<&Ty> {
+        match self {
+            Ty::Targeted(target) => Some(target),
+            _ => None,
+        }
     }
 
     fn is_numeric(&self) -> bool {
@@ -336,7 +352,14 @@ impl<'a> Checker<'a> {
                     None => Ty::Opaque,
                 }
             }
-            Type::Pointer { .. } => Ty::Ptr,
+            Type::Pointer { pointee, .. } => {
+                let target = self.resolve_type_depth(pointee, depth + 1);
+                if target == Ty::Opaque {
+                    Ty::Ptr
+                } else {
+                    Ty::Targeted(Box::new(target))
+                }
+            }
             Type::Array { element, .. } => Ty::Array(Box::new(self.resolve_type_depth(element, depth + 1))),
             Type::Slice { .. } => Ty::Opaque,
             Type::Tuple { .. } | Type::Function { .. } | Type::ConstArgument { .. } => Ty::Opaque,
@@ -415,7 +438,8 @@ impl<'a> Checker<'a> {
                     return to.clone();
                 }
                 let on_the_numeric_lattice = (from.is_numeric() && to.is_numeric())
-                    || (from == Ty::Ptr && *to == Ty::Str);
+                    || (from == Ty::Ptr && *to == Ty::Str)
+                    || (from.is_pointer() && to.is_pointer());
                 if !on_the_numeric_lattice {
                     self.mismatch(span, to, &value);
                     return to.clone();
@@ -562,7 +586,7 @@ impl<'a> Checker<'a> {
         if left == Ty::Str || right == Ty::Str {
             return self.string_binary(op, left, right, span);
         }
-        if left == Ty::Ptr || right == Ty::Ptr {
+        if left.is_pointer() || right.is_pointer() {
             return self.pointer_binary(op, left, right, span);
         }
         if left == Ty::Unit || right == Ty::Unit {
@@ -663,11 +687,52 @@ impl<'a> Checker<'a> {
 
     fn pointer_binary(&mut self, op: BinaryOp, left: Ty, right: Ty, span: Span) -> Ty {
         let numeric = |ty: &Ty| ty.is_integral() && *ty != Ty::Bool;
+        let same_target = left == right || left == Ty::Ptr || right == Ty::Ptr;
         match op {
-            BinaryOp::Add | BinaryOp::Sub if (left == Ty::Ptr && numeric(&right)) || (numeric(&left) && right == Ty::Ptr) => {
-                Ty::Ptr
+            BinaryOp::Add | BinaryOp::Sub
+                if (left.is_pointer() && numeric(&right)) || (numeric(&left) && right.is_pointer()) =>
+            {
+                if !left.is_pointer() {
+                    return right.clone();
+                }
+                left
             }
-            BinaryOp::Eq | BinaryOp::NotEq if left == Ty::Ptr && right == Ty::Ptr => Ty::Bool,
+            BinaryOp::Eq | BinaryOp::NotEq if left.is_pointer() && right.is_pointer() => {
+                if same_target {
+                    Ty::Bool
+                } else {
+                    self.error(
+                        code::TYPE_MISMATCH,
+                        format!(
+                            "`{}` compares pointers to different things: `{}` and `{}`",
+                            symbol(op),
+                            left.name(),
+                            right.name()
+                        ),
+                        span,
+                    );
+                    Ty::Opaque
+                }
+            }
+            BinaryOp::Lt | BinaryOp::Gt | BinaryOp::Le | BinaryOp::Ge
+                if left.is_pointer() && right.is_pointer() =>
+            {
+                if same_target {
+                    Ty::Bool
+                } else {
+                    self.error(
+                        code::TYPE_MISMATCH,
+                        format!(
+                            "`{}` compares pointers to different things: `{}` and `{}`",
+                            symbol(op),
+                            left.name(),
+                            right.name()
+                        ),
+                        span,
+                    );
+                    Ty::Opaque
+                }
+            }
             _ => {
                 self.error(
                     code::TYPE_MISMATCH,
@@ -767,12 +832,24 @@ impl<'a> Checker<'a> {
                 }
             }
             UnaryOp::AddressOf => {
-                let _ = self.infer(operand);
-                Ty::Ptr
+                let target = self.infer(operand).defaulted();
+                Ty::Targeted(Box::new(target))
             }
             UnaryOp::Load => {
-                let _ = self.infer(operand);
-                Ty::Opaque
+                let value = self.infer(operand);
+                match value {
+                    Ty::Targeted(target) => *target,
+                    Ty::Ptr => Ty::Opaque,
+                    Ty::Opaque => Ty::Opaque,
+                    concrete => {
+                        self.error(
+                            code::TYPE_MISMATCH,
+                            format!("`*` needs a pointer, found `{}`", concrete.name()),
+                            span,
+                        );
+                        Ty::Opaque
+                    }
+                }
             }
         }
     }
@@ -853,6 +930,10 @@ impl<'a> Checker<'a> {
                         Ty::U8
                     }
                     Ty::Opaque | Ty::Ptr => Ty::Opaque,
+                    Ty::Targeted(target) => {
+                        self.check_index(&index, *span);
+                        (**target).clone()
+                    }
             _ => {
                         self.error(
                             code::TYPE_MISMATCH,
@@ -995,6 +1076,9 @@ impl<'a> Checker<'a> {
     /// exist is reported; anything the checker does not know the shape of
     /// stays silent.
     fn field_type(&mut self, base: &Ty, field: &str, span: Span) -> Ty {
+        if let Ty::Targeted(target) = base {
+            return self.field_type(target, field, span);
+        }
         if let Ty::Struct(name) = base {
             if let Some(fields) = self.structs.get(name) {
                 if let Some((_, ty)) = fields.iter().find(|(known, _)| known == field) {
@@ -1248,7 +1332,7 @@ impl<'a> Checker<'a> {
                     return;
                 }
                 Some((to, false)) => {
-                    if to == Ty::Ptr && matches!(op, AssignOp::Add | AssignOp::Sub) {
+                    if to.is_pointer() && matches!(op, AssignOp::Add | AssignOp::Sub) {
                         self.expect(value, &Ty::I64);
                     } else {
                         self.expect(value, &to);
@@ -1290,6 +1374,20 @@ impl<'a> Checker<'a> {
             Expr::Index { base, .. } => {
                 let _ = self.infer(base);
             }
+            Expr::Unary {
+                op: UnaryOp::Load,
+                operand,
+                ..
+            } => {
+                let pointer = self.infer(operand);
+                if let Some(target) = pointer.target().cloned() {
+                    self.expect(value, &target);
+                    if op != AssignOp::Set {
+                        self.compound(op, &target, span);
+                    }
+                    return;
+                }
+            }
             Expr::Unary { operand, .. } => {
                 let _ = self.infer(operand);
             }
@@ -1299,7 +1397,7 @@ impl<'a> Checker<'a> {
     }
 
     fn compound(&mut self, op: AssignOp, target: &Ty, span: Span) {
-        if *target == Ty::Opaque || target.is_numeric() || *target == Ty::Ptr || *target == Ty::Str {
+        if *target == Ty::Opaque || target.is_numeric() || target.is_pointer() || *target == Ty::Str {
             return;
         }
         self.error(
