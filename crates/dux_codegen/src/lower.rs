@@ -9,7 +9,8 @@
 use std::collections::{HashMap, HashSet};
 
 use dux_ast::{
-    BinaryOp, Block, Decl, Expr, FnDecl, InterpolationPart, Program, Stmt, Type, UnaryOp,
+    BinaryOp, Block, ConstDecl, Decl, Expr, FnDecl, GlobalDecl, InterpolationPart, Program, Stmt,
+    Type, UnaryOp,
 };
 use dux_diag::{code, Diagnostic};
 use dux_source::Span;
@@ -19,7 +20,7 @@ use inkwell::context::Context;
 use inkwell::module::Module;
 use inkwell::types::{BasicMetadataTypeEnum, BasicType, BasicTypeEnum, FloatType, IntType};
 use inkwell::values::{
-    BasicMetadataValueEnum, BasicValueEnum, FloatValue, IntValue, PointerValue,
+    BasicMetadataValueEnum, BasicValueEnum, FloatValue, GlobalValue, IntValue, PointerValue,
 };
 use inkwell::values::{FunctionValue, ValueKind};
 use inkwell::{AddressSpace, FloatPredicate, IntPredicate};
@@ -272,6 +273,60 @@ struct Loop {
     exit: BasicBlock<'static>,
 }
 
+#[derive(Clone)]
+enum ConstValue {
+    Int(i128),
+    Float(f64),
+    Bool(bool),
+    Str(String),
+}
+
+#[derive(Clone)]
+struct Const {
+    ty: DuxType,
+    value: ConstValue,
+}
+
+impl ConstValue {
+    fn checked(self, ty: DuxType, span: Span, emitter: &mut Emitter) -> Option<ConstValue> {
+        match self {
+            ConstValue::Int(value) => {
+                if fits_i128(value, ty) {
+                    Some(ConstValue::Int(value))
+                } else {
+                    emitter.diagnostics.push(
+                        Diagnostic::error(
+                            code::UNEXPECTED_TOKEN,
+                            format!(
+                                "the constant {value} does not fit a `{}`",
+                                ty.name()
+                            ),
+                        )
+                        .with_span(span),
+                    );
+                    None
+                }
+            }
+            other => Some(other),
+        }
+    }
+}
+
+fn fits_i128(value: i128, ty: DuxType) -> bool {
+    match ty {
+        DuxType::Bool => value == 0 || value == 1,
+        DuxType::I8 => i8::try_from(value).is_ok(),
+        DuxType::I16 => i16::try_from(value).is_ok(),
+        DuxType::I32 => i32::try_from(value).is_ok(),
+        DuxType::I64 => i64::try_from(value).is_ok(),
+        DuxType::U8 => u8::try_from(value).is_ok(),
+        DuxType::U16 => u16::try_from(value).is_ok(),
+        DuxType::U32 => u32::try_from(value).is_ok(),
+        DuxType::U64 => u64::try_from(value).is_ok(),
+        _ => true,
+    }
+}
+
 struct Signature {
     params: Vec<DuxType>,
     return_ty: Option<DuxType>,
@@ -287,6 +342,8 @@ pub(crate) struct Emitter {
     /// stay quiet so the user sees one diagnostic, not a cascade.
     skipped: HashSet<String>,
     scopes: Vec<HashMap<String, (DuxType, PointerValue<'static>)>>,
+    consts: HashMap<String, Const>,
+    globals: HashMap<String, (DuxType, GlobalValue<'static>)>,
     loops: Vec<Loop>,
     allocas: Option<BasicBlock<'static>>,
     result_ty: Option<DuxType>,
@@ -308,6 +365,8 @@ impl Emitter {
             signatures: HashMap::new(),
             skipped: HashSet::new(),
             scopes: Vec::new(),
+            consts: HashMap::new(),
+            globals: HashMap::new(),
             loops: Vec::new(),
             allocas: None,
             result_ty: None,
@@ -327,14 +386,8 @@ impl Emitter {
     ) -> Vec<Diagnostic> {
         for decl in &program.decls {
             match decl {
-                Decl::Const(decl) => self.unsupported(
-                    decl.span,
-                    "`const` (the compile-time evaluator lands with the resolver)",
-                ),
-                Decl::Global(decl) => self.unsupported(
-                    decl.span,
-                    "`global` (module-level storage lands with the resolver)",
-                ),
+                Decl::Const(decl) => self.declare_const(decl),
+                Decl::Global(decl) => self.declare_global(module, decl),
                 Decl::Extern(block) => {
                     for function in &block.functions {
                         self.declare(module, function, true);
@@ -681,16 +734,23 @@ impl Emitter {
             self.unsupported(target.span(), "assigning to anything but a plain local");
             return;
         };
-        let Some((ty, slot)) = self.lookup(name).copied() else {
-            self.diagnostics.push(
-                Diagnostic::error(
-                    code::UNEXPECTED_TOKEN,
-                    format!("`{name}` is not declared in this scope"),
-                )
-                .with_span(*target_span)
-                .with_note("the resolver lands at M2; until then an unknown name is reported here"),
-            );
-            return;
+        let (ty, slot) = match self.slot_of(name) {
+            Some(target) => target,
+            None => {
+                let message = if self.consts.contains_key(name.as_str()) {
+                    format!("`{name}` is a `const`; it cannot be assigned")
+                } else {
+                    format!("`{name}` is not declared in this scope")
+                };
+                self.diagnostics.push(
+                    Diagnostic::error(code::UNEXPECTED_TOKEN, message)
+                        .with_span(*target_span)
+                        .with_note(
+                            "the resolver lands at M2; until then an unknown name is reported here",
+                        ),
+                );
+                return;
+            }
         };
         let Some(rhs) = self.expr(module, value, Some(ty)) else {
             return;
@@ -1017,22 +1077,25 @@ impl Emitter {
                 DuxType::I32,
             )),
             Expr::Str { text, span, .. } => Some(self.string_literal(text, *span)),
-            Expr::Ident { name, span } => match self.lookup(name).copied() {
-                Some((ty, slot)) => self.load(ty, slot),
-                None => {
-                    self.diagnostics.push(
-                        Diagnostic::error(
-                            code::UNEXPECTED_TOKEN,
-                            format!("`{name}` is not declared in this scope"),
-                        )
-                        .with_span(*span)
-                        .with_note(
-                            "the resolver lands at M2; until then an unknown name is reported here",
-                        ),
-                    );
-                    None
+            Expr::Ident { name, span } => {
+                if let Some((ty, slot)) = self.slot_of(name) {
+                    return self.load(ty, slot);
                 }
-            },
+                if let Some(c) = self.consts.get(name.as_str()).cloned() {
+                    return Some(self.const_reference(&c, expected, *span));
+                }
+                self.diagnostics.push(
+                    Diagnostic::error(
+                        code::UNEXPECTED_TOKEN,
+                        format!("`{name}` is not declared in this scope"),
+                    )
+                    .with_span(*span)
+                    .with_note(
+                        "the resolver lands at M2; until then an unknown name is reported here",
+                    ),
+                );
+                None
+            }
             Expr::Paren { inner, .. } => self.expr(module, inner, expected),
             Expr::Unary {
                 op, operand, span, ..
@@ -1910,10 +1973,6 @@ impl Emitter {
         slot
     }
 
-    fn lookup(&self, name: &str) -> Option<&(DuxType, PointerValue<'static>)> {
-        self.scopes.iter().rev().find_map(|scope| scope.get(name))
-    }
-
     fn new_block(&self, name: &str) -> BasicBlock<'static> {
         let function = self.builder.get_insert_block().unwrap().get_parent().unwrap();
         self.context.append_basic_block(function, name)
@@ -1996,6 +2055,251 @@ impl Emitter {
             .with_span(span)
             .with_note("this is a milestone limitation, not a language decision"),
         );
+    }
+}
+
+impl Emitter {
+    fn declare_const(&mut self, decl: &ConstDecl) {
+        let name = decl.name.name.clone();
+        let Some(ty) = decl.ty.as_ref().and_then(DuxType::from_ast) else {
+            self.unsupported(
+                decl.span,
+                "a `const` whose type is not a primitive yet",
+            );
+            return;
+        };
+        let Some(value) = self.const_expr(&decl.value) else {
+            return;
+        };
+        let Some(value) = value.checked(ty, decl.span, self) else {
+            return;
+        };
+        self.consts.insert(name, Const { ty, value });
+    }
+
+    fn declare_global(&mut self, module: &Module<'static>, decl: &GlobalDecl) {
+        let name = decl.name.name.clone();
+        let Some(ty) = decl.ty.as_ref().and_then(DuxType::from_ast) else {
+            self.unsupported(
+                decl.span,
+                "a `global` whose type is not a primitive yet",
+            );
+            return;
+        };
+        let initializer = match &decl.value {
+            None => ty.llvm(self.context).const_zero(),
+            Some(value) => {
+                let Some(value) = self.const_expr(value) else {
+                    return;
+                };
+                if matches!(value, ConstValue::Str(_)) {
+                    self.unsupported(
+                        decl.span,
+                        "a `global` string (it lands with slices at M3)",
+                    );
+                    return;
+                }
+                let Some(value) = value.checked(ty, decl.span, self) else {
+                    return;
+                };
+                self.const_initializer(&value, ty)
+            }
+        };
+        let global = module.add_global(ty.llvm(self.context), None, &name);
+        global.set_initializer(&initializer);
+        self.globals.insert(name, (ty, global));
+    }
+
+    fn const_initializer(&mut self, value: &ConstValue, ty: DuxType) -> BasicValueEnum<'static> {
+        match value {
+            ConstValue::Int(v) => match ty {
+                DuxType::Bool => self.context.bool_type().const_int(u64::from(*v != 0), false).into(),
+                other => other.int_type(self.context).const_int(*v as u64, false).into(),
+            },
+            ConstValue::Float(v) => ty
+                .float_type(self.context)
+                .const_float(*v)
+                .into(),
+            ConstValue::Bool(b) => self.context.bool_type().const_int(u64::from(*b), false).into(),
+            ConstValue::Str(_) => ty.llvm(self.context).const_zero(),
+        }
+    }
+
+    fn const_expr(&mut self, expr: &Expr) -> Option<ConstValue> {
+        match expr {
+            Expr::Int { value, span } => match i128::try_from(*value) {
+                Ok(value) => Some(ConstValue::Int(value)),
+                Err(_) => {
+                    self.diagnostics.push(
+                        Diagnostic::error(
+                            code::NUMBER_OUT_OF_RANGE,
+                            "integer constant does not fit i128",
+                        )
+                        .with_span(*span),
+                    );
+                    None
+                }
+            },
+            Expr::Float { value, .. } => Some(ConstValue::Float(*value)),
+            Expr::Bool { value, .. } => Some(ConstValue::Bool(*value)),
+            Expr::Str { text, .. } => Some(ConstValue::Str(text.clone())),
+            Expr::Paren { inner, .. } => self.const_expr(inner),
+            Expr::Unary {
+                op: UnaryOp::Neg,
+                operand,
+                ..
+            } => match self.const_expr(operand)? {
+                ConstValue::Int(v) => match v.checked_neg() {
+                    Some(v) => Some(ConstValue::Int(v)),
+                    None => {
+                        self.diagnostics.push(
+                            Diagnostic::error(
+                                code::NUMBER_OUT_OF_RANGE,
+                                "negating this constant overflows",
+                            )
+                            .with_span(operand.span()),
+                        );
+                        None
+                    }
+                },
+                ConstValue::Float(v) => Some(ConstValue::Float(-v)),
+                _ => {
+                    self.unsupported(operand.span(), "negating this constant");
+                    None
+                }
+            },
+            Expr::Binary {
+                op, lhs, rhs, span, ..
+            } => self.const_binary(*op, lhs, rhs, *span),
+            other => {
+                self.unsupported(
+                    other.span(),
+                    "this `const` initialiser (literals and constant arithmetic today)",
+                );
+                None
+            }
+        }
+    }
+
+    fn const_binary(
+        &mut self,
+        op: BinaryOp,
+        lhs: &Expr,
+        rhs: &Expr,
+        span: Span,
+    ) -> Option<ConstValue> {
+        let left = self.const_expr(lhs)?;
+        let right = self.const_expr(rhs)?;
+        enum CNum {
+            I(i128),
+            F(f64),
+        }
+        fn cnum(value: &ConstValue) -> Option<CNum> {
+            match value {
+                ConstValue::Int(v) => Some(CNum::I(*v)),
+                ConstValue::Float(v) => Some(CNum::F(*v)),
+                _ => None,
+            }
+        }
+        let mut mismatch = || {
+            self.diagnostics.push(
+                Diagnostic::error(
+                    code::UNEXPECTED_TOKEN,
+                    "this operator is not constant-foldable here",
+                )
+                .with_span(span),
+            );
+            None
+        };
+        if let (ConstValue::Bool(l), ConstValue::Bool(r)) = (&left, &right) {
+            return match op {
+                BinaryOp::And => Some(ConstValue::Bool(*l && *r)),
+                BinaryOp::Or => Some(ConstValue::Bool(*l || *r)),
+                BinaryOp::Eq => Some(ConstValue::Bool(l == r)),
+                BinaryOp::NotEq => Some(ConstValue::Bool(l != r)),
+                _ => mismatch(),
+            };
+        }
+        let (left, right) = match (cnum(&left), cnum(&right)) {
+            (Some(l), Some(r)) => (l, r),
+            _ => return mismatch(),
+        };
+        if let (CNum::I(l), CNum::I(r)) = (&left, &right) {
+            let (l, r) = (*l, *r);
+            return match op {
+                BinaryOp::Add => Some(ConstValue::Int(l.checked_add(r)?)),
+                BinaryOp::Sub => Some(ConstValue::Int(l.checked_sub(r)?)),
+                BinaryOp::Mul => Some(ConstValue::Int(l.checked_mul(r)?)),
+                BinaryOp::Div if r != 0 => Some(ConstValue::Int(l.wrapping_div(r))),
+                BinaryOp::Mod if r != 0 => Some(ConstValue::Int(l.wrapping_rem(r))),
+                BinaryOp::Eq => Some(ConstValue::Bool(l == r)),
+                BinaryOp::NotEq => Some(ConstValue::Bool(l != r)),
+                BinaryOp::Lt => Some(ConstValue::Bool(l < r)),
+                BinaryOp::Gt => Some(ConstValue::Bool(l > r)),
+                BinaryOp::Le => Some(ConstValue::Bool(l <= r)),
+                BinaryOp::Ge => Some(ConstValue::Bool(l >= r)),
+                _ => mismatch(),
+            };
+        }
+        let as_f64 = |value: &CNum| match value {
+            CNum::I(v) => *v as f64,
+            CNum::F(v) => *v,
+        };
+        let (l, r) = (as_f64(&left), as_f64(&right));
+        match op {
+            BinaryOp::Add => Some(ConstValue::Float(l + r)),
+            BinaryOp::Sub => Some(ConstValue::Float(l - r)),
+            BinaryOp::Mul => Some(ConstValue::Float(l * r)),
+            BinaryOp::Div => Some(ConstValue::Float(l / r)),
+            BinaryOp::Mod => Some(ConstValue::Float(l % r)),
+            BinaryOp::Eq => Some(ConstValue::Bool(l == r)),
+            BinaryOp::NotEq => Some(ConstValue::Bool(l != r)),
+            BinaryOp::Lt => Some(ConstValue::Bool(l < r)),
+            BinaryOp::Gt => Some(ConstValue::Bool(l > r)),
+            BinaryOp::Le => Some(ConstValue::Bool(l <= r)),
+            BinaryOp::Ge => Some(ConstValue::Bool(l >= r)),
+            _ => mismatch(),
+        }
+    }
+
+    fn const_reference(&mut self, c: &Const, expected: Option<DuxType>, span: Span) -> Typed {
+        match &c.value {
+            ConstValue::Int(v) => {
+                let want = expected.filter(|ty| ty.is_integral() || *ty == DuxType::Bool);
+                let ty = match want {
+                    Some(ty) if fits_i128(*v, ty) => ty,
+                    _ => c.ty,
+                };
+                match ty {
+                    DuxType::Bool => Typed::int(
+                        self.context.bool_type().const_int(u64::from(*v != 0), false),
+                        DuxType::Bool,
+                    ),
+                    other => Typed::int(
+                        other.int_type(self.context).const_int(*v as u64, false),
+                        other,
+                    ),
+                }
+            }
+            ConstValue::Float(v) => {
+                let ty = if c.ty == DuxType::F32 { DuxType::F32 } else { DuxType::F64 };
+                Typed::float(ty.float_type(self.context).const_float(*v), ty)
+            }
+            ConstValue::Bool(b) => Typed::int(
+                self.context.bool_type().const_int(u64::from(*b), false),
+                DuxType::Bool,
+            ),
+            ConstValue::Str(text) => self.string_literal(text, span),
+        }
+    }
+
+    fn slot_of(&self, name: &str) -> Option<(DuxType, PointerValue<'static>)> {
+        if let Some(&(ty, slot)) = self.scopes.iter().rev().find_map(|scope| scope.get(name)) {
+            return Some((ty, slot));
+        }
+        self.globals
+            .get(name)
+            .map(|(ty, global)| (*ty, global.as_pointer_value()))
     }
 }
 

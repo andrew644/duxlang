@@ -285,3 +285,22 @@ Promoted into `tests/e2e/`: `fizzbuzz.dux` (with `//@release`) and `flow.dux` (f
 three loop forms, break/continue, short-circuit, interpolation), plus `lossy_narrow.dux`
 (`//@expect-error E0005`) as the first negative codegen fixture. 11 new `ir.rs` tests pin the
 shapes above.
+
+
+## Session 6b — `const` and `global` lower
+
+Closed the two storage-shaped `E0007` gaps from the first half of session 6, on the same
+"codegen is the resolver until M2" footing as name lookup:
+
+- `const NAME: T = <constant expression>`: a small i128/f64/bool/string folder handles literals,
+  parens, `-`, and `+ - * / %` plus every comparison (`/0` and overflow are diagnostics, not
+  surprises). The value is stored, not allocated; each use materialises a literal that **adopts
+  the expected type when it fits**, so `const KI: usize = 1024` makes `page: usize = KI + 1` a
+  `store i64 1025`. Assignment to a `const` is one clean `E0005`.
+- `global NAME: T = <constant>`: one module-level `@NAME` with a constant initialiser (absent
+  value ⇒ zero, so `global scratch: i64` works); loads and stores go through the same local-slot
+  path, so `hits += 1` inside a function updates the one instance. `global` strings wait for
+  slices (M3).
+
+`tests/e2e/counters.dux` promotes the pattern (a `bump()` closing over the global through
+argument-free calls); `ir.rs` grows the two pinning tests. 88 tests, clippy clean.

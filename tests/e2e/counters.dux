@@ -1,0 +1,19 @@
+package main
+
+const MAX: i32 = 3
+
+global hits: i32 = 0
+
+fn bump() {
+    hits += 1
+}
+
+fn main() {
+    for i := 0, i < MAX, i += 1 {
+        bump()
+    }
+    while hits < MAX * 2 {
+        bump()
+    }
+    println($"hits={hits} max={MAX}")
+}

@@ -244,14 +244,6 @@ fn milestone_gaps_report_e0007_with_the_milestone_in_the_message() {
     let cases = [
         ("package main\nfn main() { for v in xs { print(\"x\") } }", "`for .. in`"),
         ("package main\nfn main() { defer println(\"x\") }", "`defer`"),
-        (
-            "package main\nconst K: i32 = 1\nfn main() { }",
-            "`const`",
-        ),
-        (
-            "package main\nglobal hits: i32 = 0\nfn main() { }",
-            "`global`",
-        ),
     ];
     for (source, needle) in cases {
         let errors = build(source).unwrap_err();
@@ -266,4 +258,46 @@ fn milestone_gaps_report_e0007_with_the_milestone_in_the_message() {
             errors[0].message
         );
     }
+}
+
+#[test]
+fn constants_fold_adopt_the_annotated_type_and_refuse_to_be_assigned() {
+    let ir = build(
+        "package main\nconst KI: usize = 1024\nfn main() { page: usize = KI + 1 }",
+    )
+    .expect("builds")
+    .ir_text();
+    assert!(
+        ir.contains("store i64 1025, ptr %page"),
+        "the constant adopts usize and folds:\n{ir}"
+    );
+
+    let errors = build("package main\nconst K: i32 = 1\nfn main() { K = 2 }").unwrap_err();
+    assert_eq!(errors[0].code, dux_diag::code::UNEXPECTED_TOKEN);
+    assert!(errors[0].message.contains("cannot be assigned"), "{errors:?}");
+
+    let errors = build("package main\nconst K: i8 = 300\nfn main() { }").unwrap_err();
+    assert_eq!(errors[0].code, dux_diag::code::UNEXPECTED_TOKEN);
+    assert!(errors[0].message.contains("does not fit"), "{errors:?}");
+}
+
+#[test]
+fn globals_are_module_storage_and_update_in_place() {
+    let ir = build(
+        "package main\nglobal hits: i32 = 0\nfn bump() { hits += 1 }\nfn main() { bump() }",
+    )
+    .expect("builds")
+    .ir_text();
+    assert!(ir.contains("@hits = global i32 0"), "{ir}");
+    assert!(ir.contains("load i32, ptr @hits"), "{ir}");
+    assert!(ir.contains("store i32"), "{ir}");
+    assert!(
+        ir.contains("store i32 %addtmp, ptr @hits") || ir.contains("ptr @hits"),
+        "the compound assign stores back through the global:\n{ir}"
+    );
+
+    let ir = build("package main\nglobal scratch: i64\nfn main() { }")
+        .expect("a value-less global is zero-initialised")
+        .ir_text();
+    assert!(ir.contains("@scratch = global i64 0"), "{ir}");
 }
