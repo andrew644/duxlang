@@ -541,3 +541,37 @@ free; write `as *i32`"*.
 Proof: `pointer_basics.dux` runs with pinned stdout; five new IR tests cover
 address-of, deref, auto-deref, scaled arithmetic and the two refusals; two new
 checker tests cover the target type. 168 tests, clippy clean, corpus silent.
+
+## Session 11c — M3 step 3: `impl` blocks and method calls
+
+Records and pointers exist, so methods are next: `impl Vec3` with a value
+receiver, a pointer receiver that mutates in place, and the auto-`&` /
+auto-deref that makes both of them read the way DESIGN promised.
+
+The lowering now names a function two ways. The *key* is what a call looks it
+up by — `Vec3.scale` — and the *symbol* is what LLVM emits —
+`dux.Vec3.scale`, prefixed so a method can never collide with a package-level
+`fn scale`. A `Unit` carries the key, the symbol, the record that owns it and
+the declaration, and both passes (declare, then lower bodies) walk the same
+list. `parameter_type` is the one place that knows `self` means the record, or
+a pointer to it when the method is written `fn m(self: *T, …)`.
+
+At the call site the receiver is an argument like any other, with a rule of its
+own: a pointer receiver borrows the place the method was called on — `v.scale(2.0)`
+passes `&v`, `p.scale(2.0)` passes the pointer `p` already holds — and a value
+receiver copies it. A method called on a temporary when it wanted an address is
+refused, because the temporary would be gone before the callee looked at it.
+Two records can declare `read`; the keys keep them apart, and an IR test pins
+that down.
+
+The checker learned to find a method through a pointer, to check a method call
+against the method's signature, and to say *"`Vec3` has no method `nope`"* with
+a note pointing at `impl Vec3`. It stays silent about methods on types it does
+not model yet — a string view, a slice, `rawptr` — because those belong to the
+standard library milestones that have not arrived.
+
+Proof: `methods.dux` runs with pinned stdout (both receiver kinds, a method on
+a field of a pointer receiver, a method taking a pointer argument, a call
+through a copy of a pointer); four new IR tests and four new checker tests; and
+`example/structs.dux` typechecks with no diagnostic at all. 169 tests, clippy
+clean.

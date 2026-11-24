@@ -755,3 +755,124 @@ fn main() {
         Vec::<&'static str>::new()
     );
 }
+
+const VEC3: &str = "struct Vec3 {
+    x: f32,
+}
+
+impl Vec3 {
+    fn doubled(self) -> f32 {
+        return self.x + self.x
+    }
+
+    fn scale(self: *Vec3, k: f32) {
+        self.x *= k
+    }
+}
+";
+
+#[test]
+fn a_method_finds_its_receiver_through_a_pointer() {
+    assert_eq!(
+        codes(&format!(
+            "{VEC3}
+fn main() {{
+    v := Vec3 {{ x: 1.0 }}
+    p := &v
+    p.scale(2.0)
+    wide: f64 = p.doubled()
+    println($\"{{}}\", wide)
+}}
+"
+        )),
+        Vec::<&'static str>::new()
+    );
+}
+
+#[test]
+fn a_method_call_is_checked_against_the_methods_signature() {
+    assert_eq!(
+        codes(&format!(
+            "{VEC3}
+fn main() {{
+    v := Vec3 {{ x: 1.0 }}
+    v.scale(\"two\")
+    println($\"{{}}\", v.x)
+}}
+"
+        )),
+        vec!["E0201"]
+    );
+    assert_eq!(
+        codes(&format!(
+            "{VEC3}
+fn main() {{
+    v := Vec3 {{ x: 1.0 }}
+    v.scale(2.0, 3.0)
+    println($\"{{}}\", v.x)
+}}
+"
+        )),
+        vec!["E0112"]
+    );
+}
+
+#[test]
+fn a_method_the_record_does_not_have_is_named() {
+    let found = diagnose(&format!(
+        "{VEC3}
+fn main() {{
+    v := Vec3 {{ x: 1.0 }}
+    println($\"{{}}\", v.nope())
+}}
+"
+    ));
+    assert_eq!(
+        found.iter().map(|d| d.code).collect::<Vec<&'static str>>(),
+        vec!["E0110"]
+    );
+    assert!(
+        found[0].message.contains("`Vec3` has no method `nope`"),
+        "{:?}",
+        found[0]
+    );
+    assert!(
+        found[0]
+            .note
+            .as_deref()
+            .is_some_and(|note| note.contains("impl Vec3")),
+        "{:?}",
+        found[0]
+    );
+}
+
+#[test]
+fn self_is_the_record_or_a_pointer_to_it() {
+    assert_eq!(
+        codes(
+            "struct Vec3 {
+    x: f32,
+}
+
+impl Vec3 {
+    fn via_pointer(self: *Vec3) -> f32 {
+        self.x = 1.0
+        return self.x
+    }
+
+    fn via_copy(self) -> f32 {
+        self.x = 2.0
+        return self.x
+    }
+}
+
+fn main() {
+    v := Vec3 { x: 0.0 }
+    v.via_pointer()
+    println($\"{}\", v.via_copy())
+}
+"
+        ),
+        Vec::<&'static str>::new()
+    );
+}

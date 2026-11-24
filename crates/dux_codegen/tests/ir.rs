@@ -603,3 +603,124 @@ fn main() {
     assert_eq!(errors[0].code, dux_diag::code::TYPE_MISMATCH, "{errors:?}");
     assert!(errors[0].message.contains("address"), "{errors:?}");
 }
+
+#[test]
+fn a_method_takes_its_receiver_first() {
+    let ir = build(
+        "package main
+struct Vec3 {
+    x: f32,
+}
+impl Vec3 {
+    fn doubled(self) -> f32 {
+        return self.x + self.x
+    }
+    fn scale(self: *Vec3, k: f32) {
+        self.x *= k
+    }
+}
+fn main() {
+    v := Vec3 { x: 1.0 }
+    println($\"{}\", v.doubled())
+    v.scale(2.0)
+    println($\"{}\", v.x)
+}",
+    )
+    .expect("builds")
+    .ir_text();
+    assert!(
+        ir.contains("define float @dux.Vec3.doubled(%Vec3 %0)"),
+        "a value receiver is the record itself, passed first:\n{ir}"
+    );
+    assert!(
+        ir.contains("define void @dux.Vec3.scale(ptr %0, float %1)"),
+        "a pointer receiver is the address of the record:\n{ir}"
+    );
+    assert!(
+        ir.contains("call float @dux.Vec3.doubled(%Vec3 %load"),
+        "the call copies the receiver: {ir}"
+    );
+    assert!(
+        ir.contains("call void @dux.Vec3.scale(ptr %v, float 2.000000e+00)"),
+        "the call borrows the receiver's slot: {ir}"
+    );
+}
+
+#[test]
+fn a_method_the_record_does_not_have_is_refused() {
+    let errors = build(
+        "package main
+struct Vec3 {
+    x: f32,
+}
+impl Vec3 {
+    fn doubled(self) -> f32 {
+        return self.x
+    }
+}
+fn main() {
+    v := Vec3 { x: 1.0 }
+    println($\"{}\", v.nope())
+}",
+    )
+    .unwrap_err();
+    assert_eq!(errors[0].code, dux_diag::code::UNDECLARED, "{errors:?}");
+    assert!(errors[0].message.contains("`Vec3` has no method `nope`"), "{errors:?}");
+    assert!(errors[0].note.as_deref().is_some_and(|n| n.contains("impl Vec3")), "{errors:?}");
+}
+
+#[test]
+fn a_pointer_receiver_needs_a_place_to_borrow() {
+    let errors = build(
+        "package main
+struct Vec3 {
+    x: f32,
+}
+fn make() -> Vec3 {
+    return Vec3 { x: 1.0 }
+}
+impl Vec3 {
+    fn scale(self: *Vec3, k: f32) {
+        self.x *= k
+    }
+}
+fn main() {
+    make().scale(2.0)
+}",
+    )
+    .unwrap_err();
+    assert_eq!(errors[0].code, dux_diag::code::TYPE_MISMATCH, "{errors:?}");
+    assert!(errors[0].message.contains("no address"), "{errors:?}");
+}
+
+#[test]
+fn methods_of_different_records_do_not_collide() {
+    let ir = build(
+        "package main
+struct A {
+    a: i32,
+}
+struct B {
+    b: i32,
+}
+impl A {
+    fn read(self) -> i32 {
+        return self.a
+    }
+}
+impl B {
+    fn read(self) -> i32 {
+        return self.b
+    }
+}
+fn main() {
+    a := A { a: 1 }
+    b := B { b: 2 }
+    println($\"{} {}\", a.read(), b.read())
+}",
+    )
+    .expect("builds")
+    .ir_text();
+    assert!(ir.contains("@dux.A.read(%A"), "{ir}");
+    assert!(ir.contains("@dux.B.read(%B"), "{ir}");
+}

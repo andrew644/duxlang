@@ -96,6 +96,19 @@ impl Ty {
         matches!(self, Ty::Ptr | Ty::Targeted(_))
     }
 
+    /// The record a method call reaches through: a record itself, or the
+    /// record a pointer aims at.
+    fn record_owner(&self) -> Option<&String> {
+        match self {
+            Ty::Struct(name) => Some(name),
+            Ty::Targeted(target) => match &**target {
+                Ty::Struct(name) => Some(name),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
     /// What a pointer points at, when the type says.
     fn target(&self) -> Option<&Ty> {
         match self {
@@ -1135,11 +1148,46 @@ impl<'a> Checker<'a> {
         }
         if let Expr::Field { base, name, .. } = callee {
             let base = self.infer(base);
-            if let Ty::Struct(owner) = &base {
-                if let Some(signature) = self.methods.get(&(owner.clone(), name.name.clone())).cloned() {
+            if let Some(owner) = base.record_owner() {
+                if let Some(signature) = self
+                    .methods
+                    .get(&(owner.clone(), name.name.clone()))
+                    .cloned()
+                {
+                    if signature.check_arguments && signature.params.len() != args.len() {
+                        self.report(
+                            name.span,
+                            Diagnostic::error(
+                                code::WRONG_ARITY,
+                                format!(
+                                    "`{owner}.{}` takes {} arguments, given {}",
+                                    name.name,
+                                    signature.params.len(),
+                                    args.len()
+                                ),
+                            )
+                            .with_note("a method's receiver is written before the dot, not inside it"),
+                        );
+                        for argument in args {
+                            let _ = self.infer(argument);
+                        }
+                        return signature.result;
+                    }
                     return self.call_signature(&signature, args, span);
                 }
+                self.report(
+                    name.span,
+                    Diagnostic::error(
+                        code::UNDECLARED,
+                        format!("`{owner}` has no method `{}`", name.name),
+                    )
+                    .with_note(format!("methods are declared in an `impl {owner}` block")),
+                );
+                return Ty::Opaque;
             }
+            // A method on a type the checker does not model yet (a string
+            // view, a slice, `rawptr`) belongs to the standard library and is
+            // silent until the milestone that owns it arrives.
             let _ = span;
             return Ty::Opaque;
         }
@@ -1176,7 +1224,12 @@ impl<'a> Checker<'a> {
         for parameter in &function.params {
             let ty = if parameter.name.name == "self" {
                 match receiver {
-                    Some(owner) => Ty::Struct(owner.to_string()),
+                    Some(owner) => match &parameter.ty {
+                        Type::Pointer { .. } => {
+                            Ty::Targeted(Box::new(Ty::Struct(owner.to_string())))
+                        }
+                        _ => Ty::Struct(owner.to_string()),
+                    },
                     None => self.resolve_type(&parameter.ty),
                 }
             } else {

@@ -1,0 +1,73 @@
+package main
+
+struct Vec3 {
+    x: f32,
+    y: f32,
+    z: f32,
+}
+
+struct AABB {
+    min: Vec3,
+    max: Vec3,
+}
+
+impl Vec3 {
+    fn squared(self) -> f32 {
+        return self.x * self.x + self.y * self.y + self.z * self.z
+    }
+
+    fn scale(self: *Vec3, k: f32) {
+        self.x *= k
+        self.y *= k
+        self.z *= k
+    }
+
+    fn shifted(self: *Vec3, dx: f32, dy: f32, dz: f32) {
+        self.x += dx
+        self.y += dy
+        self.z += dz
+    }
+}
+
+impl AABB {
+    fn centre(self) -> Vec3 {
+        return Vec3 {
+            x: (self.min.x + self.max.x) / 2.0,
+            y: (self.min.y + self.max.y) / 2.0,
+            z: (self.min.z + self.max.z) / 2.0,
+        }
+    }
+
+    fn move_by(self: *AABB, by: *Vec3) {
+        self.min.x += by.x
+        self.min.y += by.y
+        self.min.z += by.z
+        self.max.x += by.x
+        self.max.y += by.y
+        self.max.z += by.z
+    }
+}
+
+fn main() {
+    v := Vec3 { x: 1.0, y: 2.0, z: 2.0 }
+    println($"squared={}", v.squared())
+    v.scale(2.0)
+    println($"scaled={} {} {}", v.x, v.y, v.z)
+
+    p := &v
+    p.scale(0.5)
+    p.shifted(1.0, 0.0, 0.0)
+    println($"through the pointer={} {} {} squared={}", p.x, p.y, p.z, v.squared())
+
+    box := AABB { min: Vec3 { x: 0.0, y: 0.0, z: 0.0 }, max: Vec3 { x: 4.0, y: 6.0, z: 8.0 } }
+    middle := box.centre()
+    println($"centre={} {} {}", middle.x, middle.y, middle.z)
+
+    step := Vec3 { x: 1.0, y: 1.0, z: 1.0 }
+    box.move_by(&step)
+    println($"moved min={} {} {} max={} {} {}", box.min.x, box.min.y, box.min.z, box.max.x, box.max.y, box.max.z)
+
+    q := p
+    q.scale(3.0)
+    println($"through a copy of the pointer={} {}", q.x, v.x)
+}

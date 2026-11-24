@@ -420,6 +420,54 @@ fn fits_i128(value: i128, ty: DuxType) -> bool {
 struct Signature {
     params: Vec<DuxType>,
     return_ty: Option<DuxType>,
+    /// The receiver of a method, which the call site passes first and the
+    /// argument list never mentions.
+    receiver: Option<DuxType>,
+}
+
+/// A `fn` or a method, named the way the lowering names it. A method's key
+/// carries its record, because `Vec3.len` and `Mat4.len` are different
+/// functions that share a spelling; the symbol carries a prefix so neither can
+/// collide with a package-level `fn`.
+struct Unit<'a> {
+    key: String,
+    symbol: String,
+    owner: Option<&'a str>,
+    external: bool,
+    decl: &'a FnDecl,
+}
+
+impl<'a> Unit<'a> {
+    fn function(decl: &'a FnDecl) -> Self {
+        Self {
+            key: decl.name.name.clone(),
+            symbol: decl.name.name.clone(),
+            owner: None,
+            external: false,
+            decl,
+        }
+    }
+
+    fn imported(decl: &'a FnDecl) -> Self {
+        Self {
+            external: true,
+            ..Self::function(decl)
+        }
+    }
+
+    fn method(decl: &'a FnDecl, owner: &'a str) -> Self {
+        Self {
+            key: format!("{owner}.{}", decl.name.name),
+            symbol: format!("dux.{owner}.{}", decl.name.name),
+            owner: Some(owner),
+            external: false,
+            decl,
+        }
+    }
+
+    fn takes_a_receiver(&self) -> bool {
+        self.owner.is_some() && self.decl.params.first().is_some_and(|p| p.name.name == "self")
+    }
 }
 
 /// A call captured by `defer`: its arguments were evaluated at the point of
@@ -561,18 +609,38 @@ impl Emitter {
                 Decl::Global(decl) => self.declare_global(module, decl),
                 Decl::Extern(block) => {
                     for function in &block.functions {
-                        self.declare(module, function, true);
+                        self.declare(module, &Unit::imported(function));
                     }
                 }
                 _ => {}
             }
         }
         let functions: Vec<&FnDecl> = program.functions().collect();
-        for function in &functions {
-            self.declare(module, function, false);
+        let mut units: Vec<Unit> = functions.iter().map(|decl| Unit::function(decl)).collect();
+        for decl in &program.decls {
+            if let Decl::Impl(block) = decl {
+                let owner = block.type_name.name.as_str();
+                for method in &block.methods {
+                    let unit = Unit::method(method, owner);
+                    if self.functions.contains_key(&unit.key) {
+                        self.diagnostics.push(
+                            Diagnostic::error(
+                                code::DUPLICATE_DEFINITION,
+                                format!("`{owner}` has more than one `{}`", method.name.name),
+                            )
+                            .with_span(method.name.span),
+                        );
+                        continue;
+                    }
+                    units.push(unit);
+                }
+            }
         }
-        for function in &functions {
-            self.lower_body(module, function);
+        for unit in &units {
+            self.declare(module, unit);
+        }
+        for unit in &units {
+            self.lower_body(module, unit);
         }
         if let Some(dibuilder) = &self.dibuilder {
             dibuilder.finalize();
@@ -707,55 +775,65 @@ impl Emitter {
 }
 
 impl Emitter {
-    fn declare(&mut self, module: &Module<'static>, function: &FnDecl, external: bool) {
-        let name = function.name.name.clone();
-        if self.skipped.contains(&name) || self.functions.contains_key(&name) {
+    fn declare(&mut self, module: &Module<'static>, unit: &Unit) {
+        let key = unit.key.clone();
+        let external = unit.external;
+        let function = unit.decl;
+        if self.skipped.contains(&key) || self.functions.contains_key(&key) {
             if !external {
                 self.diagnostics.push(
                     Diagnostic::error(
                         code::DUPLICATE_DEFINITION,
-                        format!("`{name}` is declared more than once"),
+                        match unit.owner {
+                            Some(owner) => format!(
+                                "`{owner}` has more than one `{}`",
+                                function.name.name
+                            ),
+                            None => format!("`{key}` is declared more than once"),
+                        },
                     )
                     .with_span(function.name.span),
                 );
             }
             return;
         }
-        if !external && name == "main" {
+        if !external && unit.owner.is_none() && function.name.name == "main" {
             let fn_value =
                 module.add_function("main", self.context.i32_type().fn_type(&[], false), None);
-            self.functions.insert(name.clone(), fn_value);
+            self.functions.insert(key.clone(), fn_value);
             self.signatures.insert(
-                name,
+                key,
                 Signature {
                     params: Vec::new(),
                     return_ty: Some(DuxType::I32),
+                    receiver: None,
                 },
             );
             return;
         }
         if !function.type_params.is_empty() {
-            self.skipped.insert(name);
+            self.skipped.insert(key.clone());
             self.unsupported(function.name.span, "a generic `fn` (monomorphisation lands at M5)");
             return;
         }
         let mut params = Vec::new();
-        for param in &function.params {
-            let Some(ty) = self.type_of(&param.ty).filter(|ty| ty.array_info().is_none()) else {
-                if !external {
-                    self.skipped.insert(name);
-                    self.unsupported(
-                        param.ty.span(),
-                        &format!(
-                            "a `{}` parameter (only primitives, pointers, records and string views lower today)",
-                            param.name.name
-                        ),
-                    );
-                } else {
-                    self.skipped.insert(name);
+        let mut receiver = None;
+        for (index, param) in function.params.iter().enumerate() {
+            let ty = match self.parameter_type(unit, param, index == 0) {
+                Some(ty) => ty,
+                None => {
+                    self.refuse_parameter(&key, param, external);
+                    return;
                 }
-                return;
             };
+            if unit.takes_a_receiver() && index == 0 {
+                receiver = Some(ty);
+                continue;
+            }
+            if ty.array_info().is_some() {
+                self.refuse_parameter(&key, param, external);
+                return;
+            }
             params.push(ty);
         }
         let return_ty = match &function.return_ty {
@@ -763,42 +841,77 @@ impl Emitter {
             Some(ty) => match self.type_of(ty).filter(|ty| ty.array_info().is_none()) {
                 Some(ty) => Some(ty),
                 None => {
+                    self.skipped.insert(key.clone());
                     if !external {
-                        self.skipped.insert(name);
-                        self.unsupported(ty.span(), "this result type (primitives and pointers today)");
-                    } else {
-                        self.skipped.insert(name);
+                        self.unsupported(ty.span(), "this result type (primitives, pointers and records today)");
                     }
                     return;
                 }
             },
         };
-        let parameters = params
+        let declared = receiver
             .iter()
+            .chain(params.iter())
             .map(|ty| BasicMetadataTypeEnum::from(ty.llvm(self.context)))
             .collect::<Vec<BasicMetadataTypeEnum>>();
         let signature = match return_ty {
-            Some(ty) => ty.llvm(self.context).fn_type(&parameters, false),
-            None => self.context.void_type().fn_type(&parameters, false),
+            Some(ty) => ty.llvm(self.context).fn_type(&declared, false),
+            None => self.context.void_type().fn_type(&declared, false),
         };
-        let fn_value = module.add_function(&name, signature, None);
-        self.functions.insert(name.clone(), fn_value);
-        self.signatures.insert(name, Signature { params, return_ty });
+        let fn_value = module.add_function(&unit.symbol, signature, None);
+        self.functions.insert(key.clone(), fn_value);
+        self.signatures.insert(key, Signature { params, return_ty, receiver });
     }
 
-    fn lower_body(&mut self, module: &Module<'static>, function: &FnDecl) {
-        let name = function.name.name.clone();
-        if self.skipped.contains(&name) || function.body.stmts.is_empty() {
+    /// A parameter the lowering cannot pass by value today.
+    fn refuse_parameter(&mut self, key: &str, param: &dux_ast::Param, external: bool) {
+        self.skipped.insert(key.to_string());
+        if external {
             return;
         }
-        let Some(fn_value) = self.functions.get(&name).copied() else {
+        self.unsupported(
+            param.ty.span(),
+            &format!(
+                "a `{}` parameter (only primitives, pointers, records and string views lower today)",
+                param.name.name
+            ),
+        );
+    }
+
+    /// The type of a parameter as the lowering sees it. Inside an `impl`
+    /// block, `self` is the record itself, or a pointer to it when the method
+    /// is written `fn m(self: *T, …)`; every other parameter is an annotated
+    /// type.
+    fn parameter_type(
+        &mut self,
+        unit: &Unit,
+        param: &dux_ast::Param,
+        first: bool,
+    ) -> Option<DuxType> {
+        let Some(owner) = unit.owner else {
+            return self.type_of(&param.ty);
+        };
+        if !first || param.name.name != "self" {
+            return self.type_of(&param.ty);
+        }
+        let record = self.struct_type_of(owner)?;
+        Some(match &param.ty {
+            Type::Pointer { .. } => self.pointer_to(record),
+            _ => record,
+        })
+    }
+
+    fn lower_body(&mut self, module: &Module<'static>, unit: &Unit) {
+        let key = unit.key.as_str();
+        let function = unit.decl;
+        if self.skipped.contains(key) || function.body.stmts.is_empty() {
+            return;
+        }
+        let Some(fn_value) = self.functions.get(key).copied() else {
             return;
         };
-        self.begin_function_debug(function, &name, fn_value);
-        let signature = self
-            .signatures
-            .get(&name)
-            .expect("a lowered function was declared first");
+        self.begin_function_debug(function, &unit.symbol, fn_value);
+        let return_ty = self.signatures.get(key).and_then(|s| s.return_ty);
         let entry = self.context.append_basic_block(fn_value, "entry");
         let body = self.context.append_basic_block(fn_value, "body");
         self.builder.position_at_end(entry);
@@ -808,15 +921,15 @@ impl Emitter {
         self.loops.clear();
         self.defers.clear();
         self.dead = false;
-        self.is_main = name == "main";
+        self.is_main = unit.owner.is_none() && function.name.name == "main";
         self.result_ty = if self.is_main {
             Some(DuxType::I32)
         } else {
-            signature.return_ty
+            return_ty
         };
 
         for (index, param) in function.params.iter().enumerate() {
-            let Some(ty) = self.type_of(&param.ty) else {
+            let Some(ty) = self.parameter_type(unit, param, index == 0) else {
                 continue;
             };
             let Some(argument) = fn_value.get_nth_param(index as u32) else {
@@ -1397,10 +1510,10 @@ impl Emitter {
             self.defer_write(module, name, args, span);
             return;
         }
-        if self.skipped.contains(name.as_str()) {
+        if self.skipped.contains(name) {
             return;
         }
-        let Some(signature) = self.signatures.get(name.as_str()).cloned() else {
+        let Some(signature) = self.signatures.get(name).cloned() else {
             self.diagnostics.push(
                 Diagnostic::error(
                     code::UNDECLARED,
@@ -2676,7 +2789,7 @@ impl Emitter {
                 if let Some((ty, slot)) = self.slot_of(name) {
                     return self.load(ty, slot);
                 }
-                if let Some(c) = self.consts.get(name.as_str()).cloned() {
+                if let Some(c) = self.consts.get(name).cloned() {
                     return Some(self.const_reference(&c, expected, *span));
                 }
                 self.diagnostics.push(
@@ -3458,17 +3571,34 @@ impl Emitter {
         args: &[Expr],
         span: Span,
     ) -> Option<Typed> {
-        let Expr::Ident { name, .. } = callee else {
-            self.unsupported(span, "calling anything but a plain named function");
-            return None;
-        };
-        if name == "print" || name == "println" {
-            return self.write_builtin(module, name.as_str(), args, span);
+        match callee {
+            Expr::Ident { name, .. } => self.call_named(module, name, args, callee, span),
+            Expr::Paren { inner, .. } => self.call(module, inner, args, span),
+            Expr::Field { base, name, .. } => {
+                self.call_method(module, base, name, args, span)
+            }
+            _ => {
+                self.unsupported(span, "calling anything but a named function or a method");
+                None
+            }
         }
-        if self.skipped.contains(name.as_str()) {
+    }
+
+    fn call_named(
+        &mut self,
+        module: &Module<'static>,
+        name: &str,
+        args: &[Expr],
+        callee: &Expr,
+        span: Span,
+    ) -> Option<Typed> {
+        if name == "print" || name == "println" {
+            return self.write_builtin(module, name, args, span);
+        }
+        if self.skipped.contains(name) {
             return Some(Typed::error());
         }
-        let Some(function) = self.functions.get(name.as_str()).copied() else {
+        let Some(function) = self.functions.get(name).copied() else {
             self.diagnostics.push(
                 Diagnostic::error(
                     code::UNDECLARED,
@@ -3482,7 +3612,7 @@ impl Emitter {
         let (params, return_ty) = {
             let signature = self
                 .signatures
-                .get(name.as_str())
+                .get(name)
                 .expect("a callable function has a recorded signature");
             (signature.params.clone(), signature.return_ty)
         };
@@ -3515,10 +3645,170 @@ impl Emitter {
                 }
             }
         }
-        let call = self
-            .builder
-            .build_call(function, &arguments, "call")
-            .ok()?;
+        self.invoke(function, arguments, return_ty)
+    }
+
+    /// Where the receiver of a method call comes from: a place, which a
+    /// pointer receiver can borrow directly, or a value, which has no address.
+    fn call_method(
+        &mut self,
+        module: &Module<'static>,
+        base: &Expr,
+        name: &dux_ast::Ident,
+        args: &[Expr],
+        span: Span,
+    ) -> Option<Typed> {
+        let place = self.place_of_expr(module, base);
+        let (base_ty, base_at) = match place {
+            Some((ty, at)) => (ty, Some(at)),
+            None => {
+                let value = self.expr(module, base, None)?;
+                (value.ty, value.pointer_value())
+            }
+        };
+        let Some(record) = self.record_of(base_ty) else {
+            self.diagnostics.push(
+                Diagnostic::error(
+                    code::UNDECLARED,
+                    format!(
+                        "there are no methods on a `{}`",
+                        if base_ty == DuxType::Error {
+                            "value of an unknown type".to_string()
+                        } else {
+                            base_ty.name()
+                        }
+                    ),
+                )
+                .with_span(base.span()),
+            );
+            return None;
+        };
+        let key = format!("{}.{}", record.name, name.name);
+        if self.skipped.contains(&key) {
+            return Some(Typed::error());
+        }
+        let Some(function) = self.functions.get(&key).copied() else {
+            self.diagnostics.push(
+                Diagnostic::error(
+                    code::UNDECLARED,
+                    format!("`{}` has no method `{}`", record.name, name.name),
+                )
+                .with_span(name.span)
+                .with_note(format!("methods are declared in an `impl {}` block", record.name)),
+            );
+            return None;
+        };
+        let signature = self
+            .signatures
+            .get(&key)
+            .expect("a callable method has a recorded signature");
+        let params = signature.params.clone();
+        let return_ty = signature.return_ty;
+        let want = signature.receiver.unwrap_or(DuxType::Struct(record));
+        let receiver = self.receiver(module, base_ty, base_at, want, name, base.span())?;
+        if args.len() != params.len() {
+            self.diagnostics.push(
+                Diagnostic::error(
+                    code::WRONG_ARITY,
+                    format!(
+                        "`{}.{}` takes {} arguments, given {}",
+                        record.name,
+                        name.name,
+                        params.len(),
+                        args.len()
+                    ),
+                )
+                .with_span(span),
+            );
+            return None;
+        }
+        let mut arguments = match receiver.basic() {
+            Some(basic) => vec![BasicMetadataValueEnum::from(basic)],
+            None => {
+                self.unsupported(base.span(), "passing this receiver");
+                return None;
+            }
+        };
+        for (parameter, arg) in params.iter().zip(args) {
+            let value = self.expr(module, arg, Some(*parameter))?;
+            if value.ty == DuxType::Error {
+                return None;
+            }
+            let value = self.coerce_implicit(module, value, *parameter, arg.span())?;
+            match value.basic() {
+                Some(basic) => arguments.push(BasicMetadataValueEnum::from(basic)),
+                None => {
+                    self.unsupported(arg.span(), "passing this value");
+                    return None;
+                }
+            }
+        }
+        self.invoke(function, arguments, return_ty)
+    }
+
+    /// The receiver argument, from the place (or value) the method was called
+    /// on: a pointer receiver borrows the place, a value receiver copies it.
+    fn receiver(
+        &mut self,
+        module: &Module<'static>,
+        base_ty: DuxType,
+        base_at: Option<PointerValue<'static>>,
+        want: DuxType,
+        name: &dux_ast::Ident,
+        span: Span,
+    ) -> Option<Typed> {
+        let _ = module;
+        let refusal = |this: &mut Self, why: &str| {
+            this.diagnostics.push(
+                Diagnostic::error(
+                    code::TYPE_MISMATCH,
+                    format!(
+                        "`{}` cannot take `{}` this way: {why}",
+                        if base_ty == DuxType::Error {
+                            "this value".to_string()
+                        } else {
+                            base_ty.name()
+                        },
+                        name.name
+                    ),
+                )
+                .with_span(span),
+            );
+            None
+        };
+        let Some(at) = base_at else {
+            return refusal(self, "the receiver has no address to pass");
+        };
+        match want {
+            DuxType::Pointer(target) => {
+                if base_ty == *target {
+                    Some(Typed::pointer(at, want))
+                } else if base_ty == want {
+                    self.load(want, at)
+                } else {
+                    refusal(self, "it is neither the record nor a pointer to it")
+                }
+            }
+            want => {
+                if base_ty == want {
+                    self.load(want, at)
+                } else if self.pointee_of(base_ty) == Some(want) {
+                    let pointer = self.load(base_ty, at)?.pointer_value()?;
+                    self.load(want, pointer)
+                } else {
+                    refusal(self, "it is not a copy of the receiver's record")
+                }
+            }
+        }
+    }
+
+    fn invoke(
+        &mut self,
+        function: FunctionValue<'static>,
+        arguments: Vec<BasicMetadataValueEnum<'static>>,
+        return_ty: Option<DuxType>,
+    ) -> Option<Typed> {
+        let call = self.builder.build_call(function, &arguments, "call").ok()?;
         let core = match call.try_as_basic_value() {
             ValueKind::Basic(BasicValueEnum::IntValue(value)) => Core::Int(value),
             ValueKind::Basic(BasicValueEnum::FloatValue(value)) => Core::Float(value),

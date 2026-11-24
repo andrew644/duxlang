@@ -1,0 +1,6 @@
+squared=9
+scaled=2 4 4
+through the pointer=2 2 2 squared=12
+centre=2 3 4
+moved min=1 1 1 max=5 7 9
+through a copy of the pointer=6 6
