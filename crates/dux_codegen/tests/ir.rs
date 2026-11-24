@@ -724,3 +724,117 @@ fn main() {
     assert!(ir.contains("@dux.A.read(%A"), "{ir}");
     assert!(ir.contains("@dux.B.read(%B"), "{ir}");
 }
+
+#[test]
+fn a_slice_is_an_address_and_a_count() {
+    let ir = build(
+        "package main
+fn main() {
+    dims: [i32; 4] = [10, 20, 30, 40]
+    window: []i32 = &dims
+    println($\"{}\", window.len())
+}",
+    )
+    .expect("builds")
+    .ir_text();
+    assert!(
+        ir.contains("%window = alloca { ptr, i64 }"),
+        "a view is sixteen bytes of slot:\n{ir}"
+    );
+    assert!(
+        ir.contains("insertvalue { ptr, i64 } undef, ptr %dims, 0")
+            && ir.contains("i64 4, 1"),
+        "the array's own length becomes the view's count:\n{ir}"
+    );
+    assert!(
+        ir.contains("extractvalue { ptr, i64 } %load, 1"),
+        "`.len()` reads the count back out:\n{ir}"
+    );
+}
+
+#[test]
+fn indexing_a_slice_walks_the_data_it_carries() {
+    let ir = build(
+        "package main
+fn show(xs: []i32) -> i32 {
+    return xs[1]
+}
+fn main() {
+    dims: [i32; 2] = [1, 2]
+    println($\"{}\", show(dims))
+}",
+    )
+    .expect("builds")
+    .ir_text();
+    assert!(
+        ir.contains("%idx = getelementptr i32, ptr"),
+        "an element is `data + index`, not an index into an array:\n{ir}"
+    );
+    assert!(
+        ir.contains("insertvalue { ptr, i64 } undef, ptr %dims, 0"),
+        "an array passed where a view is expected borrows its storage:\n{ir}"
+    );
+}
+
+#[test]
+fn subslicing_moves_the_head_and_shortens_the_count() {
+    let ir = build(
+        "package main
+fn main() {
+    dims: [i32; 4] = [10, 20, 30, 40]
+    middle := &dims[1..3]
+    println($\"{} {}\", middle.len(), middle[0])
+}",
+    )
+    .expect("builds")
+    .ir_text();
+    assert!(
+        ir.contains("%view.head = getelementptr i32, ptr"),
+        "the head steps to the first element of the range:\n{ir}"
+    );
+    assert!(
+        ir.contains("getelementptr [4 x i32], ptr %dims, i64 0, i64 1")
+            || ir.contains("%view.head"),
+        "the count is the difference of the bounds:\n{ir}"
+    );
+}
+
+#[test]
+fn iterating_a_slice_reads_its_count_at_loop_entry() {
+    let ir = build(
+        "package main
+fn total(xs: []i32) -> i32 {
+    sum: i32 = 0
+    for i, v in xs {
+        sum += v
+        println($\"{}\", i)
+    }
+    return sum
+}
+fn main() {
+    dims: [i32; 2] = [1, 2]
+    println($\"{}\", total(dims))
+}",
+    )
+    .expect("builds")
+    .ir_text();
+    assert!(ir.contains("%iter = alloca i64"), "{ir}");
+    assert!(
+        ir.contains("icmp ult i64 %load"),
+        "the loop stops at the view's length:\n{ir}"
+    );
+}
+
+#[test]
+fn a_view_cannot_be_indexed_by_anything_but_an_integer() {
+    let errors = build(
+        "package main
+fn main() {
+    dims: [i32; 2] = [1, 2]
+    window: []i32 = &dims
+    println($\"{}\", window[\"one\"])
+}",
+    )
+    .unwrap_err();
+    assert_eq!(errors[0].code, dux_diag::code::TYPE_MISMATCH, "{errors:?}");
+}

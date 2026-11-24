@@ -575,3 +575,35 @@ a field of a pointer receiver, a method taking a pointer argument, a call
 through a copy of a pointer); four new IR tests and four new checker tests; and
 `example/structs.dux` typechecks with no diagnostic at all. 169 tests, clippy
 clean.
+
+## Session 11d — M3 step 4: `[]T` views
+
+`[]T` is sixteen bytes of `{ data, len }`, and it is the shape everything else
+in this milestone wants: a string view is the same pair over `u8`, `new`/`make`
+hand one out, and `Vec` (later) is a slice plus a capacity.
+
+The lowering gained `DuxType::Slice`, an LLVM `{ ptr, i64 }` that flows through
+the same aggregate machinery as a record — it copies, it lives in a slot, it is
+passed by value. Three helpers carry the whole abstraction: `view` builds a
+pair out of an address and a count, `slice_parts` takes one apart, and
+`view_of_array` lets an array make a view of itself.
+
+The rules the examples demanded:
+
+- `&x` now means three things, and says which: the address of a scalar place,
+  a view of an array, and — for `&arr[a..b]` — the view of a range. A view is
+  already a view, so `&window` is the same window.
+- An array passed where a view is expected borrows its storage and states its
+  count. The checker calls that lossless, because it is.
+- Indexing a view walks `data + index`; subslicing steps the head and shortens
+  the count. `[a..b]` with either bound spelled is a view; both bounds must be
+  written for now, because that is all the parser accepts.
+- `.len()` is a method that no `impl` declares: an array answers with its
+  length and a view answers with the count it carries.
+- `for v in xs` and `for i, v in xs` walk arrays and views alike. One loop
+  shape, two ways to know where the end is.
+
+Proof: `slices.dux` runs with pinned stdout (views of arrays, subslicing,
+writing through a view and seeing it in the array, open indexing, iteration
+with and without the position); five new IR tests and two new checker tests.
+The corpus still says nothing but E0007. 186 tests, clippy clean.

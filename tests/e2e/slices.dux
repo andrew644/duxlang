@@ -1,0 +1,47 @@
+package main
+
+fn total(xs: []i32) -> i32 {
+    sum: i32 = 0
+    for i, v in xs {
+        sum += v
+        println($"[{i}]={}", v)
+    }
+    return sum
+}
+
+fn bump(xs: []i32, by: i32) {
+    for i, _ in xs {
+        xs[i] += by
+    }
+}
+
+fn main() {
+    dims: [i32; 4] = [10, 20, 30, 40]
+    window: []i32 = &dims
+    println($"len={} first={} last={}", window.len(), window[0], window[window.len() - 1])
+    println($"total={}", total(dims))
+
+    middle := &dims[1..3]
+    println($"middle={} {} len={}", middle[0], middle[1], middle.len())
+    middle[0] = 99
+    println($"through the array={} through the window={}", dims[1], window[1])
+
+    tail := window[2..4]
+    from := window[0..2]
+    none := window[1..1]
+    println(
+        $"tail={} {} from={} {} empty={}",
+        tail[0],
+        tail[1],
+        from[0],
+        from[1],
+        none.len(),
+    )
+
+    bump(window, 1)
+    println($"bumped={} {} {} {}", window[0], window[1], window[2], dims[3])
+
+    for v in window {
+        println($"saw={}", v)
+    }
+}

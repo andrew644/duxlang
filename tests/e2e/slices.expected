@@ -1,0 +1,14 @@
+len=4 first=10 last=40
+[0]=10
+[1]=20
+[2]=30
+[3]=40
+total=100
+middle=20 30 len=2
+through the array=99 through the window=99
+tail=30 40 from=10 99 empty=0
+bumped=11 100 31 41
+saw=11
+saw=100
+saw=31
+saw=41

@@ -876,3 +876,87 @@ fn main() {
         Vec::<&'static str>::new()
     );
 }
+
+#[test]
+fn an_array_is_a_slice_that_knows_its_own_length() {
+    assert_eq!(
+        codes(
+            "fn take(xs: []i32) -> i64 {
+    return xs.len() as i64
+}
+
+fn main() {
+    dims: [i32; 4] = [10, 20, 30, 40]
+    window: []i32 = &dims
+    middle := &dims[1..3]
+    println($\"{} {} {} {} {}\", take(dims), window.len(), middle.len(), window[0], middle[1])
+}
+"
+        ),
+        Vec::<&'static str>::new()
+    );
+    assert_eq!(
+        codes(
+            "fn main() {
+    dims: [i32; 2] = [1, 2]
+    window: []i64 = &dims
+    println($\"{}\", window.len())
+}
+"
+        ),
+        // The element type is not a conversion away; it is simply another type.
+        vec!["E0201"]
+    );
+    assert_eq!(
+        codes(
+            "fn main() {
+    dims: [i32; 2] = [1, 2]
+    window: []i32 = &dims
+    wide: i64 = window[\"one\"]
+    println($\"{}\", wide)
+}
+"
+        ),
+        vec!["E0201"]
+    );
+}
+
+#[test]
+fn a_slice_elements_type_flows_through_indexing_and_loops() {
+    assert_eq!(
+        codes(
+            "struct Vec3 {
+    x: f32,
+}
+
+fn main() {
+    points: [Vec3; 2] = [Vec3 { x: 1.0 }, Vec3 { x: 2.0 }]
+    view: []Vec3 = &points
+    for p in view {
+        p.x = 3.0
+    }
+    wide: f64 = view[0]
+    println($\"{}\", wide)
+}
+"
+        ),
+        vec!["E0201"]
+    );
+    assert_eq!(
+        codes(
+            "struct Vec3 {
+    x: f32,
+}
+
+fn main() {
+    points: [Vec3; 2] = [Vec3 { x: 1.0 }, Vec3 { x: 2.0 }]
+    view: []Vec3 = &points
+    for i, p in view {
+        println($\"{} {}\", i, p.x)
+    }
+}
+"
+        ),
+        Vec::<&'static str>::new()
+    );
+}

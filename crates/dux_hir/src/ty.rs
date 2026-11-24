@@ -43,6 +43,8 @@ pub enum Ty {
     IntConst(i128),
     FloatConst(f64),
     Array(Box<Ty>),
+    /// `[]T`: a `{ data, len }` view over elements of `T`.
+    Slice(Box<Ty>),
     Struct(String),
     /// Unknown to the checker today: an imported or C type, a generic
     /// instantiation, a pointer target, a field of a shape M3 will know.
@@ -71,6 +73,7 @@ impl Ty {
             Ty::IntConst(value) => format!("integer literal {value}"),
             Ty::FloatConst(value) => format!("float literal {value}"),
             Ty::Array(element) => format!("[{}]", element.name()),
+            Ty::Slice(element) => format!("[]{}", element.name()),
             Ty::Struct(name) => name.clone(),
             Ty::Opaque => "<opaque>".to_string(),
         }
@@ -198,6 +201,11 @@ impl Ty {
         }
         if *self == Ty::Ptr && *to == Ty::Str {
             return true;
+        }
+        // An array is a slice that knows its own length, so borrowing its
+        // elements as a view loses nothing.
+        if let (Ty::Array(element), Ty::Slice(want)) = (self, to) {
+            return element == want;
         }
         false
     }
@@ -374,7 +382,9 @@ impl<'a> Checker<'a> {
                 }
             }
             Type::Array { element, .. } => Ty::Array(Box::new(self.resolve_type_depth(element, depth + 1))),
-            Type::Slice { .. } => Ty::Opaque,
+            Type::Slice { element, .. } => {
+                Ty::Slice(Box::new(self.resolve_type_depth(element, depth + 1)))
+            }
             Type::Tuple { .. } | Type::Function { .. } | Type::ConstArgument { .. } => Ty::Opaque,
             Type::Error { .. } => Ty::Opaque,
         }
@@ -452,7 +462,8 @@ impl<'a> Checker<'a> {
                 }
                 let on_the_numeric_lattice = (from.is_numeric() && to.is_numeric())
                     || (from == Ty::Ptr && *to == Ty::Str)
-                    || (from.is_pointer() && to.is_pointer());
+                    || (from.is_pointer() && to.is_pointer())
+                    || matches!((&from, to), (Ty::Array(element), Ty::Slice(want)) if element == want);
                 if !on_the_numeric_lattice {
                     self.mismatch(span, to, &value);
                     return to.clone();
@@ -846,7 +857,12 @@ impl<'a> Checker<'a> {
             }
             UnaryOp::AddressOf => {
                 let target = self.infer(operand).defaulted();
-                Ty::Targeted(Box::new(target))
+                match target {
+                    // `&arr` and `&arr[a..b]` both make a view; taking the
+                    // address of a view is the same view, unchanged.
+                    Ty::Array(element) | Ty::Slice(element) => Ty::Slice(element),
+                    target => Ty::Targeted(Box::new(target)),
+                }
             }
             UnaryOp::Load => {
                 let value = self.infer(operand);
@@ -932,9 +948,34 @@ impl<'a> Checker<'a> {
             }
             Expr::Index { base, index, span } => {
                 let base = self.infer(base);
+                // `[a..b]` is subslicing: it widens nothing and shortens nothing,
+                // it makes a view over the same elements.
+                if matches!(&**index, Expr::Range { .. }) {
+                    for bound in range_bounds(index) {
+                        let _ = self.infer(bound);
+                    }
+                    return match &base {
+                        Ty::Array(element) => Ty::Slice(element.clone()),
+                        Ty::Slice(element) => Ty::Slice(element.clone()),
+                        Ty::Str => Ty::Str,
+                        Ty::Opaque | Ty::Ptr => Ty::Opaque,
+                        other => {
+                            self.error(
+                                code::TYPE_MISMATCH,
+                                format!("there is no subslicing of `{}`", other.name()),
+                                *span,
+                            );
+                            Ty::Opaque
+                        }
+                    };
+                }
                 let index = self.infer(index);
                 match &base {
                     Ty::Array(element) => {
+                        self.check_index(&index, *span);
+                        (**element).clone()
+                    }
+                    Ty::Slice(element) => {
                         self.check_index(&index, *span);
                         (**element).clone()
                     }
@@ -1148,6 +1189,12 @@ impl<'a> Checker<'a> {
         }
         if let Expr::Field { base, name, .. } = callee {
             let base = self.infer(base);
+            if name.name == "len" && args.is_empty() {
+                match &base {
+                    Ty::Array(_) | Ty::Slice(_) | Ty::Str => return Ty::U64,
+                    _ => {}
+                }
+            }
             if let Some(owner) = base.record_owner() {
                 if let Some(signature) = self
                     .methods
@@ -1318,7 +1365,7 @@ impl<'a> Checker<'a> {
                         let is_range = matches!(iterable, Expr::Range { .. });
                         let iterable = self.infer(iterable);
                         let element = match &iterable {
-                            Ty::Array(inner) => Some((**inner).clone()),
+                            Ty::Array(inner) | Ty::Slice(inner) => Some((**inner).clone()),
                             Ty::Str => Some(Ty::U8),
                             _ => None,
                         };
@@ -1450,7 +1497,12 @@ impl<'a> Checker<'a> {
     }
 
     fn compound(&mut self, op: AssignOp, target: &Ty, span: Span) {
-        if *target == Ty::Opaque || target.is_numeric() || target.is_pointer() || *target == Ty::Str {
+        if *target == Ty::Opaque
+            || target.is_numeric()
+            || target.is_pointer()
+            || *target == Ty::Str
+            || matches!(target, Ty::Slice(_))
+        {
             return;
         }
         self.error(
@@ -1607,6 +1659,16 @@ fn float_fold(op: BinaryOp, a: f64, b: f64) -> Option<Ty> {
 
 /// The name a place expression is rooted in: `unit.min.x` is rooted in
 /// `unit`, so a `const` record keeps its fields frozen too.
+/// The two bounds of `[a..b]`, either of which may be missing.
+fn range_bounds(index: &Expr) -> Vec<&Expr> {
+    match index {
+        Expr::Range { start, end, .. } => {
+            start.iter().chain(end.iter()).map(|bound| &**bound).collect()
+        }
+        _ => Vec::new(),
+    }
+}
+
 fn place_root(expr: &Expr) -> Option<String> {
     match expr {
         Expr::Ident { name, .. } => Some(name.clone()),

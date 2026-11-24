@@ -29,7 +29,7 @@ use inkwell::values::{
     BasicMetadataValueEnum, BasicValueEnum, FloatValue, GlobalValue, IntValue, PointerValue,
     StructValue,
 };
-use inkwell::values::{FunctionValue, ValueKind};
+use inkwell::values::{BasicValue, FunctionValue, ValueKind};
 use inkwell::{AddressSpace, FloatPredicate, IntPredicate};
 
 const DW_ATE_BOOLEAN: u32 = 0x02;
@@ -62,6 +62,10 @@ pub(crate) enum DuxType {
     /// `[N x T]` storage; bindings and assignments that must copy do so
     /// element by element.
     Array(&'static ArrayInfo),
+    /// `[]T`: a `{ data, len }` view, sixteen bytes, no capacity. It is a
+    /// value, so it copies, is passed by value and lives in a slot like any
+    /// other aggregate.
+    Slice(&'static DuxType),
     /// A declared `struct`. The LLVM representation is the nominal struct
     /// type, so assignment is a copy of the whole record.
     Struct(&'static StructInfo),
@@ -119,6 +123,14 @@ impl DuxType {
 
     fn array(elem: DuxType, len: u64) -> DuxType {
         DuxType::Array(Box::leak(Box::new(ArrayInfo { elem, len })))
+    }
+
+    /// The elements a slice runs over.
+    fn slice_element(self) -> Option<DuxType> {
+        match self {
+            DuxType::Slice(element) => Some(*element),
+            _ => None,
+        }
     }
 
     fn array_info(self) -> Option<&'static ArrayInfo> {
@@ -206,6 +218,7 @@ impl DuxType {
             }
             DuxType::Pointer(_) => context.ptr_type(AddressSpace::default()).into(),
             DuxType::Array(info) => info.elem.llvm(context).array_type(info.len as u32).into(),
+            DuxType::Slice(_) => context.struct_type(&[context.ptr_type(AddressSpace::default()).into(), context.i64_type().into()], false).into(),
             DuxType::Struct(info) => info.llvm.into(),
         }
     }
@@ -244,6 +257,7 @@ impl DuxType {
             DuxType::Ptr => "rawptr".to_string(),
             DuxType::Pointer(target) => format!("*{}", target.name()),
             DuxType::Array(info) => format!("[{}; {}]", info.elem.name(), info.len),
+            DuxType::Slice(element) => format!("[]{}", element.name()),
             DuxType::Struct(info) => info.name.to_string(),
             DuxType::Error => "<error>".to_string(),
         }
@@ -262,6 +276,7 @@ impl DuxType {
             DuxType::U64 => 1 << 64,
             DuxType::F32 | DuxType::F64 => return true,
             DuxType::Array(..) | DuxType::Struct(..) | DuxType::Str | DuxType::Ptr => return false,
+            DuxType::Slice(_) => return false,
             DuxType::Pointer(_) => return false,
             DuxType::Error => return false,
         };
@@ -664,6 +679,9 @@ impl Emitter {
                 Some(primitive) => Some(primitive),
                 None => self.struct_type_of(name),
             },
+            Type::Slice { element, .. } => self
+                .type_of(element)
+                .map(|element| DuxType::Slice(Box::leak(Box::new(element)))),
             Type::Pointer { pointee, .. } => match self.type_of(pointee) {
                 Some(target) => Some(self.pointer_to(target)),
                 None => Some(DuxType::Ptr),
@@ -1985,6 +2003,8 @@ impl Emitter {
 
     /// `for v in xs` and `for i, v in xs` over a fixed array. The iterable is
     /// evaluated once; the counter walks `[0, len)`.
+    /// `for x in xs` and `for i, x in xs`. An array knows its length and a
+    /// slice carries it; past that the two walk the same way.
     fn for_in_array(
         &mut self,
         module: &Module<'static>,
@@ -2000,20 +2020,39 @@ impl Emitter {
         if iter.ty == DuxType::Error {
             return;
         }
-        let Some(info) = iter.ty.array_info() else {
-            self.unsupported(
-                iterable.span(),
-                &format!(
-                    "iterating a `{}` (strings and slices land at M3)",
-                    iter.ty.name()
-                ),
-            );
-            self.dead = true;
-            return;
-        };
-        let Core::Ptr(array) = iter.core else {
-            self.dead = true;
-            return;
+        let (element, base, limit, array_len) = match iter.ty.array_info() {
+            Some(info) => {
+                let Some(base) = iter.pointer_value() else {
+                    self.dead = true;
+                    return;
+                };
+                (
+                    info.elem,
+                    base,
+                    self.context.i64_type().const_int(info.len, false),
+                    Some(info),
+                )
+            }
+            None => match iter.ty.slice_element() {
+                Some(element) => {
+                    let Some((data, len)) = self.slice_parts(iter) else {
+                        self.dead = true;
+                        return;
+                    };
+                    (element, data, len, None)
+                }
+                None => {
+                    self.unsupported(
+                        iterable.span(),
+                        &format!(
+                            "iterating a `{}` (strings land with the string view)",
+                            iter.ty.name()
+                        ),
+                    );
+                    self.dead = true;
+                    return;
+                }
+            },
         };
         let counter = self.alloca(DuxType::I64, "iter");
         let _ = self
@@ -2030,9 +2069,9 @@ impl Emitter {
             None => None,
         };
         let value_slot = if value.name != "_" {
-            let slot = self.alloca(info.elem, &value.name);
+            let slot = self.alloca(element, &value.name);
             if let Some(scope) = self.scopes.last_mut() {
-                scope.insert(value.name.clone(), (info.elem, slot));
+                scope.insert(value.name.clone(), (element, slot));
             }
             Some(slot)
         } else {
@@ -2051,7 +2090,6 @@ impl Emitter {
             self.dead = true;
             return;
         };
-        let limit = self.context.i64_type().const_int(info.len, false);
         let Ok(more) = self
             .builder
             .build_int_compare(IntPredicate::ULT, current, limit, "in.cmp")
@@ -2073,14 +2111,19 @@ impl Emitter {
         if let Some(slot) = value_slot {
             let current = self.load(DuxType::I64, counter).and_then(|v| v.int_value());
             if let Some(i) = current {
-                let array_ty = info.elem.llvm(self.context).array_type(info.len as u32);
-                let zero = self.context.i64_type().const_zero();
-                let element = unsafe { self.builder.build_gep(array_ty, array, &[zero, i], "elem") };
-                if let Ok(at) = element {
-                    if let Some(element) = self.load(info.elem, at) {
-                        match (info.elem.array_info(), element.core) {
-                            (Some(elem_info), Core::Ptr(source)) => {
-                                self.copy_array(slot, source, elem_info)
+                let at = match array_len {
+                    Some(info) => {
+                        let array_ty = info.elem.llvm(self.context).array_type(info.len as u32);
+                        let zero = self.context.i64_type().const_zero();
+                        unsafe { self.builder.build_gep(array_ty, base, &[zero, i], "elem") }
+                    }
+                    None => unsafe { self.builder.build_gep(element.llvm(self.context), base, &[i], "elem") },
+                };
+                if let Ok(at) = at {
+                    if let Some(element) = self.load(element, at) {
+                        match (element.ty.array_info(), element.core) {
+                            (Some(info), Core::Ptr(source)) => {
+                                self.copy_array(slot, source, info)
                             }
                             (None, _) => {
                                 if let Some(basic) = element.basic() {
@@ -2291,8 +2334,11 @@ impl Emitter {
         module: &Module<'static>,
         base: &Expr,
         index: &Expr,
-        _span: Span,
+        span: Span,
     ) -> Option<Typed> {
+        if matches!(index, Expr::Range { .. }) {
+            return self.subslice(module, base, index, span);
+        }
         let (elem, at) = self.place_of(module, base, index)?;
         self.load(elem, at)
     }
@@ -2307,6 +2353,20 @@ impl Emitter {
     ) -> Option<(DuxType, PointerValue<'static>)> {
         let base_span = base.span();
         let base = self.expr(module, base, None)?;
+        if let Some(element) = base.ty.slice_element() {
+            let (data, _) = self.slice_parts(base)?;
+            let index_value = self.expr(module, index, None)?;
+            if index_value.ty == DuxType::Error {
+                return None;
+            }
+            let index64 = self.index_to_i64(index_value, index.span())?;
+            let at = unsafe {
+                self.builder
+                    .build_gep(element.llvm(self.context), data, &[index64.int_value()?], "idx")
+            }
+            .ok()?;
+            return Some((element, at));
+        }
         let (element, is_array) = match base.ty.array_info() {
             Some(info) => (info.elem, true),
             None => match self.pointee_of(base.ty) {
@@ -2330,24 +2390,7 @@ impl Emitter {
         if index_value.ty == DuxType::Error {
             return None;
         }
-        if !index_value.ty.is_integral() {
-            self.diagnostics.push(
-                Diagnostic::error(
-                    code::TYPE_MISMATCH,
-                    format!(
-                        "an index must be an integer, found `{}`",
-                        index_value.ty.name()
-                    ),
-                )
-                .with_span(index.span()),
-            );
-            return None;
-        }
-        let index64 = if index_value.ty == DuxType::I64 {
-            index_value
-        } else {
-            self.convert(index_value, DuxType::I64)?
-        };
+        let index64 = self.index_to_i64(index_value, index.span())?;
         let at = if is_array {
             let info = base.ty.array_info()?;
             let array_ty = info.elem.llvm(self.context).array_type(info.len as u32);
@@ -2453,6 +2496,183 @@ impl Emitter {
             }
             _ => None,
         }
+    }
+
+    /// What `&` makes of an operand: a view of an array or of a range of one,
+    /// the view itself when the operand already is one, and otherwise the
+    /// address of the place.
+    fn borrowed(&mut self, module: &Module<'static>, operand: &Expr, span: Span) -> Option<Typed> {
+        let mut inner = operand;
+        while let Expr::Paren { inner: next, .. } = inner {
+            inner = next;
+        }
+        if let Expr::Index { base, index, .. } = inner {
+            if matches!(&**index, Expr::Range { .. }) {
+                return self.subslice(module, base, index, span);
+            }
+        }
+        let (target, at) = self.place_of_expr(module, inner)?;
+        if target.array_info().is_some() {
+            let copied = self.load(target, at)?;
+            return self.view_of_array(copied);
+        }
+        if target.slice_element().is_some() {
+            return self.load(target, at);
+        }
+        Some(Typed::pointer(at, self.pointer_to(target)))
+    }
+
+    /// One bound of a `[a..b]`, evaluated as the position it names.
+    fn view_bound(&mut self, module: &Module<'static>, bound: &Expr) -> Option<Typed> {
+        let value = self.expr(module, bound, Some(DuxType::I64))?;
+        self.index_to_i64(value, bound.span())
+    }
+
+    /// An index is an `i64` position, whatever integer the source wrote.
+    fn index_to_i64(&mut self, value: Typed, span: Span) -> Option<Typed> {
+        if value.ty == DuxType::I64 {
+            return Some(value);
+        }
+        if !value.ty.is_integral() {
+            self.diagnostics.push(
+                Diagnostic::error(
+                    code::TYPE_MISMATCH,
+                    format!("an index must be an integer, found `{}`", value.ty.name()),
+                )
+                .with_span(span),
+            );
+            return None;
+        }
+        self.convert(value, DuxType::I64)
+    }
+
+    /// The `{ data, len }` shape every view shares.
+    fn view_llvm(&self) -> StructType<'static> {
+        self.context.struct_type(
+            &[
+                self.context.ptr_type(AddressSpace::default()).into(),
+                self.context.i64_type().into(),
+            ],
+            false,
+        )
+    }
+
+    /// A view over `element`s: an address and a count.
+    fn view(
+        &mut self,
+        element: DuxType,
+        data: PointerValue<'static>,
+        len: IntValue<'static>,
+    ) -> Typed {
+        let ty = DuxType::Slice(Box::leak(Box::new(element)));
+        let mut value = self.view_llvm().get_undef();
+        if let Ok(inserted) =
+            self.builder
+                .build_insert_value(value, data.as_basic_value_enum(), 0, "view.data")
+        {
+            value = inserted.into_struct_value();
+        }
+        if let Ok(inserted) =
+            self.builder
+                .build_insert_value(value, len.as_basic_value_enum(), 1, "view.len")
+        {
+            value = inserted.into_struct_value();
+        }
+        Typed {
+            core: Core::Aggregate(value),
+            ty,
+        }
+    }
+
+    /// The address and the count a view carries.
+    fn slice_parts(&mut self, value: Typed) -> Option<(PointerValue<'static>, IntValue<'static>)> {
+        let Core::Aggregate(value) = value.core else {
+            if let Some(Core::Ptr(at)) = Some(value.core) {
+                // A view that lives in a slot: read it out first.
+                let loaded = self
+                    .builder
+                    .build_load(self.view_llvm(), at, "view")
+                    .ok()?;
+                return self.slice_parts(Typed {
+                    core: Core::Aggregate(loaded.into_struct_value()),
+                    ty: value.ty,
+                });
+            }
+            return None;
+        };
+        let data = self
+            .builder
+            .build_extract_value(value, 0, "view.data")
+            .ok()?
+            .into_pointer_value();
+        let len = self
+            .builder
+            .build_extract_value(value, 1, "view.len")
+            .ok()?
+            .into_int_value();
+        Some((data, len))
+    }
+
+    /// The view an array makes of itself: its own storage, its own length.
+    fn view_of_array(&mut self, value: Typed) -> Option<Typed> {
+        let info = value.ty.array_info()?;
+        let data = value.pointer_value()?;
+        let len = self.context.i64_type().const_int(info.len, false);
+        Some(self.view(info.elem, data, len))
+    }
+
+    /// `[a..b]`: the same elements, a shorter count. A missing bound is the
+    /// end of the view.
+    fn subslice(
+        &mut self,
+        module: &Module<'static>,
+        base: &Expr,
+        range: &Expr,
+        span: Span,
+    ) -> Option<Typed> {
+        let value = self.expr(module, base, None)?;
+        let view = if value.ty.array_info().is_some() {
+            self.view_of_array(value)?
+        } else if value.ty.slice_element().is_some() {
+            value
+        } else {
+            self.diagnostics.push(
+                Diagnostic::error(
+                    code::TYPE_MISMATCH,
+                    format!(
+                        "there is no subslicing of `{}`",
+                        if value.ty == DuxType::Error { "this value".to_string() } else { value.ty.name() }
+                    ),
+                )
+                .with_span(span),
+            );
+            return None;
+        };
+        let element = view.ty.slice_element()?;
+        let (data, len) = self.slice_parts(view)?;
+        let Expr::Range { start, end, .. } = range else {
+            return None;
+        };
+        let zero = self.context.i64_type().const_zero();
+        let from = match start.as_deref() {
+            Some(lo) => self.view_bound(module, lo)?,
+            None => Typed { core: Core::Int(zero), ty: DuxType::I64 },
+        };
+        let to = match end.as_deref() {
+            Some(hi) => self.view_bound(module, hi)?,
+            None => Typed { core: Core::Int(len), ty: DuxType::I64 },
+        };
+        let from = from.int_value()?;
+        let to = to.int_value()?;
+        let data = unsafe {
+            self.builder
+                .build_gep(element.llvm(self.context), data, &[from], "view.head")
+        }
+        .ok()?;
+        let Ok(count) = self.builder.build_int_sub(to, from, "view.len") else {
+            return None;
+        };
+        Some(self.view(element, data, count))
     }
 
     /// The record a place reaches and the address of that record. A place of
@@ -2948,8 +3168,8 @@ impl Emitter {
                     None
                 }
             }
-            UnaryOp::AddressOf => match self.place_of_expr(module, operand) {
-                Some((target, at)) => Some(Typed::pointer(at, self.pointer_to(target))),
+            UnaryOp::AddressOf => match self.borrowed(module, operand, span) {
+                Some(view) => Some(view),
                 None => {
                     self.diagnostics.push(
                         Diagnostic::error(
@@ -3394,6 +3614,15 @@ impl Emitter {
                 },
             });
         }
+        if let Some(info) = value.ty.array_info() {
+            // An array is a slice that knows its own length: passing one where
+            // a view is expected borrows its storage and states its count.
+            if to.slice_element() == Some(info.elem) {
+                if let Some(view) = self.view_of_array(value) {
+                    return Some(view);
+                }
+            }
+        }
         if self.lossless(value.ty, to) {
             return self.convert(value, to);
         }
@@ -3432,6 +3661,9 @@ impl Emitter {
         }
         if from == DuxType::Ptr && to == DuxType::Str {
             return true;
+        }
+        if let (Some(info), Some(want)) = (from.array_info(), to.slice_element()) {
+            return info.elem == want;
         }
         false
     }
@@ -3666,6 +3898,11 @@ impl Emitter {
                 (value.ty, value.pointer_value())
             }
         };
+        if name.name == "len" && args.is_empty() {
+            if let Some(len) = self.length_of(module, base_ty, base_at, base.span()) {
+                return Some(len);
+            }
+        }
         let Some(record) = self.record_of(base_ty) else {
             self.diagnostics.push(
                 Diagnostic::error(
@@ -3744,6 +3981,33 @@ impl Emitter {
             }
         }
         self.invoke(function, arguments, return_ty)
+    }
+
+    /// `.len()`: an array knows its length, a view carries it.
+    fn length_of(
+        &mut self,
+        module: &Module<'static>,
+        base_ty: DuxType,
+        base_at: Option<PointerValue<'static>>,
+        span: Span,
+    ) -> Option<Typed> {
+        let _ = module;
+        if let Some(info) = base_ty.array_info() {
+            let len = self.context.i64_type().const_int(info.len, false);
+            return Some(Typed {
+                core: Core::Int(len),
+                ty: DuxType::U64,
+            });
+        }
+        base_ty.slice_element()?;
+        let at = base_at?;
+        let view = self.load(base_ty, at)?;
+        let (_, len) = self.slice_parts(view)?;
+        let _ = span;
+        Some(Typed {
+            core: Core::Int(len),
+            ty: DuxType::U64,
+        })
     }
 
     /// The receiver argument, from the place (or value) the method was called
@@ -4636,6 +4900,9 @@ fn compound_op(op: dux_ast::AssignOp) -> Option<BinaryOp> {
 }
 
 fn spec_for(ty: DuxType) -> Option<&'static str> {
+    if ty.slice_element().is_some() {
+        return None;
+    }
     Some(match ty {
         DuxType::Bool => "s",
         DuxType::I8 | DuxType::I16 | DuxType::I32 => "d",
@@ -4645,7 +4912,9 @@ fn spec_for(ty: DuxType) -> Option<&'static str> {
         DuxType::F32 | DuxType::F64 => "g",
         DuxType::Str => "s",
         DuxType::Ptr | DuxType::Pointer(_) => "p",
-        DuxType::Array(..) | DuxType::Struct(..) | DuxType::Error => return None,
+        DuxType::Array(..) | DuxType::Struct(..) | DuxType::Slice(_) | DuxType::Error => {
+            return None
+        }
     })
 }
 
