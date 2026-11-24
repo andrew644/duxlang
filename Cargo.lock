@@ -57,6 +57,18 @@ dependencies = [
  "dux_ast",
  "dux_codegen",
  "dux_diag",
+ "dux_hir",
+ "dux_lexer",
+ "dux_parser",
+ "dux_source",
+]
+
+[[package]]
+name = "dux_hir"
+version = "0.1.0"
+dependencies = [
+ "dux_ast",
+ "dux_diag",
  "dux_lexer",
  "dux_parser",
  "dux_source",

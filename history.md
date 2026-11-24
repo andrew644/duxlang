@@ -358,3 +358,41 @@ Tests: six round-trip/golden tests in `dux_driver/tests/format.rs` (the whole `e
 and `tests/e2e/` corpora must round-trip or be legitimately refused; formatted fixtures
 still run to byte-identical stdout), six CLI tests in `duxc/tests/fmt_cli.rs`, one CLI
 parse test. Clippy clean.
+
+## Session 8 — the resolver lands in `dux_hir`
+
+DESIGN 6.1's `resolve (names, imports, def order)` step becomes a real pass:
+`dux_hir::resolve(&Program) -> Resolution`, run by the driver inside `analyze`
+whenever lex+parse reported no blocking error, so `check`, `build`, `run` and
+the LSP-shaped API all see the same verdict.
+
+The contract that made this landable in one piece: **the resolver may add no
+diagnostic to any file in the normative corpus.** Silence is verified directly
+(`the_normative_corpus_resolves_without_a_single_diagnostic`) because `check`
+and `--emit=ast` run over `example/` in other tests, and any false positive
+would break those gates too. Consequences:
+
+- Scopes are real (function/block/loop nesting, bindings visible after their
+  statement, pattern bindings — `Some(v) := e` — scoped to their body only),
+  but the resolver only reports what it can prove: E0110 undeclared name,
+  E0111 duplicate definition (top level, or a parameter declared twice),
+  E0112 call arity against declared Dux functions, E0100/E0101 program shape
+  (now caught by `check`, not just at codegen).
+- Everything a later milestone owns is accepted silently: fields and methods
+  (M3), patterns beyond their bindings (M4), type parameters (M5), imported
+  namespaces from `import` and `#[c_include]`/`#[c_link]` blocks (M6), and all
+  type annotations. Arity checks skip calls whose arguments contain a
+  milestone-gap `Error` node, so E0007 never cascades into E0112.
+- Universe scope: `print`/`println`/`new`/`make`/`free`/`del`/`context`,
+  `Some`/`None`/`Ok`/`Err`, and the primitive type names (needed because
+  `new(i32)` passes a type where the parser saw an identifier — the checker
+  will own that distinction properly).
+
+Codegen still resolves names as a stopgap when driven directly (its
+`is not declared in this scope` E0007 paths keep the ir.rs tests honest); the
+driver never reaches them anymore. That duplication dies with the checker.
+
+Tests: 17 in `dux_hir/tests/resolve.rs` (per-code negatives plus the corpus
+silence gate), four new e2e fixtures `undeclared_name`/`arity_mismatch`/
+`duplicate_definition`/`main_returns_string`, codes E0110–E0112 added to
+dux_diag and the DESIGN 8.1a table. 124 tests, clippy clean.

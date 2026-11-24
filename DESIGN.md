@@ -610,6 +610,9 @@ tests/e2e/
 | `E0008` | statement not terminated (`;` or newline required) | parser |
 | `E0100` | no `main` | program shape |
 | `E0101` | `main` has the wrong signature | program shape |
+| `E0110` | name is not declared in this scope | resolver |
+| `E0111` | duplicate definition (top level or parameter) | resolver |
+| `E0112` | call supplies the wrong number of arguments | resolver |
 | `E0900` | link failure | driver |
 | `E0901` | source/output I/O failure | driver |
 | `E0902` | LLVM failure | codegen |
@@ -666,7 +669,7 @@ Each milestone ends green (`cargo test` + e2e) before the next starts.
 |---|---|---|
 | M0 | **Done.** Workspace, `duxc version/check/build/run`, e2e harness, `inkwell llvm23-1` linked against system LLVM 23.1.5 (**binding risk retired**: verified on this box), `hello.dux` codegen'd through libLLVM and linked | `hello.dux` → `Hello, world!` |
 | M1 | *Almost done:* lexer, parser and AST now cover the whole declared surface — declarations (`const`/`global`/`struct`/`enum`/`type`/`impl`/`mod`/`extern`), attributes, expressions (struct values, paths, arrays, ranges, tuple members, function-pointer types) — with error-tolerant recovery. `--emit=ast` landed (`dux_ast::dump`, milestone gaps do not block the dump). `dux fmt` landed: the canonical formatter is an AST printer (`dux_ast::fmt`), round-trip- and idempotency-tested against the whole corpus; it refuses any file whose parse carried an error, so a milestone gap can never be silently rewritten away. Remaining: the resolver/checker, which M2 picks up | every `example/*.dux` parses (`every_example_parses_so_the_review_samples_stay_the_target_surface`) |
-| M2 | Resolver + checker for `fn`/calls/primitives, `if`/`for`/`while`/`defer`, line-table debug info | `types.dux`, `control_flow.dux`, arithmetic stdout |
+| M2 | *In progress:* **resolver landed** (`dux_hir`): names, definition order, arity, duplicates, program shape — gated into `check`/`build`, contract-silent on the whole corpus. Remaining: the type checker for `fn`/calls/primitives, `if`/`for`/`while`/`defer` lowering, line-table debug info | `types.dux`, `control_flow.dux`, arithmetic stdout |
 | M3 | `struct`/`impl`/methods, `*T`, `&`/`*`, `[]T`, `string`, `rawptr`, context + `new`/`make`/`free`/`del`, debug allocator | `structs.dux`, `pointers.dux`, `memory.dux`, `strings.dux` |
 | M4 | `enum` sum types + `match`, `Option`, `Result`, pattern conditions (`if P := e`), niche layout, exhaustiveness | `sum_types.dux`, `option_result.dux` + negative tests |
 | M5 | Generics + monomorphisation (`<T>`, `const N`), `Vec<T>`, `HashMap<K, V>`, stdlib `fmt`/`strings`/`mem` | `generics.dux` |

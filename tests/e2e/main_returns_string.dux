@@ -1,0 +1,6 @@
+//@expect-error E0101
+package main
+
+fn main() -> string {
+    return "not an exit code"
+}

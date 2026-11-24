@@ -65,6 +65,12 @@ pub fn analyze(path: &std::path::Path) -> Result<Analyzed, Failure> {
     let mut diagnostics = lexed.diagnostics;
     let parsed = parse(&sources, &lexed.tokens);
     diagnostics.extend(parsed.diagnostics);
+    let syntax_clean = diagnostics
+        .iter()
+        .all(|d| d.severity != Severity::Error || d.code == code::UNSUPPORTED_IN_BUILD);
+    if syntax_clean {
+        diagnostics.extend(dux_hir::resolve(&parsed.program).diagnostics);
+    }
     Ok(Analyzed {
         sources,
         file,

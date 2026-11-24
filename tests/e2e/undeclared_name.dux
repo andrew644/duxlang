@@ -1,0 +1,7 @@
+//@expect-error E0110
+package main
+
+fn main() {
+    total := missing_counter + 1
+    println($"{}", total)
+}

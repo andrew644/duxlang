@@ -1,0 +1,15 @@
+[package]
+name = "dux_hir"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+dux_ast = { workspace = true }
+dux_source = { workspace = true }
+dux_diag = { workspace = true }
+
+[dev-dependencies]
+dux_source = { workspace = true }
+dux_lexer = { workspace = true }
+dux_parser = { workspace = true }

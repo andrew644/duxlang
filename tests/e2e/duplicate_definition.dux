@@ -1,0 +1,14 @@
+//@expect-error E0111
+package main
+
+fn helper() {
+    println("first")
+}
+
+fn helper() {
+    println("second")
+}
+
+fn main() {
+    helper()
+}

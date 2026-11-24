@@ -10,4 +10,5 @@ dux_diag = { workspace = true }
 dux_lexer = { workspace = true }
 dux_ast = { workspace = true }
 dux_parser = { workspace = true }
+dux_hir = { workspace = true }
 dux_codegen = { workspace = true }

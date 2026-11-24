@@ -11,6 +11,9 @@ pub mod code {
     pub const EXPECTED_SEMICOLON: &str = "E0008";
     pub const NO_MAIN: &str = "E0100";
     pub const BAD_MAIN_SIGNATURE: &str = "E0101";
+    pub const UNDECLARED: &str = "E0110";
+    pub const DUPLICATE_DEFINITION: &str = "E0111";
+    pub const WRONG_ARITY: &str = "E0112";
     pub const LINK_FAILED: &str = "E0900";
     pub const SOURCE_IO: &str = "E0901";
     pub const CODEGEN_FAILED: &str = "E0902";
