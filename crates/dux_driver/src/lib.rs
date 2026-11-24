@@ -78,6 +78,7 @@ pub enum Emit {
     Execute,
     Object,
     LlvmIr,
+    Ast,
 }
 
 pub struct BuildRequest<'a> {
@@ -141,6 +142,9 @@ pub fn build(
     request: &BuildRequest,
     out_override: Option<&std::path::Path>,
 ) -> Result<BuiltArtifact, Failure> {
+    if request.emit == Emit::Ast {
+        return emit_ast(request, out_override);
+    }
     let (_analyzed, _module, artifact) = compile(request)?;
     match request.emit {
         Emit::LlvmIr => {
@@ -160,8 +164,44 @@ pub fn build(
                 std::fs::copy(&artifact.executable, path).map_err(|e| io_failure(path, e))?;
             }
         }
+        Emit::Ast => unreachable!("`--emit=ast` returns before code generation"),
     }
     Ok(artifact)
+}
+
+fn emit_ast(
+    request: &BuildRequest,
+    out_override: Option<&std::path::Path>,
+) -> Result<BuiltArtifact, Failure> {
+    let analyzed = analyze(request.source)?;
+    let blocking: Vec<Diagnostic> = analyzed
+        .diagnostics
+        .iter()
+        .filter(|d| d.severity == Severity::Error && d.code != code::UNSUPPORTED_IN_BUILD)
+        .cloned()
+        .collect();
+    if !blocking.is_empty() {
+        return Err(Failure {
+            sources: analyzed.sources,
+            diagnostics: blocking,
+        });
+    }
+    std::fs::create_dir_all(&request.out_dir).map_err(|e| {
+        Failure::bare(vec![Diagnostic::error(
+            code::SOURCE_IO,
+            format!("cannot create {}: {e}", request.out_dir.display()),
+        )])
+    })?;
+    let path = out_override
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| request.out_dir.join(format!("{}.ast", output_stem(request.source))));
+    write_file(&path, dux_ast::dump::dump(&analyzed.program).as_bytes())?;
+    Ok(BuiltArtifact {
+        object: path.clone(),
+        executable: path,
+        ir: String::new(),
+        data_layout: String::new(),
+    })
 }
 
 pub fn run(

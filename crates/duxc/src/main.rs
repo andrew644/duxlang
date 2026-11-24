@@ -101,6 +101,7 @@ fn build(
         Emit::Exe => DriverEmit::Execute,
         Emit::Object => DriverEmit::Object,
         Emit::Ir => DriverEmit::LlvmIr,
+        Emit::Ast => DriverEmit::Ast,
     };
     let request = request(file, out_dir, release, driver_emit);
     match dux_driver::build(&request, out) {
@@ -110,6 +111,7 @@ fn build(
                 (None, Emit::Exe) => artifact.executable.display().to_string(),
                 (None, Emit::Object) => artifact.object.display().to_string(),
                 (None, Emit::Ir) => artifact.object.with_extension("ll").display().to_string(),
+                (None, Emit::Ast) => artifact.object.display().to_string(),
             };
             let _ = writeln!(std::io::stdout(), "wrote {written}");
             ExitCode::SUCCESS

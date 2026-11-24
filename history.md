@@ -304,3 +304,21 @@ Closed the two storage-shaped `E0007` gaps from the first half of session 6, on 
 
 `tests/e2e/counters.dux` promotes the pattern (a `bump()` closing over the global through
 argument-free calls); `ir.rs` grows the two pinning tests. 88 tests, clippy clean.
+
+
+## Session 6c — `--emit=ast`
+
+Last M1 deliverable that was pure plumbing. `dux_ast::dump::dump` renders a `Program` as
+deterministic, span-free text (packages/imports, every declaration kind, statements, and
+expressions with full parenthesisation so precedence never has to be guessed from the dump);
+`duxc build file.dux --emit=ast` writes it next to where the object would go, or to `-o`.
+
+One real decision: **`E0007` does not block the dump.** A milestone gap means "valid Dux this
+build cannot compile yet", so `types.dux` — whose tuple literal the parser itself flags — still
+dumps, with the literal shown as `<error>`. Syntax errors still block. That matches how
+`every_example_parses` already treats `E0007`, and the new e2e `every_example_dumps_its_ast…`
+pins it for the whole normative corpus.
+
+`AssignOp/UnaryOp/BinaryOp` grew `symbol()` for the renderer. Tests: four dump-shape tests in
+`dux_driver/tests/ast_dump.rs` (the lexer+parser live below `dux_ast`, so the dump is tested
+from a crate that can run them), one CLI parse test, one e2e. 94 tests, clippy clean.

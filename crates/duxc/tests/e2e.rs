@@ -189,6 +189,43 @@ fn the_normative_hello_example_compiles_runs_and_prints_exactly_hello_world() {
 }
 
 #[test]
+fn every_example_dumps_its_ast_so_milestone_gaps_never_hide_the_tree() {
+    let scratch = Path::new(SCRATCH_DIR).join("ast-dumps");
+    let _ = std::fs::remove_dir_all(&scratch);
+    let mut offenders = Vec::new();
+    for entry in std::fs::read_dir(EXAMPLE_DIR).expect("example/ exists") {
+        let path = entry.expect("readable entry").path();
+        if path.extension().is_some_and(|e| e != "dux") {
+            continue;
+        }
+        let output = Command::new(env!("CARGO_BIN_EXE_duxc"))
+            .arg("build")
+            .arg(&path)
+            .arg("--emit=ast")
+            .arg("--out-dir")
+            .arg(&scratch)
+            .output()
+            .expect("duxc is runnable");
+        let stem = path.file_stem().expect("stem").to_string_lossy().to_string();
+        let dump = scratch.join(format!("{stem}.ast"));
+        if output.status.code() != Some(0) || !dump.exists() {
+            offenders.push(format!(
+                "{}: exit {:?}, dump exists {}, stderr: {}",
+                path.display(),
+                output.status.code(),
+                dump.exists(),
+                String::from_utf8_lossy(&output.stderr)
+            ));
+        }
+    }
+    assert!(
+        offenders.is_empty(),
+        "`--emit=ast` failed for:\n{}",
+        offenders.join("\n")
+    );
+}
+
+#[test]
 fn every_example_parses_so_the_review_samples_stay_the_target_surface() {
     let mut offenders = Vec::new();
     for entry in std::fs::read_dir(EXAMPLE_DIR).expect("example/ exists") {

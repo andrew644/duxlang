@@ -18,6 +18,7 @@ OPTIONS:
     --out-dir <dir>   scratch directory for objects (default: .dux-cache)
     --release         optimise (default<O2>) instead of -O0
     --emit=ir         write textual LLVM IR instead of linking
+    --emit=ast        write the parsed AST dump instead of linking
     --emit=obj        keep the object file
     --emit=exe        link an executable (default)
     --help            show this message
@@ -28,6 +29,7 @@ pub enum Emit {
     Exe,
     Object,
     Ir,
+    Ast,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -69,7 +71,7 @@ impl UsageError {
                 format!("`{command}` expects a .dux file")
             }
             UsageError::BadEmit(value) => {
-                format!("`--emit={value}` is not one of ir, obj, exe")
+                format!("`--emit={value}` is not one of ast, ir, obj, exe")
             }
             UsageError::MissingValue(option) => format!("`{option}` expects a value"),
             UsageError::ExpectedOption(text) => format!("unexpected argument `{text}`"),
@@ -111,6 +113,7 @@ pub fn parse<I: IntoIterator<Item = OsString>>(argv: I) -> Result<Command, Usage
                     other if other.starts_with("--emit=") => {
                         emit = match other.trim_start_matches("--emit=") {
                             "ir" | "llvm-ir" => Emit::Ir,
+                            "ast" => Emit::Ast,
                             "obj" | "object" => Emit::Object,
                             "exe" | "executable" => Emit::Exe,
                             other => return Err(UsageError::BadEmit(other.to_string())),
@@ -209,6 +212,20 @@ mod tests {
         assert_eq!(
             parse(argv(&["check"])),
             Err(UsageError::MissingFile("check"))
+        );
+    }
+
+    #[test]
+    fn emit_ast_parses_and_bad_emits_still_reject() {
+        assert_eq!(
+            parse(argv(&["build", "app.dux", "--emit=ast"])),
+            Ok(Command::Build {
+                file: PathBuf::from("app.dux"),
+                out: None,
+                out_dir: PathBuf::from(".dux-cache"),
+                release: false,
+                emit: Emit::Ast,
+            })
         );
     }
 

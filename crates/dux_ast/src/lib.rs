@@ -1,3 +1,5 @@
+pub mod dump;
+
 use dux_source::Span;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -87,9 +89,22 @@ pub enum AssignOp {
     Set,
     Add,
     Sub,
-    Mul,
     Div,
+    Mul,
     Mod,
+}
+
+impl AssignOp {
+    pub fn symbol(self) -> &'static str {
+        match self {
+            AssignOp::Set => "=",
+            AssignOp::Add => "+=",
+            AssignOp::Sub => "-=",
+            AssignOp::Mul => "*=",
+            AssignOp::Div => "/=",
+            AssignOp::Mod => "%=",
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -98,6 +113,17 @@ pub enum UnaryOp {
     Not,
     AddressOf,
     Load,
+}
+
+impl UnaryOp {
+    pub fn symbol(self) -> &'static str {
+        match self {
+            UnaryOp::Neg => "-",
+            UnaryOp::Not => "!",
+            UnaryOp::AddressOf => "&",
+            UnaryOp::Load => "*",
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -134,6 +160,24 @@ impl BinaryOp {
             self,
             BinaryOp::Eq | BinaryOp::NotEq | BinaryOp::Lt | BinaryOp::Gt | BinaryOp::Le | BinaryOp::Ge
         )
+    }
+
+    pub fn symbol(self) -> &'static str {
+        match self {
+            BinaryOp::Add => "+",
+            BinaryOp::Sub => "-",
+            BinaryOp::Mul => "*",
+            BinaryOp::Div => "/",
+            BinaryOp::Mod => "%",
+            BinaryOp::Eq => "==",
+            BinaryOp::NotEq => "!=",
+            BinaryOp::Lt => "<",
+            BinaryOp::Gt => ">",
+            BinaryOp::Le => "<=",
+            BinaryOp::Ge => ">=",
+            BinaryOp::And => "&&",
+            BinaryOp::Or => "||",
+        }
     }
 }
 
