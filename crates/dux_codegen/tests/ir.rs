@@ -11,7 +11,13 @@ fn build(source: &str) -> Result<CompiledModule, Vec<dux_diag::Diagnostic>> {
         "the fixture should parse: {:?}",
         parsed.diagnostics
     );
-    CompiledModule::build(&parsed.program, Options { opt_level: OptLevel::None })
+    CompiledModule::build_with_line_tables(
+        &parsed.program,
+        Options {
+            opt_level: OptLevel::None,
+        },
+        &sources,
+    )
 }
 
 const HELLO: &str = "package main\nfn main() { println(\"hi\") }";
@@ -136,6 +142,32 @@ fn a_value_if_meets_at_a_phi() {
     .expect("builds")
     .ir_text();
     assert!(ir.contains("phi ptr"), "string arms meet at a pointer phi:\n{ir}");
+}
+
+#[test]
+fn every_statement_carries_its_source_line() {
+    let source = "package main\n\nfn pick(n: i32) -> i32 {\n    if n > 0 {\n        return n\n    }\n    return 0\n}\n\nfn main() {\n    pick(3)\n}\n";
+    let ir = build(source).expect("builds").ir_text();
+    assert!(
+        ir.contains(r#"!DISubprogram(name: "pick""#) && ir.contains(r#"!DISubprogram(name: "main""#),
+        "each function gets a subprogram:\n{ir}"
+    );
+    assert!(
+        ir.contains(r#"DILocation(line: 3, column: 4"#),
+            "`fn pick` names itself at line 3:\n{ir}"
+    );
+    assert!(
+        ir.contains(r#"DILocation(line: 5, column: 9"#),
+        "the `return n` statement is at line 5 column 9:\n{ir}"
+    );
+    assert!(
+        ir.contains(r#"DILocation(line: 11, column: 5"#),
+        "the `pick(3)` call is at line 11:\n{ir}"
+    );
+    assert!(
+        ir.contains(r#""Debug Info Version", i32 "#),
+        "the module must claim the debug version or the backend drops it all:\n{ir}"
+    );
 }
 
 #[test]

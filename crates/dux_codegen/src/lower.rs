@@ -13,10 +13,14 @@ use dux_ast::{
     Type, UnaryOp,
 };
 use dux_diag::{code, Diagnostic};
-use dux_source::Span;
+use dux_source::{FileId, SourceMap, Span};
 use inkwell::basic_block::BasicBlock;
 use inkwell::builder::Builder;
 use inkwell::context::Context;
+use inkwell::debug_info::{
+    AsDIScope, DICompileUnit, DIFile, DISubprogram, DIFlags, DIFlagsConstants, DebugInfoBuilder,
+    DWARFEmissionKind, DWARFSourceLanguage,
+};
 use inkwell::module::Module;
 use inkwell::types::{BasicMetadataTypeEnum, BasicType, BasicTypeEnum, FloatType, IntType};
 use inkwell::values::{
@@ -24,6 +28,11 @@ use inkwell::values::{
 };
 use inkwell::values::{FunctionValue, ValueKind};
 use inkwell::{AddressSpace, FloatPredicate, IntPredicate};
+
+const DW_ATE_BOOLEAN: u32 = 0x02;
+const DW_ATE_FLOAT: u32 = 0x04;
+const DW_ATE_SIGNED: u32 = 0x05;
+const DW_ATE_UNSIGNED: u32 = 0x07;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum DuxType {
@@ -400,10 +409,15 @@ pub(crate) struct Emitter {
     puts: Option<FunctionValue<'static>>,
     fputs: Option<FunctionValue<'static>>,
     stdout: Option<inkwell::values::GlobalValue<'static>>,
+    sources: SourceMap,
+    dibuilder: Option<DebugInfoBuilder<'static>>,
+    compile_unit: Option<DICompileUnit<'static>>,
+    scope: Option<DISubprogram<'static>>,
+    di_files: HashMap<FileId, DIFile<'static>>,
 }
 
 impl Emitter {
-    pub(crate) fn new(context: &'static Context) -> Self {
+    pub(crate) fn new(context: &'static Context, sources: SourceMap) -> Self {
         Self {
             context,
             builder: context.create_builder(),
@@ -424,6 +438,11 @@ impl Emitter {
             puts: None,
             fputs: None,
             stdout: None,
+            sources,
+            dibuilder: None,
+            compile_unit: None,
+            scope: None,
+            di_files: HashMap::new(),
         }
     }
 
@@ -432,6 +451,41 @@ impl Emitter {
         module: &Module<'static>,
         program: &Program,
     ) -> Vec<Diagnostic> {
+        if !self.sources.is_empty() {
+            let file = self
+                .sources
+                .first_file()
+                .map(|file| self.sources.name_of(file).to_string())
+                .unwrap_or_else(|| "main.dux".to_string());
+            let (dibuilder, compile_unit) = module.create_debug_info_builder(
+                true,
+                DWARFSourceLanguage::Rust,
+                &file,
+                "",
+                "duxc",
+                false,
+                "",
+                0,
+                "",
+                DWARFEmissionKind::Full,
+                0,
+                false,
+                false,
+                "",
+                "",
+            );
+            self.dibuilder = Some(dibuilder);
+            self.compile_unit = Some(compile_unit);
+            let version = self
+                .context
+                .i32_type()
+                .const_int(inkwell::debug_info::debug_metadata_version() as u64, false);
+            module.add_basic_value_flag(
+                "Debug Info Version",
+                inkwell::module::FlagBehavior::Warning,
+                version,
+            );
+        }
         for decl in &program.decls {
             match decl {
                 Decl::Const(decl) => self.declare_const(decl),
@@ -451,6 +505,12 @@ impl Emitter {
         for function in &functions {
             self.lower_body(module, function);
         }
+        if let Some(dibuilder) = &self.dibuilder {
+            dibuilder.finalize();
+        }
+        self.dibuilder = None;
+        self.compile_unit = None;
+        self.scope = None;
         self.diagnostics
             .sort_by_key(|diagnostic| diagnostic.span.map(|span| span.start));
         self.diagnostics
@@ -545,6 +605,7 @@ impl Emitter {
         let Some(fn_value) = self.functions.get(&name).copied() else {
             return;
         };
+        self.begin_function_debug(function, &name, fn_value);
         let signature = self
             .signatures
             .get(&name)
@@ -640,6 +701,7 @@ impl Emitter {
 
 impl Emitter {
     fn stmt(&mut self, module: &Module<'static>, stmt: &Stmt) {
+        self.set_location(stmt.span());
         match stmt {
             Stmt::Expr { expr, .. } => {
                 self.expr(module, expr, None);
@@ -1982,6 +2044,121 @@ impl Emitter {
 
     fn false_value(&self) -> IntValue<'static> {
         self.context.bool_type().const_zero()
+    }
+
+    /// One line of the line table: every subsequent instruction carries the
+    /// span's line and column until the next statement claims one.
+    fn set_location(&mut self, span: Span) {
+        let (Some(dibuilder), Some(scope)) = (&self.dibuilder, self.scope) else {
+            return;
+        };
+        let context = self.context;
+        let (line, column) = self.sources.line_col(span.file, span.start);
+        let location = dibuilder.create_debug_location(
+            context,
+            line as u32,
+            column as u32,
+            scope.as_debug_info_scope(),
+            None,
+        );
+        self.builder.set_current_debug_location(location);
+    }
+
+    /// A `DISubprogram` per function. Parameter types are described for the
+    /// primitives; a function that touches anything richer gets an empty
+    /// signature — full DWARF type DIEs land at M7, the line table does not
+    /// depend on them.
+    fn begin_function_debug(&mut self, function: &FnDecl, linkage_name: &str, fn_value: FunctionValue<'static>) {
+        let Some(unit) = self.compile_unit else {
+            return;
+        };
+        if self.dibuilder.is_none() {
+            return;
+        }
+        let file = self.di_file(function.name.span.file);
+        let (line, _) = self.sources.line_col(function.name.span.file, function.name.span.start);
+        let mut params = Vec::new();
+        let mut exact = true;
+        for param in &function.params {
+            match DuxType::from_ast(&param.ty).and_then(|ty| self.di_type(ty)) {
+                Some(ty) => params.push(ty),
+                None => exact = false,
+            }
+        }
+        let return_type: Option<Option<inkwell::debug_info::DIType<'static>>> =
+            match function.return_ty.as_ref() {
+                None => Some(None),
+                Some(ty) => match DuxType::from_ast(ty) {
+                    Some(ty) => self.di_type(ty).map(Some),
+                    None => None,
+                },
+            };
+        let known = exact && return_type.is_some();
+        let Some(dibuilder) = &self.dibuilder else {
+            return;
+        };
+        let signature = dibuilder.create_subroutine_type(
+            file,
+            if known {
+                return_type.unwrap_or(None)
+            } else {
+                None
+            },
+            if known { &params } else { &[] },
+            DIFlags::ZERO,
+        );
+        let subprogram = dibuilder.create_function(
+            unit.as_debug_info_scope(),
+            linkage_name,
+            None,
+            file,
+            line as u32,
+            signature,
+            true,
+            true,
+            line as u32,
+            DIFlags::ZERO,
+            false,
+        );
+        fn_value.set_subprogram(subprogram);
+        self.scope = Some(subprogram);
+        self.builder.unset_current_debug_location();
+        self.set_location(function.name.span);
+    }
+
+    fn di_file(&mut self, file: FileId) -> DIFile<'static> {
+        if let Some(known) = self.di_files.get(&file).copied() {
+            return known;
+        }
+        let name = self.sources.name_of(file).to_string();
+        let created = match &self.dibuilder {
+            Some(dibuilder) => dibuilder.create_file(&name, ""),
+            None => return self.di_files.get(&file).copied().expect("checked above"),
+        };
+        self.di_files.insert(file, created);
+        created
+    }
+
+    fn di_type(&mut self, ty: DuxType) -> Option<inkwell::debug_info::DIType<'static>> {
+        let dibuilder = self.dibuilder.as_ref()?;
+        let (name, bits, encoding) = match ty {
+            DuxType::Bool => ("bool", 1, DW_ATE_BOOLEAN),
+            DuxType::I8 => ("i8", 8, DW_ATE_SIGNED),
+            DuxType::I16 => ("i16", 16, DW_ATE_SIGNED),
+            DuxType::I32 => ("i32", 32, DW_ATE_SIGNED),
+            DuxType::I64 => ("i64", 64, DW_ATE_SIGNED),
+            DuxType::U8 => ("u8", 8, DW_ATE_UNSIGNED),
+            DuxType::U16 => ("u16", 16, DW_ATE_UNSIGNED),
+            DuxType::U32 => ("u32", 32, DW_ATE_UNSIGNED),
+            DuxType::U64 => ("u64", 64, DW_ATE_UNSIGNED),
+            DuxType::F32 => ("f32", 32, DW_ATE_FLOAT),
+            DuxType::F64 => ("f64", 64, DW_ATE_FLOAT),
+            _ => return None,
+        };
+        dibuilder
+            .create_basic_type(name, bits, encoding, DIFlags::ZERO)
+            .ok()
+            .map(|ty| ty.as_type())
     }
 }
 

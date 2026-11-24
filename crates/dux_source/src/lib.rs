@@ -46,7 +46,7 @@ struct SourceFile {
     text: String,
 }
 
-#[derive(Default, Debug)]
+#[derive(Default, Debug, Clone)]
 pub struct SourceMap {
     files: Vec<SourceFile>,
 }
@@ -78,6 +78,14 @@ impl SourceMap {
             .get(file.0 as usize)
             .map(|f| f.name.as_str())
             .unwrap_or("<unknown>")
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.files.is_empty()
+    }
+
+    pub fn first_file(&self) -> Option<FileId> {
+        self.files.first().map(|_| FileId(0))
     }
 
     pub fn text_of(&self, file: FileId) -> &str {

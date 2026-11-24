@@ -154,7 +154,11 @@ fn compile(request: &BuildRequest) -> Result<(Analyzed, CompiledModule, BuiltArt
     let options = Options {
         opt_level: request.opt_level,
     };
-    let module = match CompiledModule::build(&analyzed.program, options) {
+    let module = match CompiledModule::build_with_line_tables(
+        &analyzed.program,
+        options,
+        &analyzed.sources,
+    ) {
         Ok(module) => module,
         Err(diagnostics) => {
             return Err(Failure {

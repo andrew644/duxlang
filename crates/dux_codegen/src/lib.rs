@@ -84,6 +84,17 @@ fn process_context() -> &'static Context {
 
 impl CompiledModule {
     pub fn build(program: &Program, options: Options) -> Result<CompiledModule, Vec<Diagnostic>> {
+        Self::build_with_line_tables(program, options, &dux_source::SourceMap::new())
+    }
+
+    /// Build with a line table: when the `SourceMap` is non-empty the module
+    /// carries `!llvm.dbg.cu` metadata and every statement its line and
+    /// column, so generated programs are steppable and backtrace-able.
+    pub fn build_with_line_tables(
+        program: &Program,
+        options: Options,
+        sources: &dux_source::SourceMap,
+    ) -> Result<CompiledModule, Vec<Diagnostic>> {
         let context = process_context();
         let module = context.create_module(module_name(program));
         let machine = target_machine(options.opt_level)?;
@@ -91,7 +102,7 @@ impl CompiledModule {
         module.set_data_layout(&machine.get_target_data().get_data_layout());
 
         select_main(program)?;
-        let diagnostics = Emitter::new(context).lower(&module, program);
+        let diagnostics = Emitter::new(context, sources.clone()).lower(&module, program);
         if !diagnostics.is_empty() {
             return Err(diagnostics);
         }
