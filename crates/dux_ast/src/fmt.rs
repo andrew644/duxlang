@@ -398,7 +398,7 @@ impl Printer {
             Stmt::If { cond, then_branch, else_branch, .. } => {
                 let mut out = format!(
                     "{p}if {} {{\n{}",
-                    self.expr(cond, level),
+                    self.condition(cond, level),
                     self.block(then_branch, level + 1)
                 );
                 out.push_str(&format!("{p}}}"));
@@ -406,7 +406,7 @@ impl Printer {
                 while let Some(Stmt::If { cond, then_branch, else_branch, .. }) = current {
                     out.push_str(&format!(
                         " else if {} {{\n{}{p}}}",
-                        self.expr(cond, level),
+                        self.condition(cond, level),
                         self.block(then_branch, level + 1)
                     ));
                     current = else_branch.as_deref();
@@ -425,7 +425,7 @@ impl Printer {
             }
             Stmt::While { cond, body, .. } => format!(
                 "{p}while {} {{\n{}{p}}}",
-                self.expr(cond, level),
+                self.condition(cond, level),
                 self.block(body, level + 1)
             ),
             Stmt::Loop { body, .. } => {
@@ -451,14 +451,95 @@ impl Printer {
                 };
                 format!("{head}\n{}{p}}}", self.block(body, level + 1))
             }
+            Stmt::Match { subject, arms, .. } => {
+                format!("{p}{}", self.match_expression(subject, arms, level))
+            }
             Stmt::Error { .. } => format!("{p}<error>"),
+        }
+    }
+
+    fn match_expression(&self, subject: &Expr, arms: &[MatchArm], level: usize) -> String {
+        let body = arms
+            .iter()
+            .map(|arm| format!("{}{},\n", pad(level + 1), self.arm(arm, level + 1)))
+            .collect::<String>();
+        format!(
+            "match {} {{\n{body}{}}}",
+            self.expr(subject, level),
+            pad(level)
+        )
+    }
+
+    fn arm(&self, arm: &MatchArm, level: usize) -> String {
+        let guard = arm
+            .guard
+            .as_ref()
+            .map(|guard| format!(" if {}", self.expr(guard, level)))
+            .unwrap_or_default();
+        let body = match &arm.body {
+            MatchBody::Expr(expr) => self.expr(expr, level),
+            MatchBody::Block(block) => {
+                format!("{{\n{}{}}}", self.block(block, level + 1), pad(level))
+            }
+            MatchBody::Stmt(stmt) => self.stmt(stmt, level).trim_start().to_string(),
+        };
+        format!("{}{guard} => {body}", self.pattern(&arm.pattern))
+    }
+
+    fn pattern(&self, pattern: &Pattern) -> String {
+        match pattern {
+            Pattern::Wildcard { .. } => "_".to_string(),
+            Pattern::Else { .. } => "else".to_string(),
+            Pattern::Name { name, .. } => name.name.clone(),
+            Pattern::Literal { value, .. } => self.expr(value, 0),
+            Pattern::Path { qualifier, name, .. } => format!("{qualifier}::{name}"),
+            Pattern::Tuple { qualifier, name, elements, .. } => format!(
+                "{}{name}({})",
+                qualifier.as_ref().map(|q| format!("{q}::")).unwrap_or_default(),
+                elements
+                    .iter()
+                    .map(|element| self.pattern(element))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+            Pattern::Struct { qualifier, name, fields, rest, .. } => {
+                let mut written = fields
+                    .iter()
+                    .map(|field| match field {
+                        FieldPattern::Shorthand { name, .. } => name.name.clone(),
+                        FieldPattern::Nested { name, pattern, .. } => {
+                            format!("{}: {}", name.name, self.pattern(pattern))
+                        }
+                    })
+                    .collect::<Vec<_>>();
+                if *rest {
+                    written.push("..".to_string());
+                }
+                format!(
+                    "{}{name} {{ {} }}",
+                    qualifier.as_ref().map(|q| format!("{q}::")).unwrap_or_default(),
+                    written.join(", ")
+                )
+            }
+            Pattern::Range { start, end, inclusive, .. } => format!(
+                "{}{}{}",
+                self.pattern(start),
+                if *inclusive { "..=" } else { ".." },
+                self.pattern(end)
+            ),
+            Pattern::Or { alternatives, .. } => alternatives
+                .iter()
+                .map(|alternative| self.pattern(alternative))
+                .collect::<Vec<_>>()
+                .join(" | "),
+            Pattern::Error { .. } => "<error>".to_string(),
         }
     }
 
     fn condition(&self, cond: &Expr, level: usize) -> String {
         match cond {
             Expr::CondBinding { pattern, value, .. } => {
-                format!("{} := {}", self.expr(pattern, level), self.expr(value, level))
+                format!("{} := {}", self.pattern(pattern), self.expr(value, level))
             }
             other => self.expr(other, level),
         }
@@ -583,8 +664,9 @@ impl Printer {
                 )
             }
             Expr::CondBinding { pattern, value, .. } => {
-                format!("{} := {}", self.expr(pattern, level), self.expr(value, level))
+                format!("{} := {}", self.pattern(pattern), self.expr(value, level))
             }
+            Expr::Match { subject, arms, .. } => self.match_expression(subject, arms, level),
             Expr::InterpString { parts, .. } => interpolation(parts),
             Expr::If {
                 cond,

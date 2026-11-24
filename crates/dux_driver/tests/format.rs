@@ -61,10 +61,17 @@ fn every_formatable_example_survives_a_format_round_trip() {
             rejected.push(path.file_name().unwrap().to_string_lossy().into_owned());
         }
     }
-    for must_format in ["hello.dux", "fizzbuzz.dux", "structs.dux", "pointers.dux", "strings.dux"] {
+    for must_format in [
+        "hello.dux",
+        "fizzbuzz.dux",
+        "structs.dux",
+        "pointers.dux",
+        "strings.dux",
+        "sum_types.dux",
+    ] {
         assert!(formatted.contains(&must_format.to_string()), "{must_format} must format");
     }
-    for must_reject in ["types.dux", "sum_types.dux", "generics.dux"] {
+    for must_reject in ["types.dux", "generics.dux"] {
         assert!(rejected.contains(&must_reject.to_string()), "{must_reject} has a milestone gap the formatter must not silently drop");
     }
 }

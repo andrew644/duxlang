@@ -246,6 +246,10 @@ impl<'a> Resolver<'a> {
                 self.scopes.pop();
             }
             Stmt::Loop { body, .. } => self.block(body),
+            Stmt::Match { subject, arms, .. } => {
+                self.expr(subject);
+                self.arms(arms);
+            }
             Stmt::For { kind, body, .. } => match kind {
                 ForKind::ThreeClause { init, cond, step } => {
                     self.scopes.push(Vec::new());
@@ -289,12 +293,29 @@ impl<'a> Resolver<'a> {
         match cond {
             Expr::CondBinding { pattern, value, .. } => {
                 self.expr(value);
-                binders(pattern)
+                pattern.binders().into_iter().map(|name| name.name).collect()
             }
             other => {
                 self.expr(other);
                 Vec::new()
             }
+        }
+    }
+
+    /// Each arm sees its own scope: what its pattern binds lives only in the arm.
+    fn arms(&mut self, arms: &[dux_ast::MatchArm]) {
+        for arm in arms {
+            self.scopes.push(Vec::new());
+            self.bind_all(arm.pattern.binders().into_iter().map(|name| name.name).collect());
+            if let Some(guard) = &arm.guard {
+                self.expr(guard);
+            }
+            match &arm.body {
+                dux_ast::MatchBody::Expr(expr) => self.expr(expr),
+                dux_ast::MatchBody::Block(block) => self.block(block),
+                dux_ast::MatchBody::Stmt(stmt) => self.stmt(stmt),
+            }
+            self.scopes.pop();
         }
     }
 
@@ -365,7 +386,14 @@ impl<'a> Resolver<'a> {
                     self.expr(value);
                 }
             }
-            Expr::CondBinding { .. } => {}
+            Expr::CondBinding { pattern, value, .. } => {
+                let _ = pattern;
+                self.expr(value);
+            }
+            Expr::Match { subject, arms, .. } => {
+                self.expr(subject);
+                self.arms(arms);
+            }
             Expr::InterpString { parts, .. } => {
                 for part in parts {
                     if let InterpolationPart::Hole {
@@ -466,11 +494,3 @@ fn callee_name(callee: &Expr) -> String {
     }
 }
 
-fn binders(pattern: &Expr) -> Vec<String> {
-    match pattern {
-        Expr::Ident { name, .. } => vec![name.clone()],
-        Expr::Paren { inner, .. } => binders(inner),
-        Expr::Call { args, .. } => args.iter().flat_map(binders).collect(),
-        _ => Vec::new(),
-    }
-}

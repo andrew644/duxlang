@@ -287,14 +287,85 @@ fn dump_stmt(stmt: &Stmt, level: usize) -> String {
                 dump_block(body, level + 1)
             ),
         },
+        Stmt::Match { subject, arms, .. } => format!(
+            "{pad}{}\n",
+            dump_match(subject, arms)
+        ),
         Stmt::Error { .. } => format!("{pad}<error>\n"),
+    }
+}
+
+fn dump_match(subject: &Expr, arms: &[MatchArm]) -> String {
+    let arms = arms
+        .iter()
+        .map(|arm| {
+            let guard = arm
+                .guard
+                .as_ref()
+                .map(|guard| format!(" if {}", dump_expr(guard)))
+                .unwrap_or_default();
+            let body = match &arm.body {
+                MatchBody::Expr(expr) => dump_expr(expr),
+                MatchBody::Block(block) => format!("{{ {} }}", dump_block(block, 0).trim()),
+                MatchBody::Stmt(stmt) => dump_stmt(stmt, 0).trim().to_string(),
+            };
+            format!("{}{guard} => {body}", dump_pattern(&arm.pattern))
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("match {} {{ {arms} }}", dump_expr(subject))
+}
+
+fn dump_pattern(pattern: &Pattern) -> String {
+    match pattern {
+        Pattern::Wildcard { .. } => "_".to_string(),
+        Pattern::Else { .. } => "else".to_string(),
+        Pattern::Name { name, .. } => name.name.clone(),
+        Pattern::Literal { value, .. } => dump_expr(value),
+        Pattern::Path { qualifier, name, .. } => format!("{qualifier}::{name}"),
+        Pattern::Tuple { qualifier, name, elements, .. } => format!(
+            "{}{name}({})",
+            qualifier.as_ref().map(|q| format!("{q}::")).unwrap_or_default(),
+            elements.iter().map(dump_pattern).collect::<Vec<_>>().join(", ")
+        ),
+        Pattern::Struct { qualifier, name, fields, rest, .. } => {
+            let mut written = fields
+                .iter()
+                .map(|field| match field {
+                    FieldPattern::Shorthand { name, .. } => name.name.clone(),
+                    FieldPattern::Nested { name, pattern, .. } => {
+                        format!("{}: {}", name.name, dump_pattern(pattern))
+                    }
+                })
+                .collect::<Vec<_>>();
+            if *rest {
+                written.push("..".to_string());
+            }
+            format!(
+                "{}{name} {{ {} }}",
+                qualifier.as_ref().map(|q| format!("{q}::")).unwrap_or_default(),
+                written.join(", ")
+            )
+        }
+        Pattern::Range { start, end, inclusive, .. } => format!(
+            "{}{}{}",
+            dump_pattern(start),
+            if *inclusive { "..=" } else { ".." },
+            dump_pattern(end)
+        ),
+        Pattern::Or { alternatives, .. } => alternatives
+            .iter()
+            .map(dump_pattern)
+            .collect::<Vec<_>>()
+            .join(" | "),
+        Pattern::Error { .. } => "<error>".to_string(),
     }
 }
 
 fn dump_cond(cond: &Expr) -> String {
     match cond {
         Expr::CondBinding { pattern, value, .. } => {
-            format!("{} := {}", dump_expr(pattern), dump_expr(value))
+            format!("{} := {}", dump_pattern(pattern), dump_expr(value))
         }
         other => dump_expr(other),
     }
@@ -344,8 +415,9 @@ fn dump_expr(expr: &Expr) -> String {
                 .join(", ")
         ),
         Expr::CondBinding { pattern, value, .. } => {
-            format!("({} := {})", dump_expr(pattern), dump_expr(value))
+            format!("({} := {})", dump_pattern(pattern), dump_expr(value))
         }
+        Expr::Match { subject, arms, .. } => dump_match(subject, arms),
         Expr::InterpString { parts, .. } => {
             let body = parts
                 .iter()

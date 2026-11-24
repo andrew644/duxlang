@@ -1,8 +1,8 @@
 use dux_ast::{
     AssignOp, Attribute, AttributeArgument, BinaryOp, Block, ConstDecl, Decl, EnumDecl, Expr,
-    ExternBlock, Field, FnDecl, ForKind, GlobalDecl, Ident, ImplDecl, Import, InterpolationPart,
-    ModuleDecl, Param, Program, StrKind, StructDecl, Stmt, Type, TypeAliasDecl, TypeParam, UnaryOp,
-    Variant, VariantBody,
+    ExternBlock, Field, FieldPattern, FnDecl, ForKind, GlobalDecl, Ident, ImplDecl, Import,
+    InterpolationPart, MatchArm, MatchBody, ModuleDecl, Param, Pattern, Program, StrKind,
+    StructDecl, Stmt, Type, TypeAliasDecl, TypeParam, UnaryOp, Variant, VariantBody,
 };
 use dux_diag::Diagnostic;
 use dux_lexer::{Keyword, Literal, Punct, Token, TokenKind};
@@ -882,11 +882,7 @@ impl<'a> Parser<'a> {
                 Stmt::Loop { body, span }
             }
             TokenKind::Keyword(Keyword::For) => self.for_statement(),
-            TokenKind::Keyword(Keyword::Match) => {
-                self.unsupported(&token, token.kind.describe());
-                self.skip_to_statement_end();
-                Stmt::Error { span: token.span }
-            }
+            TokenKind::Keyword(Keyword::Match) => self.match_statement(),
             TokenKind::Punct(Punct::LBrace) => {
                 let block = self.block();
                 let span = block.span;
@@ -1603,13 +1599,7 @@ impl<'a> Parser<'a> {
                     span: token.span.merge(end),
                 }
             }
-            TokenKind::Keyword(Keyword::Match) => {
-                self.unsupported(&token, token.kind.describe());
-                let end = self.skip_expression_blocks();
-                Expr::Error {
-                    span: token.span.merge(end),
-                }
-            }
+            TokenKind::Keyword(Keyword::Match) => self.match_expression(),
             TokenKind::Punct(Punct::LParen) => {
                 self.bump();
                 let inner = self.expr();
@@ -1753,46 +1743,397 @@ impl<'a> Parser<'a> {
         }
     }
 
-    /// Skip an unsupported expression whose body is one or more `{ .. }` blocks,
-    /// as in `match x { .. }`, `match x { .. } else { .. }` or `if c { .. } else { .. }`.
-    fn skip_expression_blocks(&mut self) -> Span {
-        let mut end = self.peek().span;
-        while !self.at_end() {
-            if self.at_punct(Punct::LBrace) {
-                end = self.skip_balanced_block();
-                continue;
-            }
-            if self.at_keyword(Keyword::Else) {
-                self.bump();
-                continue;
-            }
-            if self.at_punct(Punct::Semicolon) || self.at_punct(Punct::RBrace) {
-                break;
-            }
-            end = self.peek().span;
-            self.bump();
+    /// `match` in value position: the arms are the value's branches.
+    fn match_expression(&mut self) -> Expr {
+        let token = self.bump_span();
+        let subject = self.match_subject();
+        let (arms, span) = self.match_arms();
+        Expr::Match {
+            subject: Box::new(subject),
+            arms,
+            span: token.merge(span),
         }
-        end
     }
 
-    fn skip_balanced_block(&mut self) -> Span {
-        let mut depth = 0usize;
-        let mut end = self.peek().span;
-        while !self.at_end() {
-            end = self.peek().span;
-            if self.at_punct(Punct::LBrace) {
-                depth += 1;
-            } else if self.at_punct(Punct::RBrace) {
-                depth -= 1;
+    /// `match` in statement position, where an arm may run statements.
+    fn match_statement(&mut self) -> Stmt {
+        let token = self.bump_span();
+        let subject = self.match_subject();
+        let (arms, span) = self.match_arms();
+        Stmt::Match {
+            subject,
+            arms,
+            span: token.merge(span),
+        }
+    }
+
+    /// The scrutinee of a `match`. A `{` after it opens the arms, never a
+    /// struct value, so the subject is read in control-flow-head position.
+    fn match_subject(&mut self) -> Expr {
+        self.in_condition += 1;
+        let subject = self.expr();
+        self.in_condition -= 1;
+        subject
+    }
+
+    /// `{ arm, arm, .. }`. The commas are part of the arm, and a block-bodied
+    /// arm may stand without one.
+    fn match_arms(&mut self) -> (Vec<MatchArm>, Span) {
+        let open = self.expect_punct(Punct::LBrace, "expected `{` to open the `match` arms");
+        let mut arms = Vec::new();
+        while !self.at_punct(Punct::RBrace) && !self.at_end() {
+            let before = self.cursor;
+            let arm = self.match_arm();
+            let block_body = matches!(arm.body, MatchBody::Block(_));
+            if self.at_punct(Punct::Comma) {
                 self.bump();
-                if depth == 0 {
-                    return end;
+            } else if !block_body && !self.at_punct(Punct::RBrace) && !self.at_end() {
+                let token = self.peek().clone();
+                self.error(&token, "expected `,` between the arms of a `match`");
+            }
+            if self.cursor == before {
+                self.bump();
+            }
+            arms.push(arm);
+        }
+        let close = self.expect_punct(Punct::RBrace, "expected `}` to close the `match` arms");
+        (arms, open.merge(close))
+    }
+
+    /// `pattern [if guard] => body`
+    fn match_arm(&mut self) -> MatchArm {
+        let pattern = self.pattern();
+        let mut span = pattern.span();
+        let guard = if self.at_keyword(Keyword::If) {
+            self.bump();
+            let guard = self.expr();
+            span = span.merge(guard.span());
+            Some(guard)
+        } else {
+            None
+        };
+        let arrow = self.expect_punct(
+            Punct::FatArrow,
+            "expected `=>` after the pattern of a `match` arm",
+        );
+        span = span.merge(arrow);
+        let body = if self.at_punct(Punct::LBrace) {
+            let block = self.block();
+            span = span.merge(block.span);
+            MatchBody::Block(block)
+        } else {
+            match self.stmt() {
+                Stmt::Expr { expr, .. } => {
+                    span = span.merge(expr.span());
+                    MatchBody::Expr(expr)
+                }
+                stmt => {
+                    span = span.merge(stmt.span());
+                    MatchBody::Stmt(stmt)
+                }
+            }
+        };
+        MatchArm {
+            pattern,
+            guard,
+            body,
+            span,
+        }
+    }
+
+    /// A full pattern: or-patterns bind at the top, so `1 | 2 | 3 =>` is one arm.
+    fn pattern(&mut self) -> Pattern {
+        let first = self.range_pattern();
+        if !self.at_punct(Punct::Pipe) {
+            return first;
+        }
+        let mut alternatives = vec![first];
+        while self.at_punct(Punct::Pipe) {
+            self.bump();
+            alternatives.push(self.range_pattern());
+        }
+        let span = alternatives
+            .iter()
+            .fold(alternatives[0].span(), |span, arm| span.merge(arm.span()));
+        Pattern::Or { alternatives, span }
+    }
+
+    /// `4..=9`, `1..5`: a pattern that covers a stretch of literals.
+    fn range_pattern(&mut self) -> Pattern {
+        let start = self.component_pattern();
+        if !self.at_punct(Punct::DotDot) && !self.at_punct(Punct::DotDotEq) {
+            return start;
+        }
+        let inclusive = self.at_punct(Punct::DotDotEq);
+        self.bump();
+        let end = self.component_pattern();
+        let span = start.span().merge(end.span());
+        Pattern::Range {
+            start: Box::new(start),
+            end: Box::new(end),
+            inclusive,
+            span,
+        }
+    }
+
+    fn component_pattern(&mut self) -> Pattern {
+        let token = self.peek().clone();
+        match token.kind {
+            TokenKind::Int
+            | TokenKind::Float
+            | TokenKind::Char
+            | TokenKind::Str
+            | TokenKind::RawStr
+            | TokenKind::CString
+            | TokenKind::Keyword(Keyword::True)
+            | TokenKind::Keyword(Keyword::False) => {
+                let value = self.literal_value();
+                Pattern::Literal {
+                    value: Box::new(value),
+                    span: token.span,
+                }
+            }
+            TokenKind::Punct(Punct::Minus) => {
+                self.bump();
+                let operand = self.component_pattern();
+                let span = token.span.merge(operand.span());
+                match operand {
+                    Pattern::Literal { value, .. } => Pattern::Literal {
+                        value: Box::new(Expr::Unary {
+                            op: UnaryOp::Neg,
+                            operand: value,
+                            span,
+                        }),
+                        span,
+                    },
+                    other => {
+                        self.diagnostics.push(
+                            Diagnostic::error(
+                                CODE_UNEXPECTED_TOKEN,
+                                "only a literal number may be negated in a pattern",
+                            )
+                            .with_span(span),
+                        );
+                        other
+                    }
+                }
+            }
+            TokenKind::Keyword(Keyword::Else) => {
+                self.bump();
+                Pattern::Else { span: token.span }
+            }
+            TokenKind::Punct(Punct::LParen) => {
+                self.bump();
+                let inner = self.pattern();
+                self.expect_punct(Punct::RParen, "expected `)` to close the parenthesised pattern");
+                inner
+            }
+            TokenKind::Ident => {
+                self.bump();
+                let name = token.text(self.sources).to_string();
+                if name == "_" && !self.at_punct(Punct::LParen) && !self.at_punct(Punct::LBrace) {
+                    return Pattern::Wildcard { span: token.span };
+                }
+                if self.at_punct(Punct::ColonColon) {
+                    self.bump();
+                    let member = self.expect_ident("variant name");
+                    let span = token.span.merge(member.span);
+                    return self.variant_pattern(Some(name), member.name, span);
+                }
+                if self.at_punct(Punct::LParen) || self.at_pattern_brace() {
+                    return self.variant_pattern(None, name, token.span);
+                }
+                Pattern::Name {
+                    name: Ident::new(name, token.span),
+                    span: token.span,
+                }
+            }
+            _ => {
+                self.error(&token, "expected a pattern");
+                self.bump();
+                Pattern::Error { span: token.span }
+            }
+        }
+    }
+
+    /// A `{` that belongs to the pattern (`Shape::Rect { w, h }`), not to an arm body.
+    fn at_pattern_brace(&self) -> bool {
+        self.at_punct(Punct::LBrace) && !self.peek().newline_before
+    }
+
+    /// What follows a variant name: `(p1, p2)`, `{ f1, f2 }`, or nothing at all.
+    fn variant_pattern(&mut self, qualifier: Option<String>, name: String, start: Span) -> Pattern {
+        if self.at_punct(Punct::LParen) {
+            self.bump();
+            let mut elements = Vec::new();
+            while !self.at_punct(Punct::RParen) && !self.at_end() {
+                let before = self.cursor;
+                elements.push(self.pattern());
+                if self.at_punct(Punct::Comma) {
+                    self.bump();
+                } else if !self.at_punct(Punct::RParen) {
+                    let token = self.peek().clone();
+                    self.error(&token, "expected `,` between the patterns of a variant");
+                    break;
+                }
+                if self.cursor == before {
+                    self.bump();
+                }
+            }
+            let end = self.expect_punct(Punct::RParen, "expected `)` to close the variant pattern");
+            return Pattern::Tuple {
+                qualifier,
+                name,
+                elements,
+                span: start.merge(end),
+            };
+        }
+        if self.at_pattern_brace() {
+            return self.struct_pattern(qualifier, name, start);
+        }
+        Pattern::Path {
+            qualifier: qualifier.unwrap_or_default(),
+            name,
+            span: start,
+        }
+    }
+
+    fn struct_pattern(&mut self, qualifier: Option<String>, name: String, start: Span) -> Pattern {
+        self.bump();
+        let mut fields = Vec::new();
+        let mut rest = false;
+        while !self.at_punct(Punct::RBrace) && !self.at_end() {
+            let before = self.cursor;
+            if self.at_punct(Punct::DotDot) {
+                self.bump();
+                rest = true;
+                if self.at_punct(Punct::Comma) {
+                    self.bump();
                 }
                 continue;
             }
-            self.bump();
+            let field = self.expect_ident("field name");
+            let span = field.span;
+            let pattern = if self.at_punct(Punct::Colon) {
+                self.bump();
+                Some(self.pattern())
+            } else {
+                None
+            };
+            fields.push(match pattern {
+                None => FieldPattern::Shorthand { name: field, span },
+                Some(pattern) => {
+                    let span = span.merge(pattern.span());
+                    FieldPattern::Nested {
+                        name: field,
+                        pattern: Box::new(pattern),
+                        span,
+                    }
+                }
+            });
+            if self.at_punct(Punct::Comma) {
+                self.bump();
+            } else if !self.at_punct(Punct::RBrace) {
+                let token = self.peek().clone();
+                self.error(&token, "expected `,` between the fields of a pattern");
+                break;
+            }
+            if self.cursor == before {
+                self.bump();
+            }
         }
-        end
+        let end = self.expect_punct(Punct::RBrace, "expected `}` to close the pattern");
+        Pattern::Struct {
+            qualifier,
+            name,
+            fields,
+            rest,
+            span: start.merge(end),
+        }
+    }
+
+    /// A literal read where a pattern is expected.
+    fn literal_value(&mut self) -> Expr {
+        let token = self.peek().clone();
+        self.bump();
+        match token.literal {
+            Some(Literal::Int(value)) => Expr::Int { value, span: token.span },
+            Some(Literal::Float(value)) => Expr::Float { value, span: token.span },
+            Some(Literal::Char(value)) => Expr::Char { value, span: token.span },
+            Some(Literal::Text(text)) => Expr::Str {
+                text,
+                kind: match token.kind {
+                    TokenKind::RawStr => StrKind::Raw,
+                    TokenKind::CString => StrKind::CString,
+                    _ => StrKind::Utf8,
+                },
+                span: token.span,
+            },
+            _ => match token.kind {
+                TokenKind::Keyword(Keyword::True) => Expr::Bool { value: true, span: token.span },
+                TokenKind::Keyword(Keyword::False) => Expr::Bool { value: false, span: token.span },
+                _ => Expr::Error { span: token.span },
+            },
+        }
+    }
+
+    /// Is this control-flow head `P := e`? A `:=` before the body block says so;
+    /// braces that are followed by `:=` belong to a struct pattern, not to a body.
+    fn at_pattern_condition(&self) -> bool {
+        let mut index = self.cursor;
+        let mut depth = 0usize;
+        while index - self.cursor <= 64 {
+            let Some(token) = self.tokens.get(index) else {
+                return false;
+            };
+            match token.kind {
+                TokenKind::Punct(Punct::ColonEq) if depth == 0 => return true,
+                TokenKind::Punct(Punct::LParen) | TokenKind::Punct(Punct::LBracket) => depth += 1,
+                TokenKind::Punct(Punct::RParen) | TokenKind::Punct(Punct::RBracket) => {
+                    depth = depth.saturating_sub(1)
+                }
+                TokenKind::Punct(Punct::LBrace) if depth == 0 => {
+                    let Some(close) = self.balanced_brace(index) else {
+                        return false;
+                    };
+                    match self.tokens.get(close + 1).map(|token| token.kind) {
+                        Some(TokenKind::Punct(Punct::ColonEq)) => {
+                            index = close + 1;
+                            continue;
+                        }
+                        _ => return false,
+                    }
+                }
+                TokenKind::Punct(Punct::LBrace) => depth += 1,
+                TokenKind::Punct(Punct::RBrace) => depth = depth.saturating_sub(1),
+                TokenKind::Punct(Punct::Semicolon) if depth == 0 => return false,
+                TokenKind::Eof => return false,
+                _ => {}
+            }
+            index += 1;
+        }
+        false
+    }
+
+    /// The index just past the `{` at `open`, its matching `}`.
+    fn balanced_brace(&self, open: usize) -> Option<usize> {
+        let mut depth = 0usize;
+        let mut index = open;
+        while let Some(token) = self.tokens.get(index) {
+            match token.kind {
+                TokenKind::Punct(Punct::LBrace) => depth += 1,
+                TokenKind::Punct(Punct::RBrace) => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return Some(index);
+                    }
+                }
+                TokenKind::Eof => return None,
+                _ => {}
+            }
+            index += 1;
+        }
+        None
     }
 
     fn starts_expression(&self) -> bool {
@@ -1871,19 +2212,19 @@ impl<'a> Parser<'a> {
     /// matched and its bindings are in scope in the body (design D27).
     fn condition(&mut self) -> Expr {
         self.in_condition += 1;
-        let head = self.expr();
-        let head = if self.at_punct(Punct::ColonEq) {
-            let start = head.span();
-            self.bump();
+        let head = if self.at_pattern_condition() {
+            let pattern = self.pattern();
+            let start = pattern.span();
+            self.expect_punct(Punct::ColonEq, "expected `:=` after the pattern");
             let value = self.expr();
             let span = start.merge(value.span());
             Expr::CondBinding {
-                pattern: Box::new(head),
+                pattern,
                 value: Box::new(value),
                 span,
             }
         } else {
-            head
+            self.expr()
         };
         self.in_condition -= 1;
         head
@@ -2201,14 +2542,137 @@ mod tests {
 
     #[test]
     fn an_unlowerable_expression_reports_one_milestone_diagnostic() {
-        let (program, diagnostics) = parse_text("fn f() -> i32 {\n    return match x { 1 => 2, }\n}");
+        let (_program, diagnostics) = parse_text("fn f() -> i32 {\n    return (1, 2)\n}");
         assert_eq!(
             diagnostics.iter().map(|d| d.code).collect::<Vec<_>>(),
             vec![CODE_UNSUPPORTED_YET],
-            "`match` is a milestone gap, and one diagnostic is enough"
+            "a tuple value is a milestone gap, and one diagnostic is enough"
         );
-        let function = program.find_function("f").unwrap();
-        assert!(matches!(function.body.stmts[0], Stmt::Return { .. }));
+    }
+
+    #[test]
+    fn match_arms_keep_their_literals_or_patterns_ranges_and_guards() {
+        let (program, diagnostics) = parse_text(
+            "fn f(n: i32) -> string {\n    return match n {\n        0 => \"zero\",\n        1 | 2 | 3 => \"small\",\n        4..=9 => \"single digit\",\n        x if x < 0 => \"negative\",\n        _ => \"big\",\n    }\n}\n",
+        );
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        let Expr::Match { subject, arms, .. } = value_of_return(&program) else {
+            panic!("expected a `match` value");
+        };
+        assert!(matches!(&**subject, Expr::Ident { name, .. } if name == "n"));
+        assert_eq!(arms.len(), 5);
+        assert!(matches!(arms[0].pattern, Pattern::Literal { .. }));
+        assert!(matches!(
+            &arms[1].pattern,
+            Pattern::Or { alternatives, .. } if alternatives.len() == 3
+        ));
+        assert!(matches!(arms[2].pattern, Pattern::Range { inclusive: true, .. }));
+        assert!(matches!(&arms[3].pattern, Pattern::Name { name, .. } if name.name == "x"));
+        assert!(arms[3].guard.is_some(), "the `if` after a pattern is a guard");
+        assert!(matches!(arms[4].pattern, Pattern::Wildcard { .. }));
+        assert!(matches!(arms[0].body, MatchBody::Expr(Expr::Str { .. })));
+    }
+
+    #[test]
+    fn variant_patterns_bind_payloads_by_position_and_by_name() {
+        let (program, diagnostics) = parse_text(
+            "fn f(s: Shape) {\n    match s {\n        Shape::Circle(r) => print(r),\n        Shape::Rect { w, h } => print(w),\n        Command::Load { path, .. } => print(path),\n        None => print(\"nothing\"),\n        else => print(\"other\"),\n    }\n}\n",
+        );
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        let Stmt::Match { arms, .. } = &program.find_function("f").unwrap().body.stmts[0] else {
+            panic!("expected a `match` statement");
+        };
+        assert!(matches!(
+            &arms[0].pattern,
+            Pattern::Tuple { qualifier, name, elements, .. }
+                if qualifier.as_deref() == Some("Shape") && name == "Circle" && elements.len() == 1
+        ));
+        assert!(matches!(
+            &arms[1].pattern,
+            Pattern::Struct { qualifier, fields, rest, .. }
+                if qualifier.as_deref() == Some("Shape") && fields.len() == 2 && !rest
+        ));
+        assert!(matches!(
+            &arms[2].pattern,
+            Pattern::Struct { fields, rest, .. } if fields.len() == 1 && *rest
+        ));
+        assert!(
+            matches!(&arms[3].pattern, Pattern::Name { name, .. } if name.name == "None"),
+            "a bare name is ambiguous until the checker knows the variants"
+        );
+        assert!(matches!(arms[4].pattern, Pattern::Else { .. }));
+        let binders = arms[1].pattern.binders();
+        assert_eq!(
+            binders.iter().map(|b| b.name.as_str()).collect::<Vec<_>>(),
+            vec!["w", "h"]
+        );
+    }
+
+    #[test]
+    fn a_match_arm_body_may_be_a_block() {
+        let (program, diagnostics) =
+            parse_text("fn f(n: i32) {\n    match n {\n        0 => {\n            print(\"zero\")\n        }\n        _ => print(\"many\")\n    }\n}\n");
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        let Stmt::Match { arms, .. } = &program.find_function("f").unwrap().body.stmts[0] else {
+            panic!("expected a `match` statement");
+        };
+        assert!(matches!(&arms[0].body, MatchBody::Block(block) if block.stmts.len() == 1));
+        assert!(matches!(&arms[1].body, MatchBody::Expr(_)));
+    }
+
+    #[test]
+    fn a_pattern_condition_binds_through_its_pattern() {
+        for source in [
+            "fn f(o: Option<i32>) {\n    if Some(x) := o {\n        print(x)\n    }\n}",
+            "fn f(s: Shape) {\n    if Shape::Rect { w, h } := s {\n        print(w)\n    }\n}",
+            "fn f(o: Option<*Node>) {\n    while Some(node) := cursor {\n        print(node)\n    }\n}",
+        ] {
+            let (program, diagnostics) = parse_text(source);
+            assert!(diagnostics.is_empty(), "{source}: {diagnostics:?}");
+            let function = program.find_function("f").unwrap();
+            let cond = match &function.body.stmts[0] {
+                Stmt::If { cond, .. } | Stmt::While { cond, .. } => cond,
+                other => panic!("expected a conditional, found {other:?}"),
+            };
+            let Expr::CondBinding { pattern, .. } = cond else {
+                panic!("expected a pattern condition, found {cond:?}");
+            };
+            assert!(!pattern.binders().is_empty(), "{pattern:?}");
+        }
+    }
+
+    #[test]
+    fn a_plain_condition_stays_an_expression() {
+        let (program, diagnostics) =
+            parse_text("fn f() {\n    if hits < 3 {\n        hits = 0\n    }\n}\n");
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        let Stmt::If { cond, .. } = &program.find_function("f").unwrap().body.stmts[0] else {
+            panic!("expected an `if`");
+        };
+        assert!(matches!(cond, Expr::Binary { .. }), "{cond:?}");
+    }
+
+    #[test]
+    fn a_missing_comma_between_arms_is_reported_and_the_arms_survive() {
+        let (program, diagnostics) =
+            parse_text("fn f(n: i32) {\n    match n {\n        0 => print(\"a\")\n        1 => print(\"b\")\n    }\n}\n");
+        assert_eq!(
+            diagnostics.iter().map(|d| d.code).collect::<Vec<_>>(),
+            vec![CODE_UNEXPECTED_TOKEN],
+            "one diagnostic, not a cascade"
+        );
+        let Stmt::Match { arms, .. } = &program.find_function("f").unwrap().body.stmts[0] else {
+            panic!("expected a `match` statement");
+        };
+        assert_eq!(arms.len(), 2);
+    }
+
+    fn value_of_return(program: &Program) -> &Expr {
+        let function = program.find_function("f").expect("f");
+        let Stmt::Return { value: Some(value), .. } = &function.body.stmts[0] else {
+            panic!("expected a return of a value");
+        };
+        value
     }
 
     #[test]
@@ -2311,15 +2775,11 @@ mod tests {
     }
 
     #[test]
-    fn control_flow_parses_and_match_is_still_a_milestone_gap() {
+    fn control_flow_parses_including_a_match_in_value_position() {
         let (program, diagnostics) = parse_text(
             "fn f() { if x { y() } else if z { w() } else { v() }; while a { b() }; for i := 0, i < 3, i += 1 { c() }; for v in xs { d() }; for i, v in xs { e() }; for { f() }; break; continue; g := match x { _ => 1 } }",
         );
-        assert_eq!(
-            diagnostics.iter().map(|d| d.code).collect::<Vec<_>>(),
-            vec![CODE_UNSUPPORTED_YET],
-            "`match` is the only control-flow form still unimplemented"
-        );
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
         let statements = &program.find_function("f").unwrap().body.stmts;
         assert!(matches!(&statements[0], Stmt::If { else_branch: Some(_), .. }));
         assert!(matches!(&statements[1], Stmt::While { .. }));
@@ -2333,6 +2793,13 @@ mod tests {
         assert!(matches!(&statements[5], Stmt::Loop { .. }), "`for {{ }}` is a loop");
         assert!(matches!(&statements[6], Stmt::Break { .. }));
         assert!(matches!(&statements[7], Stmt::Continue { .. }));
+        assert!(matches!(
+            &statements[8],
+            Stmt::Binding {
+                value: Some(Expr::Match { .. }),
+                ..
+            }
+        ));
     }
 
     #[test]

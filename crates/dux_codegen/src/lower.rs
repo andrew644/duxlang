@@ -1645,6 +1645,9 @@ impl Emitter {
             Stmt::Return { value, span } => self.return_stmt(module, value.as_ref(), *span),
             Stmt::Defer { stmt, span } => self.defer_stmt(module, stmt, *span),
             Stmt::Block { block, .. } => self.block_body(module, block),
+            Stmt::Match { span, .. } => {
+                self.unsupported(*span, "a `match` (the arms land at M4)")
+            }
             Stmt::Error { .. } => {}
         }
     }
@@ -6047,6 +6050,23 @@ impl Scan {
                 }
                 self.block(body);
             }
+            Stmt::Match { subject, arms, .. } => {
+                self.expr(subject);
+                self.arms(arms);
+            }
+        }
+    }
+
+    fn arms(&mut self, arms: &[dux_ast::MatchArm]) {
+        for arm in arms {
+            if let Some(guard) = &arm.guard {
+                self.expr(guard);
+            }
+            match &arm.body {
+                dux_ast::MatchBody::Expr(expr) => self.expr(expr),
+                dux_ast::MatchBody::Block(block) => self.block(block),
+                dux_ast::MatchBody::Stmt(stmt) => self.stmt(stmt),
+            }
         }
     }
 
@@ -6124,9 +6144,25 @@ impl Scan {
                     self.expr(value);
                 }
             }
-            Expr::CondBinding { pattern, value, .. } => {
-                self.expr(pattern);
+            Expr::CondBinding { value, .. } => {
                 self.expr(value);
+            }
+            Expr::Match { subject, arms, .. } => {
+                self.expr(subject);
+                for arm in arms {
+                    if let Some(guard) = &arm.guard {
+                        self.expr(guard);
+                    }
+                    match &arm.body {
+                        dux_ast::MatchBody::Expr(expr) => self.expr(expr),
+                        dux_ast::MatchBody::Block(block) => {
+                            for stmt in &block.stmts {
+                                self.stmt(stmt);
+                            }
+                        }
+                        dux_ast::MatchBody::Stmt(stmt) => self.stmt(stmt),
+                    }
+                }
             }
             Expr::InterpString { parts, .. } => {
                 if !self.in_write {

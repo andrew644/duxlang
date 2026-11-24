@@ -707,3 +707,32 @@ string from a function) and pins that the debug allocator reports the one
 temporary nobody bound; `example/strings.dux` typechecks cleanly and runs until
 `.bytes()`, which is a standard library question. Nine new IR tests, four new
 checker tests. 198 tests, clippy clean.
+
+## Session 12a — M4 step 1: the parser reads patterns and `match`
+
+`match` was the one control-flow form the parser refused, and the reason it
+refused it is that a pattern is not an expression: `Shape::Rect { w, h }` looks
+like a struct value until you know a pattern is what a `match` arm wants. So
+the AST gained a `Pattern` of its own — wildcard, `else`, bare name, literal,
+`E::Variant`, `E::Variant(p)`/`E::Variant { f, .. }`, range, or-pattern — and
+`match` gained a place in both positions, expression and statement.
+
+An arm is `pattern [if guard] => body`, and the body is deliberately not just an
+expression: `Err(e) => return Err(…)` is how propagation is written while `?` is
+still on the shelf, so an arm may run a statement. A block body needs no comma,
+an expression body does, which is the one shape the arm list complains about.
+
+A bare name in a pattern is kept as `Pattern::Name`, not as a binding: `None`
+and `pixels` are the same spelling and only the variant table knows which one
+matches. That question moves to the checker, which is where it belongs.
+
+`if P := e` was already parsed as "an expression, then `:=`", which quietly made
+the head an expression and gave `if Shape::Rect { w, h } := s` to the body
+block. The head is now read as a pattern when a `:=` turns up before the body —
+braces that are followed by `:=` are a struct pattern, not a body.
+
+`dux fmt` prints one arm per line with a trailing comma, so the corpus formatter
+now accepts `sum_types.dux`; the two tests that pinned `match` as an `E0007`
+gap moved to a tuple, which is still a gap. Six new parser tests, one new CLI
+format test. `example/sum_types.dux` and `example/option_result.dux` now parse
+and check clean. Lowering still refuses `match` — 205 tests, clippy clean.

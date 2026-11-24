@@ -1063,6 +1063,10 @@ impl<'a> Checker<'a> {
                 let _ = pattern;
                 Ty::Bool
             }
+            Expr::Match { subject, arms, span } => {
+                let _ = self.infer(subject);
+                self.arms(arms, expected, *span)
+            }
             Expr::If { cond, then_arm, else_arm, span } => {
                 self.condition(cond);
                 let then_ty = self.expression_in(then_arm, expected);
@@ -1417,8 +1421,76 @@ impl<'a> Checker<'a> {
                 }
                 self.scopes.pop();
             }
+            Stmt::Match { subject, arms, .. } => {
+                let _ = self.infer(subject);
+                let _ = self.arms(arms, None, subject.span());
+            }
             Stmt::Error { .. } => {}
         }
+    }
+
+    /// Walk the arms of a `match`. Each arm binds its own names and its body
+    /// must agree with the others on one type when the `match` is a value.
+    fn arms(&mut self, arms: &[dux_ast::MatchArm], expected: Option<&Ty>, span: Span) -> Ty {
+        let mut joined: Option<Ty> = None;
+        for arm in arms {
+            self.scopes.push(Vec::new());
+            for binder in arm.pattern.binders() {
+                self.define(&binder.name, Ty::Opaque, false);
+            }
+            if let Some(guard) = &arm.guard {
+                let ty = self.infer(guard);
+                self.require_bool(ty, guard.span(), "the `if` of a `match` arm needs a `bool`");
+            }
+            let arm_ty = match &arm.body {
+                dux_ast::MatchBody::Expr(expr) => self.expression_in(expr, expected),
+                dux_ast::MatchBody::Block(block) => self.block_value(block, expected),
+                dux_ast::MatchBody::Stmt(stmt) => {
+                    self.statement(stmt);
+                    Ty::Opaque
+                }
+            };
+            joined = Some(match joined {
+                None => arm_ty,
+                Some(known) => self.unify(known, arm_ty, arm.span),
+            });
+            self.scopes.pop();
+        }
+        match joined {
+            Some(ty) => ty,
+            None => {
+                if expected.is_none() {
+                    self.error(
+                        code::TYPE_MISMATCH,
+                        "a `match` with no arms has no value",
+                        span,
+                    );
+                }
+                expected.cloned().unwrap_or(Ty::Opaque)
+            }
+        }
+    }
+
+    /// A block in arm position: its statements run, its last expression is its value.
+    fn block_value(&mut self, block: &Block, expected: Option<&Ty>) -> Ty {
+        self.scopes.push(Vec::new());
+        let mut value = None;
+        let last = block.stmts.len().saturating_sub(1);
+        for (index, statement) in block.stmts.iter().enumerate() {
+            if index == last {
+                if let Stmt::Expr { expr, .. } = statement {
+                    value = Some(expr);
+                    continue;
+                }
+            }
+            self.statement(statement);
+        }
+        let ty = match value {
+            Some(expr) => self.expression_in(expr, expected),
+            None => Ty::Unit,
+        };
+        self.scopes.pop();
+        ty
     }
 
     fn condition(&mut self, cond: &Expr) {

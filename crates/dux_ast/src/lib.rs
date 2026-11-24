@@ -182,6 +182,128 @@ impl BinaryOp {
     }
 }
 
+/// A pattern: what a `match` arm or a pattern condition asks for. A bare
+/// name is [`Pattern::Name`], because `None` and `pixels` look identical until
+/// the checker knows whether the name names a variant.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Pattern {
+    Wildcard { span: Span },
+    /// The `else =>` tail, which matches whatever is left.
+    Else { span: Span },
+    Name { name: Ident, span: Span },
+    Literal { value: Box<Expr>, span: Span },
+    Path { qualifier: String, name: String, span: Span },
+    Tuple { qualifier: Option<String>, name: String, elements: Vec<Pattern>, span: Span },
+    Struct {
+        qualifier: Option<String>,
+        name: String,
+        fields: Vec<FieldPattern>,
+        rest: bool,
+        span: Span,
+    },
+    Range {
+        start: Box<Pattern>,
+        end: Box<Pattern>,
+        inclusive: bool,
+        span: Span,
+    },
+    Or { alternatives: Vec<Pattern>, span: Span },
+    Error { span: Span },
+}
+
+impl Pattern {
+    pub fn span(&self) -> Span {
+        match self {
+            Pattern::Wildcard { span }
+            | Pattern::Else { span }
+            | Pattern::Name { span, .. }
+            | Pattern::Literal { span, .. }
+            | Pattern::Path { span, .. }
+            | Pattern::Tuple { span, .. }
+            | Pattern::Struct { span, .. }
+            | Pattern::Range { span, .. }
+            | Pattern::Or { span, .. }
+            | Pattern::Error { span } => *span,
+        }
+    }
+
+    /// The names the pattern binds, in the order they are written.
+    pub fn binders(&self) -> Vec<Ident> {
+        match self {
+            Pattern::Name { name, .. } => vec![name.clone()],
+            Pattern::Tuple { elements, .. } => elements.iter().flat_map(Self::binders).collect(),
+            Pattern::Struct { fields, .. } => fields.iter().flat_map(FieldPattern::binders).collect(),
+            Pattern::Or { alternatives, .. } => {
+                let mut names = Vec::new();
+                for alternative in alternatives {
+                    for binder in alternative.binders() {
+                        if !names.iter().any(|known: &Ident| known.name == binder.name) {
+                            names.push(binder);
+                        }
+                    }
+                }
+                names
+            }
+            Pattern::Range { start, end, .. } => {
+                let mut binders = start.binders();
+                binders.extend(end.binders());
+                binders
+            }
+            _ => Vec::new(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum FieldPattern {
+    /// `{ w, h }`: the field is bound to a name of its own.
+    Shorthand { name: Ident, span: Span },
+    /// `{ w: Pattern::Literal(..) }`: the field is matched against a pattern.
+    Nested { name: Ident, pattern: Box<Pattern>, span: Span },
+}
+
+impl FieldPattern {
+    pub fn span(&self) -> Span {
+        match self {
+            FieldPattern::Shorthand { span, .. } | FieldPattern::Nested { span, .. } => *span,
+        }
+    }
+
+    pub fn binders(&self) -> Vec<Ident> {
+        match self {
+            FieldPattern::Shorthand { name, .. } => vec![name.clone()],
+            FieldPattern::Nested { pattern, .. } => pattern.binders(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum MatchBody {
+    Expr(Expr),
+    Block(Block),
+    /// `=> return e`, `=> break`: an arm may run a statement, which is how
+    /// propagation is written while `?` is still on the shelf.
+    Stmt(Stmt),
+}
+
+impl MatchBody {
+    pub fn span(&self) -> Span {
+        match self {
+            MatchBody::Expr(expr) => expr.span(),
+            MatchBody::Block(block) => block.span,
+            MatchBody::Stmt(stmt) => stmt.span(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct MatchArm {
+    pub pattern: Pattern,
+    pub guard: Option<Expr>,
+    pub body: MatchBody,
+    pub span: Span,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum Expr {
     Int { value: u128, span: Span },
@@ -224,11 +346,15 @@ pub enum Expr {
         span: Span,
     },
     /// The condition of `if P := e` / `while P := e`: a pattern matched against
-    /// a value, binding on success. The pattern is kept as an expression until
-    /// the checker gives it a real pattern representation (M4).
+    /// a value, binding on success.
     CondBinding {
-        pattern: Box<Expr>,
+        pattern: Pattern,
         value: Box<Expr>,
+        span: Span,
+    },
+    Match {
+        subject: Box<Expr>,
+        arms: Vec<MatchArm>,
         span: Span,
     },
     /// A `$".."` literal broken into literal text and holes. A hole with no
@@ -278,6 +404,7 @@ impl Expr {
             | Expr::StructLiteral { span, .. }
             | Expr::InterpString { span, .. }
             | Expr::CondBinding { span, .. }
+            | Expr::Match { span, .. }
             | Expr::If { span, .. }
             | Expr::Block { span, .. }
             | Expr::Unary { span, .. }
@@ -345,6 +472,11 @@ pub enum Stmt {
         body: Block,
         span: Span,
     },
+    Match {
+        subject: Expr,
+        arms: Vec<MatchArm>,
+        span: Span,
+    },
     Error {
         span: Span,
     },
@@ -382,6 +514,7 @@ impl Stmt {
             | Stmt::While { span, .. }
             | Stmt::Loop { span, .. }
             | Stmt::For { span, .. }
+            | Stmt::Match { span, .. }
             | Stmt::Error { span } => *span,
         }
     }

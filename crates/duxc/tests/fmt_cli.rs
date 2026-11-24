@@ -95,20 +95,49 @@ fn a_broken_file_fails_fmt_and_stays_untouched() {
 #[test]
 fn a_milestone_gap_that_would_degrade_the_ast_refuses_formatting() {
     let dir = scratch("fmt_gap");
-    let file = dir.join("sums.dux");
-    std::fs::write(
-        &file,
-        "fn main() {\n    shape := 1\n    match shape { _ => println(\"x\") }\n}\n",
-    )
-    .unwrap();
+    let file = dir.join("pairs.dux");
+    std::fs::write(&file, "fn main() {\n    pair := (1, 2)\n}\n").unwrap();
 
     let run = duxc(&["fmt", file.to_str().unwrap()]);
     assert_eq!(run.code, 1);
     assert!(run.stderr.contains("E0007"), "{}", run.stderr);
     assert!(
-        std::fs::read_to_string(&file).unwrap().contains("match"),
-        "the formatter must never emit a file with the match erased"
+        std::fs::read_to_string(&file).unwrap().contains("(1, 2)"),
+        "the formatter must never emit a file with the tuple erased"
     );
+}
+
+#[test]
+fn a_match_formats_one_arm_to_a_line_and_survives_a_second_pass() {
+    let dir = scratch("fmt_match");
+    let file = dir.join("shapes.dux");
+    std::fs::write(
+        &file,
+        "fn main() {\n    shape := 1\n    match shape { 0 => println(\"zero\"), 1 | 2 if shape < 3 => println(\"small\"), x if x < 0 => println(\"negative\"), _ => println(\"many\") }\n}\n",
+    )
+    .unwrap();
+
+    let run = duxc(&["fmt", file.to_str().unwrap()]);
+    assert_eq!(run.code, 0, "{}", run.stderr);
+    let formatted = std::fs::read_to_string(&file).unwrap();
+    assert_eq!(
+        formatted,
+        concat!(
+            "fn main() {\n",
+            "    shape := 1\n",
+            "    match shape {\n",
+            "        0 => println(\"zero\"),\n",
+            "        1 | 2 if shape < 3 => println(\"small\"),\n",
+            "        x if x < 0 => println(\"negative\"),\n",
+            "        _ => println(\"many\"),\n",
+            "    }\n",
+            "}\n"
+        ),
+        "{formatted}"
+    );
+    let again = duxc(&["fmt", file.to_str().unwrap()]);
+    assert_eq!(again.code, 0, "{}", again.stderr);
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), formatted);
 }
 
 #[test]
