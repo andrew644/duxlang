@@ -1038,3 +1038,105 @@ fn main() {
         Vec::<&str>::new()
     );
 }
+
+#[test]
+fn text_joins_and_compares_as_one_type() {
+    assert_eq!(
+        codes(
+            "package main
+fn main() {
+    a := \"ab\"
+    b := \"cd\"
+    whole: string = a + b
+    same: bool = a == b
+    different: bool = a != whole
+    println($\"{} {} {}\", whole.len(), same, different)
+}"
+        ),
+        Vec::<&str>::new()
+    );
+    let found = codes(
+        "package main
+fn main() {
+    a := \"ab\"
+    n := a + 1
+}",
+    );
+    assert_eq!(found, vec![dux_diag::code::TYPE_MISMATCH]);
+}
+
+#[test]
+fn a_string_index_is_a_byte_and_a_subslice_is_text() {
+    assert_eq!(
+        codes(
+            "package main
+fn main() {
+    text := \"hello\"
+    first: u8 = text[1]
+    head: string = text[0..2]
+    println($\"{} {}\", first, head.len())
+}"
+        ),
+        Vec::<&str>::new()
+    );
+    let found = codes(
+        "package main
+fn main() {
+    text := \"hello\"
+    n: bool = text[0]
+}",
+    );
+    assert_eq!(found, vec![dux_diag::code::TYPE_MISMATCH]);
+}
+
+#[test]
+fn bytes_reach_text_for_free_and_text_gives_up_its_address() {
+    assert_eq!(
+        codes(
+            "package main
+fn echo(text: string) {
+    println(text)
+}
+fn main() {
+    echo(c\"bytes\")
+    where_ := \"text\" as rawptr
+    println($\"{}\", 1)
+}"
+        ),
+        Vec::<&str>::new()
+    );
+    let found = codes(
+        "package main
+fn main() {
+    n: i32 = \"text\"
+}",
+    );
+    assert_eq!(found, vec![dux_diag::code::TYPE_MISMATCH]);
+}
+
+#[test]
+fn a_c_string_is_bytes_not_text() {
+    assert_eq!(
+        codes(
+            "package main
+fn main() {
+    text := c\"bytes\"
+    where_: rawptr = text
+    println($\"{}\", 1)
+}"
+        ),
+        Vec::<&str>::new()
+    );
+    let found = codes(
+        "package main
+fn main() {
+    text := \"text\"
+    where_: rawptr = text
+}",
+    );
+    assert_eq!(
+        found,
+        vec![dux_diag::code::TYPE_MISMATCH],
+        "a string keeps its address behind an `as`"
+    );
+}

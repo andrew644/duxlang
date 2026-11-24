@@ -31,21 +31,35 @@ fn main_is_emitted_as_a_c_main_returning_zero() {
         ir.contains("ret i32 0"),
         "main must return 0 like a C main:\n{ir}"
     );
-    assert!(ir.contains("call i32 @puts"), "println lowers to puts:\n{ir}");
+    assert!(
+        ir.contains("call i64 @fwrite"),
+        "println writes the view's bytes:\n{ir}"
+    );
+    assert!(
+        ir.contains("call i32 @fputc"),
+        "the newline is written of its own accord:\n{ir}"
+    );
     assert!(
         ir.contains("constant [3 x i8] c\"hi\\00\""),
         "the literal must land in rodata with a NUL:\n{ir}"
     );
+    assert!(
+        ir.contains("@fwrite(ptr @str, i64 1, i64 2"),
+        "the bytes travel with their count:\n{ir}"
+    );
 }
 
 #[test]
-fn print_uses_fputs_so_it_adds_no_newline() {
+fn print_writes_the_bytes_and_no_newline() {
     let ir = build("package main\nfn main() { print(\"hi\") }")
         .expect("builds")
         .ir_text();
-    assert!(ir.contains("call i32 @fputs"), "{ir}");
-    assert!(ir.contains("@stdout"), "fputs needs the stream:\n{ir}");
-    assert!(!ir.contains("@puts"), "print must not use puts:\n{ir}");
+    assert!(ir.contains("call i64 @fwrite"), "{ir}");
+    assert!(ir.contains("@stdout"), "the stream is an argument:\n{ir}");
+    assert!(
+        !ir.contains("@fputc"),
+        "print adds no newline:\n{ir}"
+    );
 }
 
 #[test]
@@ -79,7 +93,7 @@ fn release_runs_the_new_pass_manager_without_losing_the_program() {
     })
             .expect("release builds")
             .ir_text();
-    assert!(debug.contains("@puts") && release.contains("@puts"));
+    assert!(debug.contains("@fwrite") && release.contains("@fwrite"));
     assert!(
         release.contains("i32 @main()"),
         "main must survive `default<O2>`:\n{release}"
@@ -145,7 +159,10 @@ fn a_value_if_meets_at_a_phi() {
     )
     .expect("builds")
     .ir_text();
-    assert!(ir.contains("phi ptr"), "string arms meet at a pointer phi:\n{ir}");
+    assert!(
+        ir.contains(r#"phi { ptr, i64 } [ { ptr @str, i64 1 }"#),
+        "string arms meet at a view phi:\n{ir}"
+    );
 }
 
 #[test]
@@ -339,8 +356,8 @@ fn missing_return_on_one_path_is_reported() {
 fn milestone_gaps_report_e0007_with_the_milestone_in_the_message() {
     let cases = [
         (
-            "package main\nfn main() { for b in \"abc\" { print(b) } }",
-            "iterating a `string`",
+            "package main\nfn main() { for i, v in 0..3 { print($\"{i}\") } }",
+            "positions belong to arrays",
         ),
         (
             "package main\nfn main() { if true { defer println(\"x\") } }",
@@ -994,5 +1011,217 @@ fn main() {
     assert!(
         ir.contains("define i32 @make()"),
         "the builtins are the prelude, so the program wins:\n{ir}"
+    );
+}
+
+#[test]
+fn a_string_is_an_address_and_a_count() {
+    let ir = build(
+        "package main
+fn main() {
+    text := \"hello\"
+    println($\"{}\", text.len())
+}",
+    )
+    .expect("builds")
+    .ir_text();
+    assert!(
+        ir.contains("%text = alloca { ptr, i64 }"),
+        "a string is a view in a slot:\n{ir}"
+    );
+    assert!(
+        ir.contains("store { ptr, i64 } { ptr @str, i64 5 }, ptr %text"),
+        "the literal carries its own length:\n{ir}"
+    );
+}
+
+#[test]
+fn a_string_index_reads_a_byte_and_refuses_to_write_one() {
+    let ir = build(
+        "package main
+fn main() {
+    text := \"abc\"
+    println($\"{}\", text[1])
+}",
+    )
+    .expect("builds")
+    .ir_text();
+    assert!(
+        ir.contains("getelementptr i8") && ir.contains("load i8"),
+        "the byte at an offset:\n{ir}"
+    );
+
+    let errors = build(
+        "package main
+fn main() {
+    text := \"abc\"
+    text[0] = 65
+}",
+    )
+    .expect_err("a string does not write");
+    assert_eq!(errors[0].code, dux_diag::code::TYPE_MISMATCH, "{errors:?}");
+    assert!(
+        errors[0]
+            .note
+            .as_deref()
+            .is_some_and(|note| note.contains("immutable")),
+        "{:?}",
+        errors[0].note
+    );
+}
+
+#[test]
+fn concatenation_allocates_and_copies_both_halves() {
+    let ir = build(
+        "package main
+fn main() {
+    a := \"ab\"
+    b := \"cd\"
+    whole := a + b
+    println(whole)
+    del(whole)
+}",
+    )
+    .expect("builds")
+    .ir_text();
+    assert!(
+        ir.contains("call ptr @dux.runtime.alloc("),
+        "the joined string comes from the context:\n{ir}"
+    );
+    assert!(
+        ir.contains("call void @llvm.memcpy"),
+        "both halves are copied in:\n{ir}"
+    );
+    assert!(
+        ir.contains("add i64") && ir.contains("insertvalue { ptr, i64 }"),
+        "the count is the sum of the two:\n{ir}"
+    );
+}
+
+#[test]
+fn strings_are_equal_when_the_bytes_and_the_lengths_agree() {
+    let ir = build(
+        "package main
+fn main() {
+    a := \"ab\"
+    b := \"cd\"
+    println($\"{}\", a == b)
+}",
+    )
+    .expect("builds")
+    .ir_text();
+    assert!(
+        ir.contains("call i32 @memcmp"),
+        "the common prefix is compared:\n{ir}"
+    );
+    assert!(
+        ir.contains("icmp eq i64") && ir.contains("and i1"),
+        "and then the lengths:\n{ir}"
+    );
+}
+
+#[test]
+fn a_c_string_becomes_a_string_by_measuring_it() {
+    let ir = build(
+        "package main
+fn echo(text: string) {
+    println(text)
+}
+fn main() {
+    echo(c\"bytes\")
+}",
+    )
+    .expect("builds")
+    .ir_text();
+    assert!(
+        ir.contains("call i64 @strlen"),
+        "the count has to be found before the view exists:\n{ir}"
+    );
+    assert!(
+        ir.contains("define void @echo({ ptr, i64 } %0)"),
+        "the parameter is a view:\n{ir}"
+    );
+}
+
+#[test]
+fn a_body_that_adds_text_carries_the_context() {
+    let ir = build(
+        "package main
+fn joins() -> string {
+    a := \"a\"
+    return a + \"b\"
+}
+fn adds() -> i32 {
+    x := 1
+    return x + 2
+}
+fn main() {
+    println(joins())
+    println($\"{}\", adds())
+}",
+    )
+    .expect("builds")
+    .ir_text();
+    assert!(
+        ir.contains("define { ptr, i64 } @joins(ptr %"),
+        "text joins allocate, so the joiner carries a context:\n{ir}"
+    );
+    assert!(
+        ir.contains("define i32 @adds()"),
+        "an ordinary addition does not:\n{ir}"
+    );
+}
+
+#[test]
+fn an_interpolated_string_as_a_value_is_formatted_into_a_block() {
+    let ir = build(
+        "package main
+fn label(name: string) -> string {
+    return $\"{name} is ready\"
+}
+fn main() {
+    text := label(\"dux\")
+    println(text)
+    del(text)
+}",
+    )
+    .expect("builds")
+    .ir_text();
+    assert!(
+        ir.contains("@snprintf(ptr null, i64 0"),
+        "the length is measured first:\n{ir}"
+    );
+    assert!(
+        ir.contains("call ptr @dux.runtime.alloc("),
+        "and then the block is asked for:\n{ir}"
+    );
+    assert!(
+        ir.contains("@snprintf(ptr %"),
+        "the bytes are written into the block:\n{ir}"
+    );
+    assert!(
+        ir.contains("define { ptr, i64 } @label({ ptr, i64 } %0, ptr %"),
+        "building text allocates, so the builder carries a context:\n{ir}"
+    );
+}
+
+#[test]
+fn writing_a_string_needs_no_more_of_a_context_than_printing_one() {
+    let ir = build(
+        "package main
+fn main() {
+    name := \"dux\"
+    println($\"{name} is ready\")
+}",
+    )
+    .expect("builds")
+    .ir_text();
+    assert!(
+        !ir.contains("@snprintf"),
+        "a hole written straight out is formatted in place:\n{ir}"
+    );
+    assert!(
+        !ir.contains("@dux.runtime.alloc"),
+        "and no block is asked for:\n{ir}"
     );
 }

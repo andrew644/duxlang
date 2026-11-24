@@ -214,12 +214,10 @@ impl DuxType {
             DuxType::I64 | DuxType::U64 => context.i64_type().into(),
             DuxType::F32 => context.f32_type().into(),
             DuxType::F64 => context.f64_type().into(),
-            DuxType::Str | DuxType::Ptr | DuxType::Error => {
-                context.ptr_type(AddressSpace::default()).into()
-            }
+            DuxType::Ptr | DuxType::Error => context.ptr_type(AddressSpace::default()).into(),
             DuxType::Pointer(_) => context.ptr_type(AddressSpace::default()).into(),
             DuxType::Array(info) => info.elem.llvm(context).array_type(info.len as u32).into(),
-            DuxType::Slice(_) => context.struct_type(&[context.ptr_type(AddressSpace::default()).into(), context.i64_type().into()], false).into(),
+            DuxType::Slice(_) | DuxType::Str => context.struct_type(&[context.ptr_type(AddressSpace::default()).into(), context.i64_type().into()], false).into(),
             DuxType::Struct(info) => info.llvm.into(),
         }
     }
@@ -559,8 +557,6 @@ pub(crate) struct Emitter {
     is_main: bool,
     dead: bool,
     printf: Option<FunctionValue<'static>>,
-    puts: Option<FunctionValue<'static>>,
-    fputs: Option<FunctionValue<'static>>,
     stdout: Option<inkwell::values::GlobalValue<'static>>,
     sources: SourceMap,
     dibuilder: Option<DebugInfoBuilder<'static>>,
@@ -600,8 +596,6 @@ impl Emitter {
             is_main: false,
             dead: false,
             printf: None,
-            puts: None,
-            fputs: None,
             stdout: None,
             sources,
             dibuilder: None,
@@ -865,14 +859,50 @@ impl Emitter {
             }
         }
 
-        let scans: Vec<Scan> = bodies
-            .iter()
-            .map(|body| {
-                let mut scan = Scan::default();
-                scan.block(body);
-                scan
-            })
-            .collect();
+        // What a name holds, as far as the spelling tells: every function
+        // written as returning a `string`, and every field written as one.
+        let mut text_calls: HashSet<String> = HashSet::new();
+        let mut text: HashSet<String> = HashSet::new();
+        for decl in program.functions() {
+            if decl.return_ty.as_ref().is_some_and(Scan::spelled_text) {
+                text_calls.insert(decl.name.name.clone());
+            }
+        }
+        for item in program.decls.iter() {
+            match item {
+                Decl::Struct(record) => {
+                    for field in &record.fields {
+                        if Scan::spelled_text(&field.ty) {
+                            text.insert(field.name.name.clone());
+                        }
+                    }
+                }
+                Decl::Impl(block) => {
+                    for method in &block.methods {
+                        if method.return_ty.as_ref().is_some_and(Scan::spelled_text) {
+                            text_calls.insert(method.name.name.clone());
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        let mut scans: Vec<Scan> = Vec::new();
+        for (body, params) in bodies.iter().zip(parameter_lists(program)) {
+            let mut scan = Scan {
+                text: text.clone(),
+                text_calls: text_calls.clone(),
+                ..Scan::default()
+            };
+            for param in params {
+                if Scan::spelled_text(&param.ty) {
+                    scan.text.insert(param.name.name.clone());
+                }
+            }
+            scan.block(body);
+            scans.push(scan);
+        }
         let mut by_name: HashMap<&str, Vec<usize>> = HashMap::new();
         for (index, name) in names.iter().enumerate() {
             by_name.entry(name.as_str()).or_default().push(index);
@@ -994,6 +1024,43 @@ impl Emitter {
     /// `new`, `make`, `free` and `del` reach the allocator through the hidden
     /// context. Their first argument names a type, which is not a value the
     /// lowering can otherwise evaluate.
+    /// Bytes from the current context's allocator. The count is in bytes; the
+    /// block comes back uninitialized.
+    fn allocate(
+        &mut self,
+        span: Span,
+        count: IntValue<'static>,
+        align: u32,
+    ) -> Option<PointerValue<'static>> {
+        let Some(alloc) = self.runtime.as_ref().map(|runtime| runtime.alloc) else {
+            self.unsupported(span, "allocating in a program with no memory runtime");
+            return None;
+        };
+        let Some(context) = self.context_value(span) else {
+            self.unsupported(
+                span,
+                "allocating in a function that carries no context",
+            );
+            return None;
+        };
+        let location = self.location(span);
+        self.builder
+            .build_call(
+                alloc,
+                &[
+                    context.into(),
+                    count.into(),
+                    self.context.i64_type().const_int(align as u64, false).into(),
+                    location.into(),
+                ],
+                "alloc",
+            )
+            .ok()?
+            .try_as_basic_value()
+            .basic()
+            .map(|value| value.into_pointer_value())
+    }
+
     fn memory_builtin(
         &mut self,
         module: &Module<'static>,
@@ -1690,7 +1757,7 @@ impl Emitter {
                 }
             },
             Expr::Index { base, index, .. } => {
-                match self.place_of(module, base, index) {
+                match self.place_of(module, base, index, true) {
                     Some(place) => place,
                     None => return,
                 }
@@ -1947,9 +2014,12 @@ impl Emitter {
         let value = phi.as_basic_value();
         Some(if common.is_float() {
             Typed::float(value.into_float_value(), common)
-        } else if common == DuxType::Ptr || common == DuxType::Str {
+        } else if common == DuxType::Ptr {
             Typed::pointer(value.into_pointer_value(), common)
-        } else if self.struct_of(common).is_some() {
+        } else if common == DuxType::Str
+            || common.slice_element().is_some()
+            || self.struct_of(common).is_some()
+        {
             Typed {
                 core: Core::Aggregate(value.into_struct_value()),
                 ty: common,
@@ -2603,21 +2673,12 @@ impl Emitter {
                     Some(info),
                 )
             }
-            None => match iter.ty.slice_element() {
-                Some(element) => {
-                    let Some((data, len)) = self.slice_parts(iter) else {
-                        self.dead = true;
-                        return;
-                    };
-                    (element, data, len, None)
-                }
+            None => match self.view_elements(iter) {
+                Some((element, data, len)) => (element, data, len, None),
                 None => {
                     self.unsupported(
                         iterable.span(),
-                        &format!(
-                            "iterating a `{}` (strings land with the string view)",
-                            iter.ty.name()
-                        ),
+                        &format!("iterating a `{}`", iter.ty.name()),
                     );
                     self.dead = true;
                     return;
@@ -2909,7 +2970,7 @@ impl Emitter {
         if matches!(index, Expr::Range { .. }) {
             return self.subslice(module, base, index, span);
         }
-        let (elem, at) = self.place_of(module, base, index)?;
+        let (elem, at) = self.place_of(module, base, index, false)?;
         self.load(elem, at)
     }
 
@@ -2920,9 +2981,35 @@ impl Emitter {
         module: &Module<'static>,
         base: &Expr,
         index: &Expr,
+        writable: bool,
     ) -> Option<(DuxType, PointerValue<'static>)> {
         let base_span = base.span();
         let base = self.expr(module, base, None)?;
+        if base.ty == DuxType::Str {
+            if writable {
+                self.diagnostics.push(
+                    Diagnostic::error(
+                        code::TYPE_MISMATCH,
+                        "a `string` does not write through its bytes".to_string(),
+                    )
+                    .with_span(base_span)
+                    .with_note("strings are immutable; make a `[]u8` if the bytes are yours"),
+                );
+                return None;
+            }
+            let (_, data, _) = self.view_elements(base)?;
+            let index_value = self.expr(module, index, None)?;
+            if index_value.ty == DuxType::Error {
+                return None;
+            }
+            let index64 = self.index_to_i64(index_value, index.span())?;
+            let at = unsafe {
+                self.builder
+                    .build_gep(DuxType::U8.llvm(self.context), data, &[index64.int_value()?], "byte")
+            }
+            .ok()?;
+            return Some((DuxType::U8, at));
+        }
         if let Some(element) = base.ty.slice_element() {
             let (data, _) = self.slice_parts(base)?;
             let index_value = self.expr(module, index, None)?;
@@ -3054,7 +3141,7 @@ impl Emitter {
                 let (index, field_ty) = self.field_of(info, &name.name, name.span)?;
                 Some((field_ty, self.field_address(info, at, index)?))
             }
-            Expr::Index { base, index, .. } => self.place_of(module, base, index),
+            Expr::Index { base, index, .. } => self.place_of(module, base, index, false),
             Expr::Unary {
                 op: UnaryOp::Load,
                 operand,
@@ -3117,11 +3204,11 @@ impl Emitter {
     }
 
     /// The `{ data, len }` shape every view shares.
-    fn view_llvm(&self) -> StructType<'static> {
-        self.context.struct_type(
+    fn view_llvm(context: &'static Context) -> StructType<'static> {
+        context.struct_type(
             &[
-                self.context.ptr_type(AddressSpace::default()).into(),
-                self.context.i64_type().into(),
+                context.ptr_type(AddressSpace::default()).into(),
+                context.i64_type().into(),
             ],
             false,
         )
@@ -3134,8 +3221,18 @@ impl Emitter {
         data: PointerValue<'static>,
         len: IntValue<'static>,
     ) -> Typed {
-        let ty = DuxType::Slice(Box::leak(Box::new(element)));
-        let mut value = self.view_llvm().get_undef();
+        self.view_as(DuxType::Slice(Box::leak(Box::new(element))), data, len)
+    }
+
+    /// Put an address and a count together as `ty`, which had better be one of
+    /// the two things shaped like a view.
+    fn view_as(
+        &mut self,
+        ty: DuxType,
+        data: PointerValue<'static>,
+        len: IntValue<'static>,
+    ) -> Typed {
+        let mut value = Self::view_llvm(self.context).get_undef();
         if let Ok(inserted) =
             self.builder
                 .build_insert_value(value, data.as_basic_value_enum(), 0, "view.data")
@@ -3154,6 +3251,17 @@ impl Emitter {
         }
     }
 
+    /// What a view steps over: the elements of a slice, the bytes of a string.
+    fn view_elements(&mut self, value: Typed) -> Option<(DuxType, PointerValue<'static>, IntValue<'static>)> {
+        let element = if value.ty == DuxType::Str {
+            DuxType::U8
+        } else {
+            value.ty.slice_element()?
+        };
+        let (data, len) = self.slice_parts(value)?;
+        Some((element, data, len))
+    }
+
     /// The address and the count a view carries.
     fn slice_parts(&mut self, value: Typed) -> Option<(PointerValue<'static>, IntValue<'static>)> {
         let Core::Aggregate(value) = value.core else {
@@ -3161,7 +3269,7 @@ impl Emitter {
                 // A view that lives in a slot: read it out first.
                 let loaded = self
                     .builder
-                    .build_load(self.view_llvm(), at, "view")
+                    .build_load(Self::view_llvm(self.context), at, "view")
                     .ok()?;
                 return self.slice_parts(Typed {
                     core: Core::Aggregate(loaded.into_struct_value()),
@@ -3201,9 +3309,10 @@ impl Emitter {
         span: Span,
     ) -> Option<Typed> {
         let value = self.expr(module, base, None)?;
+        let is_text = value.ty == DuxType::Str;
         let view = if value.ty.array_info().is_some() {
             self.view_of_array(value)?
-        } else if value.ty.slice_element().is_some() {
+        } else if value.ty.slice_element().is_some() || is_text {
             value
         } else {
             self.diagnostics.push(
@@ -3218,7 +3327,11 @@ impl Emitter {
             );
             return None;
         };
-        let element = view.ty.slice_element()?;
+        let element = if is_text {
+            DuxType::U8
+        } else {
+            view.ty.slice_element()?
+        };
         let (data, len) = self.slice_parts(view)?;
         let Expr::Range { start, end, .. } = range else {
             return None;
@@ -3242,6 +3355,9 @@ impl Emitter {
         let Ok(count) = self.builder.build_int_sub(to, from, "view.len") else {
             return None;
         };
+        if is_text {
+            return Some(self.view_as(DuxType::Str, data, count));
+        }
         Some(self.view(element, data, count))
     }
 
@@ -3574,7 +3690,7 @@ impl Emitter {
                 self.context.i32_type().const_int(*value as u32 as u64, false),
                 DuxType::I32,
             )),
-            Expr::Str { text, span, .. } => Some(self.string_literal(text, *span)),
+            Expr::Str { text, kind, span } => Some(self.string_literal(text, *kind, *span)),
             Expr::Ident { name, span } => {
                 if let Some((ty, slot)) = self.slot_of(name) {
                     return self.load(ty, slot);
@@ -3640,12 +3756,8 @@ impl Emitter {
             Expr::StructLiteral { name, fields, span } => {
                 self.struct_literal(module, name, fields, *span)
             }
-            Expr::InterpString { .. } => {
-                self.unsupported(
-                    expr.span(),
-                    "an interpolated string outside `print`/`println` (string building lands at M3)",
-                );
-                None
+            Expr::InterpString { parts, .. } => {
+                self.build_text(module, parts, &[], expr.span())
             }
             other => {
                 self.unsupported(other.span(), expression_name(other));
@@ -3654,7 +3766,38 @@ impl Emitter {
         }
     }
 
-    fn string_literal(&mut self, text: &str, span: Span) -> Typed {
+    /// Bytes in read-only storage, and how many of them the string sees. The
+    /// stored bytes keep their NUL, so the same address serves a C `const
+    /// char *`; the length next to it is what makes this a `string`.
+    fn string_literal(&mut self, text: &str, kind: dux_ast::StrKind, span: Span) -> Typed {
+        let bytes = match self.builder.build_global_string_ptr(text, "str") {
+            Ok(global) => global.as_pointer_value(),
+            Err(e) => {
+                self.diagnostics.push(
+                    Diagnostic::error(
+                        code::CODEGEN_FAILED,
+                        format!("failed to emit the string literal: {e}"),
+                    )
+                    .with_span(span),
+                );
+                return Typed::error();
+            }
+        };
+        if matches!(kind, dux_ast::StrKind::CString) {
+            return Typed::pointer(bytes, DuxType::Ptr);
+        }
+        let length = self.context.i64_type().const_int(text.len() as u64, false);
+        Typed {
+            core: Core::Aggregate(self.context.const_struct(
+                &[bytes.into(), length.into()],
+                false,
+            )),
+            ty: DuxType::Str,
+        }
+    }
+
+    #[allow(dead_code)]
+    fn unused_string_literal(&mut self, text: &str, span: Span) -> Typed {
         match self.builder.build_global_string_ptr(text, "str") {
             Ok(global) => Typed::pointer(global.as_pointer_value(), DuxType::Str),
             Err(e) => {
@@ -3777,6 +3920,118 @@ impl Emitter {
         }
     }
 
+    /// `+` joins two strings into a new one from the context's allocator; the
+    /// comparisons read the bytes and then the lengths, which is what `==` has
+    /// always meant for a string.
+    fn text_binary(
+        &mut self,
+        module: &Module<'static>,
+        op: BinaryOp,
+        left: Typed,
+        right: Typed,
+        span: Span,
+    ) -> Option<Typed> {
+        if left.ty != DuxType::Str || right.ty != DuxType::Str {
+            self.unsupported(
+                span,
+                "mixing a string with something that is not one (there is no implicit text)",
+            );
+            return None;
+        }
+        let (head, head_len) = self.slice_parts(left)?;
+        let (tail, tail_len) = self.slice_parts(right)?;
+        if op != BinaryOp::Add {
+            let same = self.same_text(module, head, head_len, tail, tail_len)?;
+            let holds = match op {
+                BinaryOp::Eq => same,
+                BinaryOp::NotEq => self.builder.build_not(same, "text.ne").ok()?,
+                _ => {
+                    // The checker sends ordering to `strings.less`, so only
+                    // equality reaches here.
+                    self.unsupported(span, "this operator on strings");
+                    return None;
+                }
+            };
+            return Some(Typed::int(holds, DuxType::Bool));
+        }
+        let total = self
+            .builder
+            .build_int_add(head_len, tail_len, "text.len")
+            .ok()?;
+        let data = self.allocate(span, total, 1)?;
+        self.builder
+            .build_memcpy(data, 1, head, 1, head_len)
+            .ok()?;
+        let joined = unsafe {
+            self.builder
+                .build_gep(DuxType::U8.llvm(self.context), data, &[head_len], "text.tail")
+        }
+        .ok()?;
+        self.builder
+            .build_memcpy(joined, 1, tail, 1, tail_len)
+            .ok()?;
+        Some(self.view_as(DuxType::Str, data, total))
+    }
+
+    /// Equal when the common prefix matches and the lengths agree.
+    fn same_text(
+        &mut self,
+        module: &Module<'static>,
+        left: PointerValue<'static>,
+        left_len: IntValue<'static>,
+        right: PointerValue<'static>,
+        right_len: IntValue<'static>,
+    ) -> Option<IntValue<'static>> {
+        let i64_type = self.context.i64_type();
+        let prefix = self
+            .builder
+            .build_select(
+                self.builder
+                    .build_int_compare(IntPredicate::ULT, left_len, right_len, "text.short")
+                    .ok()?,
+                left_len,
+                right_len,
+                "text.prefix",
+            )
+            .ok()?
+            .into_int_value();
+        let memcmp = self.declare_c(
+            module,
+            "memcmp",
+            self.context.i32_type().fn_type(
+                &[
+                    self.context.ptr_type(AddressSpace::default()).into(),
+                    self.context.ptr_type(AddressSpace::default()).into(),
+                    i64_type.into(),
+                ],
+                false,
+            ),
+        );
+        let bytes = self
+            .builder
+            .build_call(memcmp, &[left.into(), right.into(), prefix.into()], "text.cmp")
+            .ok()?
+            .try_as_basic_value()
+            .basic()
+            .map(|value| value.into_int_value())?;
+        let lengths_agree = self
+            .builder
+            .build_int_compare(IntPredicate::EQ, left_len, right_len, "text.same")
+            .ok()?;
+        let prefix_matches = self
+            .builder
+            .build_int_compare(
+                IntPredicate::EQ,
+                bytes,
+                self.context.i32_type().const_zero(),
+                "text.diff",
+            )
+            .ok()?;
+        self.builder
+            .build_and(lengths_agree, prefix_matches, "text.eq")
+            .ok()
+    }
+
     fn binary(
         &mut self,
         module: &Module<'static>,
@@ -3796,11 +4051,7 @@ impl Emitter {
             return self.pointer_binary(op, left, right, span);
         }
         if left.ty == DuxType::Str || right.ty == DuxType::Str {
-            self.unsupported(
-                span,
-                "`+`/`==` on strings (string operations land with the `strings` prelude at M5)",
-            );
-            return None;
+            return self.text_binary(module, op, left, right, span);
         }
         if !left.ty.is_numeric() || !right.ty.is_numeric() {
             let bad = if !left.ty.is_numeric() {
@@ -4138,6 +4389,37 @@ impl Emitter {
         Some(Typed::int(phi.as_basic_value().into_int_value(), DuxType::Bool))
     }
 
+    /// The one conversion that runs code: measuring a C string. A `string` is
+    /// bytes plus a count, and a NUL-terminated address only has the first, so
+    /// the count has to be found before the view can exist.
+    fn bytes_to_text(
+        &mut self,
+        module: &Module<'static>,
+        value: Typed,
+        to: DuxType,
+    ) -> Option<Typed> {
+        if value.ty != DuxType::Ptr || to != DuxType::Str {
+            return None;
+        }
+        let data = value.pointer_value()?;
+        let strlen = self.declare_c(
+            module,
+            "strlen",
+            self.context.i64_type().fn_type(
+                &[self.context.ptr_type(AddressSpace::default()).into()],
+                false,
+            ),
+        );
+        let length = self
+            .builder
+            .build_call(strlen, &[data.into()], "strlen")
+            .ok()?
+            .try_as_basic_value()
+            .basic()
+            .map(|value| value.into_int_value())?;
+        Some(self.view_as(DuxType::Str, data, length))
+    }
+
     fn cast(&mut self, module: &Module<'static>, target: &Expr, ty: &Type) -> Option<Typed> {
         let value = self.expr(module, target, None)?;
         let Some(to) = self.type_of(ty) else {
@@ -4149,6 +4431,9 @@ impl Emitter {
                 core: value.core,
                 ty: DuxType::Error,
             });
+        }
+        if let Some(text) = self.bytes_to_text(module, value, to) {
+            return Some(text);
         }
         match self.convert(value, to) {
             Some(cast) => Some(cast),
@@ -4194,6 +4479,9 @@ impl Emitter {
             }
         }
         if self.lossless(value.ty, to) {
+            if let Some(text) = self.bytes_to_text(_module, value, to) {
+                return Some(text);
+            }
             return self.convert(value, to);
         }
         self.diagnostics.push(
@@ -4317,12 +4605,13 @@ impl Emitter {
                 .ok()?;
             return Some(Typed::int(cast, to));
         }
-        if (from == DuxType::Ptr || from == DuxType::Str) && (to == DuxType::Ptr || to == DuxType::Str) {
-            return Some(Typed {
-                core: value.core,
-                ty: to,
-            });
+        if from == DuxType::Str && to == DuxType::Ptr {
+            // The bytes of a string are a valid C string only when they hold
+            // no NUL; `as` hands the address over and trusts the program.
+            let (data, _) = self.slice_parts(value)?;
+            return Some(Typed::pointer(data, to));
         }
+
         if from.is_pointer_like() && to.is_pointer_like() {
             return Some(Typed {
                 core: value.core,
@@ -4587,7 +4876,9 @@ impl Emitter {
                 ty: DuxType::U64,
             });
         }
-        base_ty.slice_element()?;
+        if base_ty != DuxType::Str {
+            base_ty.slice_element()?;
+        }
         let at = base_at?;
         let view = self.load(base_ty, at)?;
         let (_, len) = self.slice_parts(view)?;
@@ -4683,8 +4974,10 @@ impl Emitter {
     ) -> Option<Typed> {
         if args.is_empty() {
             if name == "println" {
-                let empty = self.string_literal("", span);
-                return self.puts(module, empty).map(|_| Typed::void());
+                let empty = self.string_literal("", dux_ast::StrKind::Utf8, span);
+                return self
+                    .write_text(module, empty, true)
+                    .map(|_| Typed::void());
             }
             self.unsupported(span, "`print` with no argument");
             return None;
@@ -4698,13 +4991,9 @@ impl Emitter {
                     );
                     return None;
                 }
-                let literal = self.string_literal(text, *arg_span);
-                if name == "println" {
-                    self.puts(module, literal)
-                } else {
-                    self.fputs(module, literal)
-                }
-                .map(|_| Typed::void())
+                let literal = self.string_literal(text, dux_ast::StrKind::Utf8, *arg_span);
+                self.write_text(module, literal, name == "println")
+                    .map(|_| Typed::void())
             }
             Expr::InterpString { parts, .. } => {
                 if name == "println" {
@@ -4724,45 +5013,54 @@ impl Emitter {
                 }
                 let value = self.expr(module, other, None)?;
                 if value.ty != DuxType::Str {
-                    self.unsupported(
-                        other.span(),
-                        &format!(
-                            "printing a `{}` directly (wrap it in a $\"..\" string)",
-                            value.ty.name()
-                        ),
+                    self.diagnostics.push(
+                        Diagnostic::error(
+                            code::TYPE_MISMATCH,
+                            format!(
+                                "`{name}` writes text, and a `{}` is not text",
+                                value.ty.name()
+                            ),
+                        )
+                        .with_span(other.span())
+                        .with_note("write `$\"{}\"` to format a value as text"),
                     );
                     return None;
                 }
-                if name == "println" {
-                    self.puts(module, value)
-                } else {
-                    self.fputs(module, value)
-                }
-                .map(|_| Typed::void())
+                self.write_text(module, value, name == "println")
+                    .map(|_| Typed::void())
             }
         }
     }
 
-    fn puts(&mut self, module: &Module<'static>, value: Typed) -> Option<()> {
-        let puts = self.puts_fn(module);
-        let _ = self
-            .builder
-            .build_call(puts, &[value.pointer_value()?.into()], "write")
-            .ok()?;
-        Some(())
-    }
-
-    fn fputs(&mut self, module: &Module<'static>, value: Typed) -> Option<()> {
-        let fputs = self.fputs_fn(module);
+    /// A string view writes the bytes it sees. A NUL terminator is not
+    /// involved: it is the length that says where the string ends, and the
+    /// bytes may contain anything.
+    fn write_text(&mut self, module: &Module<'static>, value: Typed, newline: bool) -> Option<()> {
+        let (data, len) = self.slice_parts(value)?;
         let stream = self.stdout_stream(module)?;
+        let i64_type = self.context.i64_type();
+        let fwrite = self.fwrite_fn(module);
         let _ = self
             .builder
             .build_call(
-                fputs,
-                &[value.pointer_value()?.into(), stream.into()],
+                fwrite,
+                &[
+                    data.into(),
+                    i64_type.const_int(1, false).into(),
+                    len.into(),
+                    stream.into(),
+                ],
                 "write",
             )
             .ok()?;
+        if newline {
+            let fputc = self.fputc_fn(module);
+            let newline = self.context.i32_type().const_int(10, false);
+            let _ = self
+                .builder
+                .build_call(fputc, &[newline.into(), stream.into()], "newline")
+                .ok()?;
+        }
         Some(())
     }
 
@@ -4836,15 +5134,16 @@ impl Emitter {
 
     /// Emit a printf call for an interpolated string whose hole values are
     /// already lowered — the same path `defer` replays.
-    fn write_prepared(
+    /// The format string an interpolated string means, and the arguments its
+    /// holes contribute. Text keeps its shape, with `%` escaped.
+    fn text_format(
         &mut self,
-        module: &Module<'static>,
         parts: &[InterpolationPart],
         values: &[Typed],
-        newline: bool,
         span: Span,
-    ) -> Option<()> {
+    ) -> Option<(String, Vec<BasicMetadataValueEnum<'static>>)> {
         let mut format = String::new();
+        let mut prepared: Vec<Typed> = Vec::new();
         let mut next_value = 0usize;
         for part in parts {
             match part {
@@ -4871,10 +5170,11 @@ impl Emitter {
                     next_value += 1;
                     format.push('%');
                     let spec = spec_for(value.ty).or_else(|| {
-                        self.unsupported(span, "printing a value in a $\"..\" hole");
+                        self.unsupported(span, "formatting a value in a $\"..\" hole");
                         None
                     })?;
                     format.push_str(spec);
+                    prepared.push(*value);
                 }
             }
         }
@@ -4892,6 +5192,22 @@ impl Emitter {
             );
             return None;
         }
+        let mut arguments: Vec<BasicMetadataValueEnum> = Vec::new();
+        for value in prepared {
+            arguments.extend(self.prepare_for_format(value, span)?);
+        }
+        Some((format, arguments))
+    }
+
+    fn write_prepared(
+        &mut self,
+        module: &Module<'static>,
+        parts: &[InterpolationPart],
+        values: &[Typed],
+        newline: bool,
+        span: Span,
+    ) -> Option<()> {
+        let (mut format, mut arguments) = self.text_format(parts, values, span)?;
         if newline {
             format.push('\n');
         }
@@ -4908,11 +5224,7 @@ impl Emitter {
                 return None;
             }
         };
-        let mut arguments: Vec<BasicMetadataValueEnum> = vec![format_ptr.into()];
-        for value in values {
-            let prepared = self.prepare_for_format(*value, span)?;
-            arguments.push(prepared.into());
-        }
+        arguments.insert(0, format_ptr.into());
         let printf = self.printf_fn(module);
         let _ = self
             .builder
@@ -4921,11 +5233,71 @@ impl Emitter {
         Some(())
     }
 
+    /// `$".."` where a value is expected: formatted into a block the context
+    /// owns. The count comes from a measurement pass, which is what the C
+    /// library does when handed a zero-length buffer.
+    fn build_text(
+        &mut self,
+        module: &Module<'static>,
+        parts: &[InterpolationPart],
+        positional: &[Expr],
+        span: Span,
+    ) -> Option<Typed> {
+        let values = self.lower_holes(module, parts, positional, span)?;
+        let (format, arguments) = self.text_format(parts, &values, span)?;
+        let format_ptr = match self.builder.build_global_string_ptr(&format, "text") {
+            Ok(global) => global.as_pointer_value(),
+            Err(e) => {
+                self.diagnostics.push(
+                    Diagnostic::error(
+                        code::CODEGEN_FAILED,
+                        format!("failed to emit the format string: {e}"),
+                    )
+                    .with_span(span),
+                );
+                return None;
+            }
+        };
+        let snprintf = self.snprintf_fn(module);
+        let null = self.context.ptr_type(AddressSpace::default()).const_null();
+        let zero = self.context.i64_type().const_zero();
+        let mut measuring: Vec<BasicMetadataValueEnum> =
+            vec![null.into(), zero.into(), format_ptr.into()];
+        measuring.extend(arguments.iter().copied());
+        let needed = self
+            .builder
+            .build_call(snprintf, &measuring, "measure")
+            .ok()?
+            .try_as_basic_value()
+            .basic()
+            .map(|value| value.into_int_value())?;
+        let i64_type = self.context.i64_type();
+        let length = self
+            .builder
+            .build_int_cast_sign_flag(needed, i64_type, true, "text.length")
+            .ok()?;
+        let room = self
+            .builder
+            .build_int_add(length, i64_type.const_int(1, false), "text.room")
+            .ok()?;
+        let data = self.allocate(span, room, 1)?;
+        let mut writing: Vec<BasicMetadataValueEnum> =
+            vec![data.into(), room.into(), format_ptr.into()];
+        writing.extend(arguments.iter().copied());
+        let _ = self
+            .builder
+            .build_call(snprintf, &writing, "format")
+            .ok()?;
+        Some(self.view_as(DuxType::Str, data, length))
+    }
+
+    /// The arguments one hole contributes to the format string. A string view
+    /// is two of them: `%.*s` wants the count and then the bytes.
     fn prepare_for_format(
         &mut self,
         value: Typed,
         span: Span,
-    ) -> Option<BasicValueEnum<'static>> {
+    ) -> Option<Vec<BasicMetadataValueEnum<'static>>> {
         match value.ty {
             DuxType::Bool => {
                 let true_text = self
@@ -4942,7 +5314,15 @@ impl Emitter {
                     .builder
                     .build_select(value.int_value()?, true_text, false_text, "boolstr")
                     .ok()?;
-                Some(selected.into_pointer_value().into())
+                Some(vec![selected.into_pointer_value().into()])
+            }
+            DuxType::Str => {
+                let (data, len) = self.slice_parts(value)?;
+                let count = self
+                    .builder
+                    .build_int_cast(len, self.context.i32_type(), "precision")
+                    .ok()?;
+                Some(vec![count.into(), data.into()])
             }
             DuxType::I8 | DuxType::I16 => {
                 let widened = self
@@ -4954,7 +5334,7 @@ impl Emitter {
                         "promote",
                     )
                     .ok()?;
-                Some(widened.into())
+                Some(vec![widened.into()])
             }
             DuxType::U8 | DuxType::U16 => {
                 let widened = self
@@ -4966,14 +5346,14 @@ impl Emitter {
                         "promote",
                     )
                     .ok()?;
-                Some(widened.into())
+                Some(vec![widened.into()])
             }
             DuxType::F32 => {
                 let widened = self
                     .builder
                     .build_float_ext(value.float_value()?, self.context.f64_type(), "promote")
                     .ok()?;
-                Some(widened.into())
+                Some(vec![widened.into()])
             }
             DuxType::Array(..) => {
                 self.unsupported(
@@ -4992,7 +5372,7 @@ impl Emitter {
                 );
                 None
             }
-            _ => value.basic(),
+            _ => value.basic().map(|one| vec![one.into()]),
         }
     }
 }
@@ -5078,29 +5458,30 @@ impl Emitter {
         fn_value
     }
 
-    fn puts_fn(&mut self, module: &Module<'static>) -> FunctionValue<'static> {
-        if let Some(puts) = self.puts {
-            return puts;
-        }
+    fn snprintf_fn(&mut self, module: &Module<'static>) -> FunctionValue<'static> {
         let c_char = self.context.ptr_type(AddressSpace::default());
-        let fn_type = self.context.i32_type().fn_type(&[c_char.into()], false);
-        let fn_value = declared(module, "puts", fn_type);
-        self.puts = Some(fn_value);
-        fn_value
+        let size = self.context.i64_type();
+        let fn_type =
+            self.context
+                .i32_type()
+                .fn_type(&[c_char.into(), size.into(), c_char.into()], true);
+        self.declare_c(module, "snprintf", fn_type)
     }
 
-    fn fputs_fn(&mut self, module: &Module<'static>) -> FunctionValue<'static> {
-        if let Some(fputs) = self.fputs {
-            return fputs;
-        }
+    fn fwrite_fn(&mut self, module: &Module<'static>) -> FunctionValue<'static> {
+        let c_char = self.context.ptr_type(AddressSpace::default());
+        let size = self.context.i64_type();
+        let fn_type = size.fn_type(&[c_char.into(), size.into(), size.into(), c_char.into()], false);
+        declared(module, "fwrite", fn_type)
+    }
+
+    fn fputc_fn(&mut self, module: &Module<'static>) -> FunctionValue<'static> {
         let c_char = self.context.ptr_type(AddressSpace::default());
         let fn_type = self
             .context
             .i32_type()
-            .fn_type(&[c_char.into(), c_char.into()], false);
-        let fn_value = declared(module, "fputs", fn_type);
-        self.fputs = Some(fn_value);
-        fn_value
+            .fn_type(&[self.context.i32_type().into(), c_char.into()], false);
+        declared(module, "fputc", fn_type)
     }
 
     fn stdout_stream(&mut self, module: &Module<'static>) -> Option<PointerValue<'static>> {
@@ -5423,7 +5804,7 @@ impl Emitter {
                 self.context.bool_type().const_int(u64::from(*b), false),
                 DuxType::Bool,
             ),
-            ConstValue::Str(text) => self.string_literal(text, span),
+            ConstValue::Str(text) => self.string_literal(text, dux_ast::StrKind::Utf8, span),
             ConstValue::Struct(_) => {
                 self.diagnostics.push(
                     Diagnostic::error(
@@ -5509,7 +5890,7 @@ fn spec_for(ty: DuxType) -> Option<&'static str> {
         DuxType::I64 => "ld",
         DuxType::U64 => "lu",
         DuxType::F32 | DuxType::F64 => "g",
-        DuxType::Str => "s",
+        DuxType::Str => ".*s",
         DuxType::Ptr | DuxType::Pointer(_) => "p",
         DuxType::Array(..) | DuxType::Struct(..) | DuxType::Slice(_) | DuxType::Error => {
             return None
@@ -5530,9 +5911,25 @@ fn expression_name(expr: &Expr) -> &'static str {
 }
 
 /// What a function body contributes to the allocation analysis.
+/// The parameters of every function and method, in the order
+/// `allocation_analysis` walks them.
+fn parameter_lists(program: &Program) -> impl Iterator<Item = &[dux_ast::Param]> {
+    let free = program.functions().map(|decl| decl.params.as_slice());
+    let methods = program
+        .decls
+        .iter()
+        .filter_map(|decl| match decl {
+            Decl::Impl(block) => Some(block),
+            _ => None,
+        })
+        .flat_map(|block| block.methods.iter())
+        .map(|method| method.params.as_slice());
+    free.chain(methods)
+}
+
 #[derive(Default)]
 struct Scan {
-    /// A call to `new`, `make`, `free` or `del`.
+    /// A call to `new`, `make`, `free` or `del`, or a `+` that joins text.
     allocates: bool,
     /// A read or rebinding of `context`.
     reads_context: bool,
@@ -5540,6 +5937,22 @@ struct Scan {
     rebinds_context: bool,
     /// The callees written in the body, by the name they are written with.
     calls: Vec<String>,
+    /// Names this body holds text in: `string` parameters, bindings that begin
+    /// from text, and the fields of any record that declares a `string`.
+    text: HashSet<String>,
+    /// Functions and methods written as returning a `string`.
+    text_calls: HashSet<String>,
+    /// Inside the arguments of `print`/`println`, where an interpolated string
+    /// is written out rather than built, and so allocates nothing.
+    in_write: bool,
+}
+
+impl Scan {
+    /// A type written as `string`. The walk that decides who carries a context
+    /// runs before any types exist, so it reads the spelling.
+    fn spelled_text(ty: &Type) -> bool {
+        matches!(ty, Type::Named { name, .. } if name == "string")
+    }
 }
 
 impl Scan {
@@ -5549,11 +5962,41 @@ impl Scan {
         }
     }
 
+    /// The value a name will hold, as far as a nameless walk can tell.
+    fn is_text(&self, expr: &Expr) -> bool {
+        match expr {
+            Expr::Str { kind, .. } => !matches!(kind, dux_ast::StrKind::CString),
+            Expr::InterpString { .. } => true,
+            Expr::Ident { name, .. } => self.text.contains(name),
+            Expr::Paren { inner, .. } => self.is_text(inner),
+            Expr::Cast { target, .. } => Self::spelled_text(target),
+            Expr::Field { name, .. } => self.text.contains(&name.name),
+            Expr::Index { base, index, .. } => {
+                matches!(&**index, Expr::Range { .. }) && self.is_text(base)
+            }
+            Expr::Block { value, .. } => self.is_text(value),
+            Expr::Call { callee, .. } => matches!(
+                &**callee,
+                Expr::Ident { name, .. } if self.text_calls.contains(name)
+            ),
+            _ => false,
+        }
+    }
+
     fn stmt(&mut self, stmt: &Stmt) {
         match stmt {
-            Stmt::Binding { value, .. } => {
+            Stmt::Binding {
+                name, ty, value, ..
+            } => {
                 if let Some(value) = value {
                     self.expr(value);
+                }
+                let holds_text = ty.as_ref().is_some_and(Self::spelled_text)
+                    || value.as_ref().is_some_and(|value| self.is_text(value));
+                if holds_text {
+                    self.text.insert(name.name.clone());
+                } else {
+                    self.text.remove(&name.name);
                 }
             }
             Stmt::Assign { target, value, .. } => {
@@ -5610,6 +6053,17 @@ impl Scan {
     fn expr(&mut self, expr: &Expr) {
         match expr {
             Expr::Call { callee, args, .. } => {
+                // `print`/`println` format their holes where they stand, which
+                // builds nothing; the walk must not mistake the two.
+                if matches!(callee.as_ref(), Expr::Ident { name, .. } if name == "print" || name == "println")
+                {
+                    self.in_write = true;
+                    for arg in args {
+                        self.expr(arg);
+                    }
+                    self.in_write = false;
+                    return;
+                }
                 match callee.as_ref() {
                     Expr::Ident { name, .. } if matches!(name.as_str(), "new" | "make" | "free" | "del") => {
                         self.allocates = true;
@@ -5626,6 +6080,18 @@ impl Scan {
                 }
             }
             Expr::Ident { name, .. } if name == "context" => self.reads_context = true,
+            Expr::Binary {
+                op: BinaryOp::Add,
+                lhs,
+                rhs,
+                ..
+            } => {
+                if self.is_text(lhs) || self.is_text(rhs) {
+                    self.allocates = true;
+                }
+                self.expr(lhs);
+                self.expr(rhs);
+            }
             Expr::Int { .. }
             | Expr::Float { .. }
             | Expr::Str { .. }
@@ -5663,6 +6129,9 @@ impl Scan {
                 self.expr(value);
             }
             Expr::InterpString { parts, .. } => {
+                if !self.in_write {
+                    self.allocates = true;
+                }
                 for part in parts {
                     if let InterpolationPart::Hole {
                         written: Some(value), ..

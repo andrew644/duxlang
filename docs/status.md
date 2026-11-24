@@ -11,7 +11,7 @@ each remaining gap is waiting for. A gap is a milestone, never a verdict.
 | `structs.dux` | checks clean; `math.sqrt` and an expression body still run | `math` package (M5), expression bodies |
 | `pointers.dux` | checks clean; does not run | `Option<*Node>` (M4) | `match`, `Option` |
 | `memory.dux` | parses | `Vec<string>` on a call path | generics (M5), `mem.Arena` |
-| `strings.dux` | checks clean; does not run | `string` as a view, `+`, `.bytes()` | `string` methods (M3 tail), the standard library |
+| `strings.dux` | checks clean; runs until `.bytes()` | `string` methods (`.bytes()`, `.runes()`) | the standard library (M5) |
 | `sum_types.dux` | parses | `enum` sum types, `match` (M4) |
 | `option_result.dux` | parses | `Option`/`Result` patterns (M4) |
 | `generics.dux` | parses | monomorphisation (M5) |
@@ -19,6 +19,10 @@ each remaining gap is waiting for. A gap is a milestone, never a verdict.
 
 ## Deliberate runtime gaps today
 
+- **Concatenation temporaries are not reclaimed.** `a + b` and `$"{a} {b}"`
+  allocate from the context, and only what is bound can be `del`'d. An arena
+  behind the context — which is what the context is *for* — reclaims them in a
+  block; the malloc-backed debug allocator reports them at exit instead.
 - **No guard pages, no allocation table.** The debug allocator catches a
   double free and reports what is still live at exit, but a wild pointer that
   happens to look like one of ours is not caught, and the leak report gives a

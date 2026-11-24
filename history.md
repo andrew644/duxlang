@@ -664,3 +664,46 @@ trap with exit code 2), and `release_allocator.dux` (a `--release` build that
 must say nothing). Six new IR tests, four new checker tests. `structs.dux`,
 `pointers.dux` and `strings.dux` now pass `duxc check` with no diagnostic;
 `memory.dux` waits on generics (M5). 218 tests, clippy clean.
+
+## Session 11f — M3 step 6: `string` is a view
+
+A `string` was a `ptr` to read-only bytes, which meant every operation that
+needed to know where the text ended had to hope for a NUL that DESIGN says is
+not there. It is now sixteen bytes of `{ data, len }` — the same shape as a
+`[]T`, because it is the same idea over bytes.
+
+A literal carries its own count: `{ ptr @str, i64 5 }`. Writing one out is
+`fwrite(data, 1, len, stdout)`, and a hole in a `$"{}"` becomes `%.*s` with the
+count in front of the address, which is also how a `string` sits in a hole
+next to three other values. `puts` and `fputs` are gone from the lowering; the
+newline is written by `fputc`, of its own accord.
+
+What came with the shape:
+
+- `.len()`, indexing (a `u8`), subslicing (a shorter `string`), and `for b in s`
+  over the bytes. A string index refuses to be written — strings are immutable,
+  and the diagnostic says to take a `[]u8` if the bytes are yours.
+- `+` copies both halves into a block from the context. `==` compares the
+  common prefix with `memcmp` and then the lengths. Ordering is not `<`: the
+  checker sends that to `strings.less`, and codegen never sees it.
+- `$".."` as a *value* measures itself with `snprintf(null, 0, ..)`, asks the
+  context for that many bytes, and formats again. Writing a hole out with
+  `println` still costs no allocation, and the walk that decides who carries a
+  context has to know the difference.
+- `c".."` stays a bare address, because that is what C wants. `p as string`
+  measures with `strlen` — the one conversion that runs code — and
+  `s as *u8` hands out the address and trusts the program to hold no NUL.
+
+The allocation analysis now reads spelling: a body that adds text, or builds an
+interpolated string outside a `print`, carries a context. Names are tracked
+locally — a `string` parameter, a binding that begins from text, a field
+declared `string` — so `x + 1` does not drag a context into an arithmetic
+function. Where the walk cannot tell, codegen says so rather than emitting a
+call with a missing argument.
+
+Proof: `strings.dux` runs with pinned stdout (concatenation, lengths, equality,
+subslicing in a loop, byte iteration, a C string arriving as bytes, a built
+string from a function) and pins that the debug allocator reports the one
+temporary nobody bound; `example/strings.dux` typechecks cleanly and runs until
+`.bytes()`, which is a standard library question. Nine new IR tests, four new
+checker tests. 198 tests, clippy clean.

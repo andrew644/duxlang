@@ -1,0 +1,52 @@
+//@stderr leaked 1 allocation(s)
+// `greeting + " " + audience` makes two strings and only the last one is
+// bound, so the debug allocator reports the temporary it was given.
+
+package main
+
+fn shout(name: string) -> string {
+    loud := name + "!"
+    return loud
+}
+
+fn describe(text: string, count: i64) -> string {
+    return $"{text} x {count}"
+}
+
+fn measure(text: string) -> usize {
+    return text.len()
+}
+
+fn echo(text: string) {
+    println(text)
+}
+
+fn main() {
+    greeting := "hello"
+    audience := "world"
+    whole := greeting + " " + audience
+    println(whole)
+    println($"{whole.len()} bytes")
+    print("inline")
+    println("|")
+    spelled := "hello world"
+    println($"same={whole == spelled}")
+    println($"different={greeting != whole}")
+    for cut in 0..6 {
+        print($"{whole[0..cut]}/")
+    }
+    println("")
+    for b in "abc" {
+        print($"{b} ")
+    }
+    println("")
+    loud := shout(greeting)
+    println(loud)
+    println($"measured={measure(audience)}")
+    echo(c"arrives as bytes")
+    report := describe(greeting, 3)
+    println(report)
+    del(report)
+    del(whole)
+    del(loud)
+}
