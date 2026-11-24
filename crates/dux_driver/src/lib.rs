@@ -152,6 +152,7 @@ fn compile(request: &BuildRequest) -> Result<(Analyzed, CompiledModule, BuiltArt
         });
     }
     let options = Options {
+        debug_allocator: request.opt_level == dux_codegen::OptLevel::None,
         opt_level: request.opt_level,
     };
     let module = match CompiledModule::build_with_line_tables(

@@ -2,6 +2,13 @@ use dux_codegen::{CompiledModule, OptLevel, Options};
 use dux_source::SourceMap;
 
 fn build(source: &str) -> Result<CompiledModule, Vec<dux_diag::Diagnostic>> {
+    build_with(source, Options::default())
+}
+
+fn build_with(
+    source: &str,
+    options: Options,
+) -> Result<CompiledModule, Vec<dux_diag::Diagnostic>> {
     let mut sources = SourceMap::new();
     let file = sources.add("t.dux", source.to_string());
     let lexed = dux_lexer::lex(&sources, file);
@@ -11,13 +18,7 @@ fn build(source: &str) -> Result<CompiledModule, Vec<dux_diag::Diagnostic>> {
         "the fixture should parse: {:?}",
         parsed.diagnostics
     );
-    CompiledModule::build_with_line_tables(
-        &parsed.program,
-        Options {
-            opt_level: OptLevel::None,
-        },
-        &sources,
-    )
+    CompiledModule::build_with_line_tables(&parsed.program, options, &sources)
 }
 
 const HELLO: &str = "package main\nfn main() { println(\"hi\") }";
@@ -68,11 +69,14 @@ fn release_runs_the_new_pass_manager_without_losing_the_program() {
     let file = sources.add("t.dux", HELLO.to_string());
     let lexed = dux_lexer::lex(&sources, file);
     let parsed = dux_parser::parse(&sources, &lexed.tokens);
-    let debug = CompiledModule::build(&parsed.program, Options { opt_level: OptLevel::None })
+    let debug = CompiledModule::build(&parsed.program, Options::default())
         .expect("debug builds")
         .ir_text();
     let release =
-        CompiledModule::build(&parsed.program, Options { opt_level: OptLevel::Balanced })
+        CompiledModule::build(&parsed.program, Options {
+        opt_level: OptLevel::Balanced,
+        debug_allocator: true,
+    })
             .expect("release builds")
             .ir_text();
     assert!(debug.contains("@puts") && release.contains("@puts"));
@@ -837,4 +841,158 @@ fn main() {
     )
     .unwrap_err();
     assert_eq!(errors[0].code, dux_diag::code::TYPE_MISMATCH, "{errors:?}");
+}
+
+#[test]
+fn an_allocating_function_carries_the_context_and_main_creates_one() {
+    let ir = build(
+        "package main
+fn spare() -> *i32 {
+    return new(i32)
+}
+fn main() {
+    p := spare()
+    *p = 3
+    println($\"{}\", *p)
+    free(p)
+}",
+    )
+    .expect("builds")
+    .ir_text();
+    assert!(
+        ir.contains("define internal ptr @dux.runtime.alloc(ptr"),
+        "the allocator is reached through a context:\n{ir}"
+    );
+    assert!(
+        ir.contains("@dux.default_context = global %dux.Context"),
+        "the entry point starts from a default context:\n{ir}"
+    );
+    assert!(
+        ir.contains("store ptr @dux.default_context, ptr %context"),
+        "main binds the default context:\n{ir}"
+    );
+    assert!(
+        ir.contains("call i32 @atexit(ptr @dux.runtime.report)"),
+        "the leak report runs at exit:\n{ir}"
+    );
+    assert!(
+        ir.contains("define ptr @spare(ptr %0)"),
+        "a function that allocates carries the hidden context:\n{ir}"
+    );
+}
+
+#[test]
+fn only_a_function_that_allocates_takes_the_hidden_parameter() {
+    let ir = build(
+        "package main
+fn quiet(x: i32) -> i32 {
+    return x * 2
+}
+fn loud() -> *i32 {
+    return new(i32)
+}
+fn main() {
+    println($\"{}\", quiet(2))
+    p := loud()
+    free(p)
+}",
+    )
+    .expect("builds")
+    .ir_text();
+    assert!(
+        ir.contains("define i32 @quiet(i32"),
+        "a function that never allocates keeps a C-shaped signature:\n{ir}"
+    );
+    assert!(
+        ir.contains("define ptr @loud(ptr"),
+        "a function that allocates carries the context:\n{ir}"
+    );
+}
+
+#[test]
+fn a_release_build_drops_the_debug_bookkeeping() {
+    let ir = build_with(
+        "package main\nfn main() {\n    p := new(i32)\n    free(p)\n}\n",
+        Options {
+            opt_level: OptLevel::Balanced,
+            debug_allocator: false,
+        },
+    )
+    .expect("builds")
+    .ir_text();
+    assert!(
+        !ir.contains("dux.runtime.report"),
+        "no leak reporter in a release build:\n{ir}"
+    );
+    assert!(
+        !ir.contains("@dux.runtime.live"),
+        "no allocation counters in a release build:\n{ir}"
+    );
+    assert!(
+        ir.contains("call ptr @malloc"),
+        "the plain allocator still wraps malloc:\n{ir}"
+    );
+}
+
+#[test]
+fn make_zeroes_the_block_it_hands_back() {
+    let ir = build(
+        "package main
+fn main() {
+    xs := make(i32, 4)
+    println($\"{}\", xs.len())
+    del(xs)
+}",
+    )
+    .expect("builds")
+    .ir_text();
+    assert!(
+        ir.contains("call void @llvm.memset"),
+        "make zeroes what it allocated:\n{ir}"
+    );
+}
+
+#[test]
+fn a_block_that_rebinds_the_context_puts_the_outer_one_back() {
+    let ir = build(
+        "package main
+fn main() {
+    outer := context
+    {
+        context = outer
+        p := new(i32)
+        free(p)
+    }
+    println($\"{}\", 1)
+}",
+    )
+    .expect("builds")
+    .ir_text();
+    assert!(
+        ir.contains("%context.outer = alloca ptr"),
+        "the block saved the outer context:\n{ir}"
+    );
+    assert!(
+        ir.contains("store ptr %context.outer.value, ptr %context"),
+        "the block put the outer context back:\n{ir}"
+    );
+}
+
+#[test]
+fn a_program_may_declare_its_own_make() {
+    let ir = build(
+        "package main
+fn make() -> i32 {
+    return 5
+}
+fn main() {
+    println($\"{}\", make())
+}",
+    )
+    .expect("builds")
+    .ir_text();
+    assert!(
+        ir.contains("define i32 @make()"),
+        "the builtins are the prelude, so the program wins:\n{ir}"
+    );
 }

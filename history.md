@@ -607,3 +607,60 @@ Proof: `slices.dux` runs with pinned stdout (views of arrays, subslicing,
 writing through a view and seeing it in the array, open indexing, iteration
 with and without the position); five new IR tests and two new checker tests.
 The corpus still says nothing but E0007. 186 tests, clippy clean.
+
+## Session 11e — M3 step 5: the context, and what it points at
+
+`new` is not `malloc`. Between "give me four bytes" and the operating system
+sits a decision about *who owns the memory*, and DESIGN makes that decision
+visible: every function that allocates, directly or through a call it makes,
+carries a hidden trailing `context` parameter, and `main` is where the first
+one is created.
+
+The analysis that decides who carries it walks each body for `new`, `make`,
+`free`, `del` and any read or rebinding of `context`, then closes over the call
+graph. Calls are resolved by name and, for a method, against every method of
+that name. That over-approximates on purpose: a hidden parameter nobody sees
+is a cheaper mistake than a call that forgot to pass one. A function marked
+`#[no_context]` never carries it, and asking it to allocate is refused.
+
+The context itself is `{ allocate, release, label }` — three pointers, no more.
+`main` binds the default one, and every allocation loads the procedure pointers
+out of it, so a future `mem.Arena` is not a special case: it is a different
+three pointers in the same shape. A block that rebinds `context` gets the outer
+value back when it ends, including when it leaves through `break` or
+`continue`, which unwinds every block still holding one.
+
+`crates/dux_codegen/src/runtime.rs` emits two allocators.
+
+- The debug allocator heads each block with a magic word and the payload size,
+  counts live allocations and bytes, refuses a `free` of a block it never
+  handed out — including a second `free` of one it did, because releasing
+  poisons the magic — and registers a report of what is still live at exit.
+  Out of memory is fatal and says so.
+- The plain allocator, chosen by `--release`, is `malloc` and `free` with an
+  OOM check. It carries no headers, no counters, no globals.
+
+`new(T)` and `make(T, n)` name a type where a value would normally go, so both
+the checker and the lowering pick that argument apart before treating the call
+as a call. `make` zeroes what it allocated and hands back a view, which is why
+step 4's `{ data, len }` arrived first. `defer free(p)` snapshots the pointer
+at the `defer` and releases it at the exit, through the context the `defer`
+could see.
+
+Sizes come from `getelementptr` on a null element rather than from target data:
+LLVM folds it to a constant, and the lowering keeps its hands off the machine
+description.
+
+Two details worth keeping in mind. The builtins are the prelude, not keywords:
+a program that declares its own `make` wins, and an old test that does exactly
+that caught this. And the leak report goes to stderr while the program's own
+output goes to stdout, so in a pipe the report can appear first.
+
+Proof: four new fixtures run with pinned stdout — `heap.dux` (scalars, records,
+a pointer passed to a function that does not allocate), `make_and_del.dux`
+(slices made on the heap, written, iterated, released through `defer`),
+`leaks.dux` (which must say it leaked one block), `double_free.dux` (which must
+trap with exit code 2), and `release_allocator.dux` (a `--release` build that
+must say nothing). Six new IR tests, four new checker tests. `structs.dux`,
+`pointers.dux` and `strings.dux` now pass `duxc check` with no diagnostic;
+`memory.dux` waits on generics (M5). 218 tests, clippy clean.

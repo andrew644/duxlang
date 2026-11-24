@@ -1,0 +1,12 @@
+//@exit 2
+//@stderr double free
+// A block is poisoned when it is released, so a second free of the same
+// pointer is caught at the second free rather than in a later crash.
+
+fn main() {
+    p := new(i32)
+    *p = 1
+    free(p)
+    free(p)
+    print("unreachable\n")
+}

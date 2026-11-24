@@ -1,0 +1,26 @@
+// M3: heap allocation through the hidden context.
+
+struct Point {
+    x: i32,
+    y: i32,
+    z: i32,
+}
+
+fn bump(p: *i32) {
+    *p += 1
+}
+
+fn main() {
+    single := new(i32)
+    *single = 21
+    bump(single)
+    println($"through new={}", *single)
+    free(single)
+
+    point := new(Point)
+    point.x = 3
+    point.y = 4
+    point.z = 5
+    println($"record {} {} {}", point.x, point.y, point.z)
+    free(point)
+}

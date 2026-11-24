@@ -9,6 +9,7 @@ use inkwell::{OptimizationLevel};
 use std::path::Path;
 
 mod lower;
+mod runtime;
 
 use lower::Emitter;
 
@@ -40,12 +41,16 @@ impl OptLevel {
 #[derive(Copy, Clone, Debug)]
 pub struct Options {
     pub opt_level: OptLevel,
+    /// Head every allocation with bookkeeping so a double free is trapped and
+    /// unreleased memory is reported at exit. Off in a release build.
+    pub debug_allocator: bool,
 }
 
 impl Default for Options {
     fn default() -> Self {
         Self {
             opt_level: OptLevel::None,
+            debug_allocator: true,
         }
     }
 }
@@ -102,7 +107,9 @@ impl CompiledModule {
         module.set_data_layout(&machine.get_target_data().get_data_layout());
 
         select_main(program)?;
-        let diagnostics = Emitter::new(context, sources.clone()).lower(&module, program);
+        let mut emitter = Emitter::new(context, sources.clone());
+        emitter.debug_allocator = options.debug_allocator;
+        let diagnostics = emitter.lower(&module, program);
         if !diagnostics.is_empty() {
             return Err(diagnostics);
         }

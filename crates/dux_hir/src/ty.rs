@@ -235,7 +235,11 @@ fn primitive(name: &str) -> Option<Ty> {
 fn builtin_result(name: &str) -> Option<Ty> {
     match name {
         "print" | "println" => Some(Ty::Unit),
-        "new" | "make" | "free" | "del" => Some(Ty::Opaque),
+        // Checked where the argument is a type: `new(i32)` is not a call with
+        // a value argument, so the shape is picked apart before this.
+        "new" => Some(Ty::Ptr),
+        "make" => Some(Ty::Opaque),
+        "free" | "del" => Some(Ty::Unit),
         _ => None,
     }
 }
@@ -1161,6 +1165,20 @@ impl<'a> Checker<'a> {
         );
     }
 
+    /// The type named as a builtin's first argument, as in `new(Vec3)`.
+    fn type_argument(&mut self, argument: Option<&Expr>) -> Option<Ty> {
+        let Some(Expr::Ident { name, span }) = argument else {
+            return None;
+        };
+        let written = Type::Named {
+            name: name.clone(),
+            args: Vec::new(),
+            span: *span,
+        };
+        let resolved = self.resolve_type(&written);
+        (resolved != Ty::Opaque).then_some(resolved)
+    }
+
     fn call(&mut self, callee: &Expr, args: &[Expr], span: Span) -> Ty {
         let name = match callee {
             Expr::Ident { name, .. } => Some(name.clone()),
@@ -1171,11 +1189,26 @@ impl<'a> Checker<'a> {
             _ => None,
         };
         if let Some(name) = &name {
-            if let Some(result) = builtin_result(name) {
-                for arg in args {
-                    let _ = self.infer(arg);
+            // `new(T)` and `make(T, n)` name a type, not a value, so their
+            // result is known without checking the first argument.
+            if matches!(name.as_str(), "new" | "make") && !self.functions.contains_key(name) {
+                if let Some(element) = self.type_argument(args.first()) {
+                    for argument in args.iter().skip(1) {
+                        let _ = self.infer(argument);
+                    }
+                    return match name.as_str() {
+                        "new" => Ty::Targeted(Box::new(element)),
+                        _ => Ty::Slice(Box::new(element)),
+                    };
                 }
-                return result;
+            }
+            if !self.functions.contains_key(name) {
+                if let Some(result) = builtin_result(name) {
+                    for arg in args {
+                        let _ = self.infer(arg);
+                    }
+                    return result;
+                }
             }
             if matches!(name.as_str(), "Some" | "None" | "Ok" | "Err") {
                 for arg in args {

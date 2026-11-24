@@ -8,9 +8,10 @@
 
 use std::collections::{HashMap, HashSet};
 
+use crate::runtime::Runtime;
 use dux_ast::{
-    BinaryOp, Block, ConstDecl, Decl, Expr, FnDecl, GlobalDecl, InterpolationPart, Program, Stmt,
-    Type, UnaryOp,
+    BinaryOp, Block, ConstDecl, Decl, Expr, FnDecl, ForKind, GlobalDecl, InterpolationPart, Program,
+    Stmt, Type, UnaryOp,
 };
 use dux_diag::{code, Diagnostic};
 use dux_source::{FileId, SourceMap, Span};
@@ -438,6 +439,9 @@ struct Signature {
     /// The receiver of a method, which the call site passes first and the
     /// argument list never mentions.
     receiver: Option<DuxType>,
+    /// The LLVM parameter list ends with the hidden `context` pointer, which
+    /// the argument list never mentions.
+    hidden_context: bool,
 }
 
 /// A `fn` or a method, named the way the lowering names it. A method's key
@@ -497,6 +501,12 @@ enum Deferred {
     Call {
         name: String,
         slots: Vec<(DuxType, PointerValue<'static>)>,
+        hidden_context: bool,
+    },
+    /// `defer free(p)` and `defer del(s)`: the memory is handed back at the
+    /// end of the function, through the context of the `defer`.
+    Release {
+        slot: (DuxType, PointerValue<'static>),
     },
 }
 
@@ -527,6 +537,23 @@ pub(crate) struct Emitter {
     globals: HashMap<String, (DuxType, GlobalValue<'static>)>,
     loops: Vec<Loop>,
     defers: Vec<Deferred>,
+    /// The allocator runtime, emitted when some function in the program
+    /// allocates.
+    runtime: Option<Runtime>,
+    /// Head allocations with bookkeeping and report leaks at exit.
+    pub(crate) debug_allocator: bool,
+    /// Functions that carry the hidden `context` parameter: the ones that
+    /// allocate, directly or through a call.
+    allocating: HashSet<String>,
+    /// The running function's `context` slot, where it keeps the pointer it was
+    /// handed (or, for `main`, the default context it created).
+    context_slot: Option<PointerValue<'static>>,
+    /// Saved outer contexts of the blocks being lowered, innermost last.
+    context_saves: Vec<PointerValue<'static>>,
+    /// The function being lowered, for reading its hidden `context` parameter.
+    running_function: Option<FunctionValue<'static>>,
+    /// C library declarations the generated code leans on.
+    c_functions: HashMap<String, FunctionValue<'static>>,
     allocas: Option<BasicBlock<'static>>,
     result_ty: Option<DuxType>,
     is_main: bool,
@@ -561,6 +588,13 @@ impl Emitter {
             globals: HashMap::new(),
             loops: Vec::new(),
             defers: Vec::new(),
+            runtime: None,
+            debug_allocator: true,
+            allocating: HashSet::new(),
+            context_slot: None,
+            context_saves: Vec::new(),
+            running_function: None,
+            c_functions: HashMap::new(),
             allocas: None,
             result_ty: None,
             is_main: false,
@@ -582,6 +616,14 @@ impl Emitter {
         module: &Module<'static>,
         program: &Program,
     ) -> Vec<Diagnostic> {
+        self.allocating = self.allocation_analysis(program);
+        if !self.allocating.is_empty() {
+            self.runtime = Some(Runtime::emit(
+                self.context,
+                module,
+                self.debug_allocator,
+            ));
+        }
         if !self.sources.is_empty() {
             let file = self
                 .sources
@@ -793,6 +835,340 @@ impl Emitter {
 }
 
 impl Emitter {
+    /// Which functions carry the hidden `context` parameter: the ones that
+    /// allocate, read `context`, or call something that does.
+    ///
+    /// Calls are resolved by name, and a method call against every method of
+    /// that name. Being conservative is safe — a hidden parameter is invisible
+    /// in the source — while missing one would be a miscompiled call.
+    fn allocation_analysis(&self, program: &Program) -> HashSet<String> {
+        let mut keys: Vec<String> = Vec::new();
+        let mut names: Vec<String> = Vec::new();
+        let mut bodies: Vec<&Block> = Vec::new();
+        let mut fixed: Vec<bool> = Vec::new();
+        for decl in program.functions() {
+            keys.push(decl.name.name.clone());
+            names.push(decl.name.name.clone());
+            bodies.push(&decl.body);
+            fixed.push(has_attribute(&decl.attributes, "no_context"));
+        }
+        for item in program.decls.iter().filter_map(|decl| match decl {
+            Decl::Impl(block) => Some(block),
+            _ => None,
+        }) {
+            let owner = item.type_name.name.as_str();
+            for method in &item.methods {
+                keys.push(format!("{owner}.{}", method.name.name));
+                names.push(method.name.name.clone());
+                bodies.push(&method.body);
+                fixed.push(has_attribute(&method.attributes, "no_context"));
+            }
+        }
+
+        let scans: Vec<Scan> = bodies
+            .iter()
+            .map(|body| {
+                let mut scan = Scan::default();
+                scan.block(body);
+                scan
+            })
+            .collect();
+        let mut by_name: HashMap<&str, Vec<usize>> = HashMap::new();
+        for (index, name) in names.iter().enumerate() {
+            by_name.entry(name.as_str()).or_default().push(index);
+        }
+
+        let mut needs: HashSet<usize> = HashSet::new();
+        for (index, scan) in scans.iter().enumerate() {
+            if scan.allocates || scan.reads_context {
+                needs.insert(index);
+            }
+        }
+        loop {
+            let mut grew = false;
+            for (index, scan) in scans.iter().enumerate() {
+                if needs.contains(&index) {
+                    continue;
+                }
+                let follows = scan.calls.iter().any(|call| {
+                    by_name
+                        .get(call.as_str())
+                        .into_iter()
+                        .flatten()
+                        .any(|callee| *callee != index && needs.contains(callee))
+                });
+                if follows {
+                    needs.insert(index);
+                    grew = true;
+                }
+            }
+            if !grew {
+                break;
+            }
+        }
+
+        needs
+            .into_iter()
+            .filter(|index| !fixed[*index])
+            .map(|index| keys[index].clone())
+            .collect()
+    }
+
+    /// The running function's `context`, which every allocation goes through.
+    fn context_value(&mut self, span: Span) -> Option<PointerValue<'static>> {
+        let Some(slot) = self.context_slot else {
+            self.unsupported(
+                span,
+                "allocating in a function that has no `context`: mark it `#[no_context]` \
+                 and take the allocator as an argument",
+            );
+            return None;
+        };
+        self.builder
+            .build_load(self.context.ptr_type(AddressSpace::default()), slot, "context")
+            .ok()
+            .map(|value| value.into_pointer_value())
+    }
+
+    /// Bind `context` for the running function. `main` starts with the default
+    /// context; every other allocating function is handed its caller's.
+    fn bind_context(&mut self, module: &Module<'static>, argument: Option<u32>) {
+        let Some(runtime) = &self.runtime else {
+            return;
+        };
+        let default = runtime.default_context;
+        let report = runtime.report;
+        let pointer_type = self.context.ptr_type(AddressSpace::default());
+        let slot = self.alloca_in_entry(pointer_type.into(), "context");
+        let value = match argument {
+            Some(index) => match self.function_argument(index) {
+                Some(value) => value,
+                None => return,
+            },
+            None => {
+                if let Some(report) = report {
+                    let atexit = self.declare_c(
+                        module,
+                        "atexit",
+                        self.context
+                            .i32_type()
+                            .fn_type(&[pointer_type.into()], false),
+                    );
+                    let _ = self.builder.build_call(
+                        atexit,
+                        &[report.as_global_value().as_pointer_value().into()],
+                        "atexit",
+                    );
+                }
+                default
+            }
+        };
+        let _ = self.builder.build_store(slot, value);
+        self.context_slot = Some(slot);
+        if let Some(scope) = self.scopes.last_mut() {
+            scope.insert("context".to_string(), (DuxType::Ptr, slot));
+        }
+    }
+
+    fn function_argument(&self, index: u32) -> Option<PointerValue<'static>> {
+        let function = self.running_function?;
+        function
+            .get_nth_param(index)
+            .map(|value| value.into_pointer_value())
+    }
+
+    fn declare_c(
+        &mut self,
+        module: &Module<'static>,
+        name: &str,
+        fn_type: inkwell::types::FunctionType<'static>,
+    ) -> FunctionValue<'static> {
+        if let Some(function) = self.c_functions.get(name).copied() {
+            return function;
+        }
+        let function = declared(module, name, fn_type);
+        self.c_functions.insert(name.to_string(), function);
+        function
+    }
+
+    /// `new`, `make`, `free` and `del` reach the allocator through the hidden
+    /// context. Their first argument names a type, which is not a value the
+    /// lowering can otherwise evaluate.
+    fn memory_builtin(
+        &mut self,
+        module: &Module<'static>,
+        name: &str,
+        args: &[Expr],
+        span: Span,
+    ) -> Option<Typed> {
+        let (alloc, free) = match &self.runtime {
+            Some(runtime) => (runtime.alloc, runtime.free),
+            None => {
+                self.unsupported(span, "allocation");
+                return None;
+            }
+        };
+        let context = self.context_value(span)?;
+        let location = self.location(args.first().map_or(span, Expr::span));
+        match name {
+            "new" => {
+                let element = self.type_argument(args.first(), name)?;
+                let llvm = element.llvm(self.context);
+                let size = self.size_of(llvm)?;
+                let align = self.alignment_of(llvm);
+                let pointer = self
+                    .builder
+                    .build_call(
+                        alloc,
+                        &[
+                            context.into(),
+                            size.into(),
+                            self.context.i64_type().const_int(align as u64, false).into(),
+                            location.into(),
+                        ],
+                        "new",
+                    )
+                    .ok()?
+                    .try_as_basic_value()
+                    .basic()
+                    .map(|value| value.into_pointer_value())?;
+                Some(Typed {
+                    core: Core::Ptr(pointer),
+                    ty: self.pointer_to(element),
+                })
+            }
+            "make" => {
+                if args.len() != 2 {
+                    self.diagnostics.push(
+                        Diagnostic::error(
+                            code::WRONG_ARITY,
+                            "`make` takes a type and a length".to_string(),
+                        )
+                        .with_span(span),
+                    );
+                    return None;
+                }
+                let element = self.type_argument(args.first(), name)?;
+                let count = self.expr(module, &args[1], Some(DuxType::I64))?;
+                let Some(count) = count.int_value() else {
+                    self.unsupported(args[1].span(), "a non-integer length for `make`");
+                    return None;
+                };
+                let llvm = element.llvm(self.context);
+                let each = self.size_of(llvm)?;
+                let align = self.alignment_of(llvm);
+                let total = self
+                    .builder
+                    .build_int_mul(each, count, "bytes")
+                    .ok()?;
+                let pointer = self
+                    .builder
+                    .build_call(
+                        alloc,
+                        &[
+                            context.into(),
+                            total.into(),
+                            self.context.i64_type().const_int(align as u64, false).into(),
+                            location.into(),
+                        ],
+                        "make",
+                    )
+                    .ok()?
+                    .try_as_basic_value()
+                    .basic()
+                    .map(|value| value.into_pointer_value())?;
+                let zero = self.context.i8_type().const_zero();
+                let _ = self.builder.build_memset(pointer, align, zero, total);
+                Some(self.view(element, pointer, count))
+            }
+            "free" => {
+                let value = self.expr(module, args.first()?, None)?;
+                let Some(pointer) = value.pointer_value() else {
+                    self.unsupported(args[0].span(), "`free` of something that is not a pointer");
+                    return None;
+                };
+                let _ = self
+                    .builder
+                    .build_call(free, &[context.into(), pointer.into()], "free");
+                Some(Typed::void())
+            }
+            "del" => {
+                let value = self.expr(module, args.first()?, None)?;
+                let Some((pointer, _)) = self.slice_parts(value) else {
+                    self.unsupported(args[0].span(), "`del` of something that is not a slice");
+                    return None;
+                };
+                let _ = self
+                    .builder
+                    .build_call(free, &[context.into(), pointer.into()], "del");
+                Some(Typed::void())
+            }
+            _ => None,
+        }
+    }
+
+    /// The type named as a builtin's first argument, as in `new(Vec3)`.
+    fn type_argument(&mut self, argument: Option<&Expr>, name: &str) -> Option<DuxType> {
+        let Some(Expr::Ident { name: type_name, span }) = argument else {
+            self.unsupported(
+                argument.map_or_else(Span::default, Expr::span),
+                &format!("`{name}` wants a type"),
+            );
+            return None;
+        };
+        let written = Type::Named {
+            name: type_name.clone(),
+            args: Vec::new(),
+            span: *span,
+        };
+        match self.type_of(&written) {
+            Some(ty) => Some(ty),
+            None => {
+                self.unsupported(
+                    *span,
+                    &format!("`{type_name}` is not a type `{name}` knows"),
+                );
+                None
+            }
+        }
+    }
+
+    /// `sizeof` without a target data handle: one past a null element folds to
+    /// a constant the moment LLVM sees it.
+    fn size_of(&mut self, ty: BasicTypeEnum<'static>) -> Option<IntValue<'static>> {
+        let pointer_type = self.context.ptr_type(AddressSpace::default());
+        let one = self.context.i64_type().const_int(1, false);
+        let past = unsafe {
+            self.builder
+                .build_gep(ty, pointer_type.const_null(), &[one], "elements")
+                .ok()?
+        };
+        self.builder
+            .build_ptr_to_int(past, self.context.i64_type(), "size")
+            .ok()
+    }
+
+    /// The alignment the allocator must respect. A fixed shape's alignment is
+    /// its first field's, and no primitive the language has asks for more than
+    /// eight bytes.
+    fn alignment_of(&mut self, ty: BasicTypeEnum<'static>) -> u32 {
+        let size = self.size_of(ty).and_then(|size| size.get_zero_extended_constant());
+        match size {
+            Some(value) if value < 8 => value as u32,
+            _ => 8,
+        }
+    }
+
+    /// A `"file:line"` literal for the allocator's location field.
+    fn location(&mut self, span: Span) -> PointerValue<'static> {
+        let file = self.sources.name_of(span.file).to_string();
+        let line = self.sources.line_col(span.file, span.start).0;
+        self.builder
+            .build_global_string_ptr(&format!("{file}:{line}"), "dux.location")
+            .expect("location")
+            .as_pointer_value()
+    }
+
     fn declare(&mut self, module: &Module<'static>, unit: &Unit) {
         let key = unit.key.clone();
         let external = unit.external;
@@ -825,6 +1201,7 @@ impl Emitter {
                     params: Vec::new(),
                     return_ty: Some(DuxType::I32),
                     receiver: None,
+                    hidden_context: false,
                 },
             );
             return;
@@ -867,18 +1244,32 @@ impl Emitter {
                 }
             },
         };
-        let declared = receiver
+        // An imported function is C's, so its parameter list is exactly what
+        // was written; only a Dux definition carries the hidden context.
+        let hidden_context = !external && self.allocating.contains(&key);
+        let mut declared = receiver
             .iter()
             .chain(params.iter())
             .map(|ty| BasicMetadataTypeEnum::from(ty.llvm(self.context)))
             .collect::<Vec<BasicMetadataTypeEnum>>();
+        if hidden_context {
+            declared.push(self.context.ptr_type(AddressSpace::default()).into());
+        }
         let signature = match return_ty {
             Some(ty) => ty.llvm(self.context).fn_type(&declared, false),
             None => self.context.void_type().fn_type(&declared, false),
         };
         let fn_value = module.add_function(&unit.symbol, signature, None);
         self.functions.insert(key.clone(), fn_value);
-        self.signatures.insert(key, Signature { params, return_ty, receiver });
+        self.signatures.insert(
+            key,
+            Signature {
+                params,
+                return_ty,
+                receiver,
+                hidden_context,
+            },
+        );
     }
 
     /// A parameter the lowering cannot pass by value today.
@@ -928,6 +1319,10 @@ impl Emitter {
         let Some(fn_value) = self.functions.get(key).copied() else {
             return;
         };
+        let hidden_context = self
+            .signatures
+            .get(key)
+            .is_some_and(|signature| signature.hidden_context);
         self.begin_function_debug(function, &unit.symbol, fn_value);
         let return_ty = self.signatures.get(key).and_then(|s| s.return_ty);
         let entry = self.context.append_basic_block(fn_value, "entry");
@@ -945,6 +1340,17 @@ impl Emitter {
         } else {
             return_ty
         };
+
+        self.running_function = Some(fn_value);
+        self.context_slot = None;
+        if self.allocating.contains(key) {
+            let argument = if self.is_main || !hidden_context {
+                None
+            } else {
+                Some(function.params.len() as u32)
+            };
+            self.bind_context(module, argument);
+        }
 
         for (index, param) in function.params.iter().enumerate() {
             let Some(ty) = self.parameter_type(unit, param, index == 0) else {
@@ -981,6 +1387,9 @@ impl Emitter {
             self.finish_function(function);
         }
         self.allocas = None;
+        self.context_slot = None;
+        self.context_saves.clear();
+        self.running_function = None;
     }
 
     fn finish_function(&mut self, function: &FnDecl) {
@@ -1010,13 +1419,91 @@ impl Emitter {
 
     fn block_body(&mut self, module: &Module<'static>, block: &Block) {
         self.scopes.push(HashMap::new());
+        let outer = self.save_context(block);
         for stmt in &block.stmts {
             if self.dead {
                 break;
             }
             self.stmt(module, stmt);
         }
+        self.restore_context(outer);
         self.scopes.pop();
+    }
+
+    /// A block that rebinds `context` gets the outer value back on exit, so
+    /// `context = arena.ctx()` lasts exactly as long as the block that wrote
+    /// it. The saved pointer lives in the entry block, where every slot of the
+    /// function lives.
+    fn save_context(&mut self, block: &Block) -> Option<PointerValue<'static>> {
+        let slot = self.context_slot?;
+        let mut scan = Scan::default();
+        scan.block(block);
+        if !scan.rebinds_context {
+            return None;
+        }
+        let pointer_type = self.context.ptr_type(AddressSpace::default());
+        let saved = self.alloca_in_entry(pointer_type.into(), "context.outer");
+        let outer = self
+            .builder
+            .build_load(pointer_type, slot, "context.outer.value")
+            .ok()?
+            .into_pointer_value();
+        let _ = self.builder.build_store(saved, outer);
+        self.context_saves.push(saved);
+        Some(saved)
+    }
+
+    fn restore_context(&mut self, saved: Option<PointerValue<'static>>) {
+        let Some(saved) = saved else { return };
+        self.context_saves.pop();
+        if self.dead {
+            return;
+        }
+        let Some(slot) = self.context_slot else {
+            return;
+        };
+        let pointer_type = self.context.ptr_type(AddressSpace::default());
+        if self
+            .builder
+            .get_insert_block()
+            .is_some_and(|block| block.get_terminator().is_some())
+        {
+            return;
+        }
+        let outer = self
+            .builder
+            .build_load(pointer_type, saved, "context.outer.value")
+            .ok();
+        if let Some(outer) = outer {
+            let _ = self.builder.build_store(slot, outer);
+        }
+    }
+
+    /// Leaving a block early through `break` or `continue` unwinds every block
+    /// still holding an outer context, innermost first.
+    fn unwind_contexts(&mut self) {
+        if self.context_saves.is_empty() || self.dead {
+            return;
+        }
+        let Some(slot) = self.context_slot else {
+            return;
+        };
+        let pointer_type = self.context.ptr_type(AddressSpace::default());
+        if self
+            .builder
+            .get_insert_block()
+            .is_some_and(|block| block.get_terminator().is_some())
+        {
+            return;
+        }
+        for saved in self.context_saves.iter().rev() {
+            if let Ok(outer) = self
+                .builder
+                .build_load(pointer_type, *saved, "context.outer.value")
+            {
+                let _ = self.builder.build_store(slot, outer);
+            }
+        }
     }
 }
 
@@ -1068,6 +1555,7 @@ impl Emitter {
                         exit,
                     }) => {
                         let target = if is_break { *exit } else { *continuation };
+                        self.unwind_contexts();
                         self.br(target);
                         self.dead = true;
                     }
@@ -1528,6 +2016,20 @@ impl Emitter {
             self.defer_write(module, name, args, span);
             return;
         }
+        if name == "free" || name == "del" {
+            let Some(value) = self.expr(module, args.first().unwrap_or(&Expr::Error { span }), None)
+            else {
+                return;
+            };
+            if value.ty == DuxType::Error {
+                return;
+            }
+            let Some(slot) = self.capture(module, value, "deferred", span) else {
+                return;
+            };
+            self.defers.push(Deferred::Release { slot });
+            return;
+        }
         if self.skipped.contains(name) {
             return;
         }
@@ -1574,9 +2076,14 @@ impl Emitter {
             };
             slots.push(slot);
         }
+        let hidden_context = self
+            .signatures
+            .get(name.as_str())
+            .is_some_and(|signature| signature.hidden_context);
         self.defers.push(Deferred::Call {
             name: name.clone(),
             slots,
+            hidden_context,
         });
     }
 
@@ -1693,6 +2200,10 @@ impl Emitter {
             Call {
                 name: String,
                 slots: Vec<(DuxType, PointerValue<'static>)>,
+                hidden_context: bool,
+            },
+            Release {
+                slot: (DuxType, PointerValue<'static>),
             },
         }
         for index in (0..self.defers.len()).rev() {
@@ -1708,10 +2219,16 @@ impl Emitter {
                     slots: slots.clone(),
                     span: *span,
                 },
-                Deferred::Call { name, slots } => Owned::Call {
+                Deferred::Call {
+                    name,
+                    slots,
+                    hidden_context,
+                } => Owned::Call {
                     name: name.clone(),
                     slots: slots.clone(),
+                    hidden_context: *hidden_context,
                 },
+                Deferred::Release { slot } => Owned::Release { slot: *slot },
             };
             match owned {
                 Owned::Write {
@@ -1729,7 +2246,11 @@ impl Emitter {
                     }
                     let _ = self.write_prepared(module, &parts, &values, newline, span);
                 }
-                Owned::Call { name, slots } => {
+                Owned::Call {
+                    name,
+                    slots,
+                    hidden_context,
+                } => {
                     let Some(function) = self.functions.get(name.as_str()).copied() else {
                         continue;
                     };
@@ -1744,12 +2265,61 @@ impl Emitter {
                             }
                         }
                     }
+                    if ready && hidden_context {
+                        if let Some(context) = self.context_slot {
+                            let value = self
+                                .builder
+                                .build_load(
+                                    self.context.ptr_type(AddressSpace::default()),
+                                    context,
+                                    "context",
+                                )
+                                .ok()
+                                .map(|value| value.into_pointer_value());
+                            match value {
+                                Some(value) => arguments.push(value.into()),
+                                None => ready = false,
+                            }
+                        } else {
+                            ready = false;
+                        }
+                    }
                     if ready {
                         let _ = self
                             .builder
                             .build_call(function, &arguments, "deferred")
                             .ok();
                     }
+                }
+                Owned::Release { slot: (ty, slot) } => {
+                    let Some(runtime) = &self.runtime else {
+                        continue;
+                    };
+                    let free = runtime.free;
+                    let Some(context) = self.context_slot else {
+                        continue;
+                    };
+                    let pointer_type = self.context.ptr_type(AddressSpace::default());
+                    let memory = match self.load(ty, slot) {
+                        Some(value) => value
+                            .pointer_value()
+                            .or_else(|| self.slice_parts(value).map(|(data, _)| data)),
+                        None => None,
+                    };
+                    let Some(memory) = memory else {
+                        continue;
+                    };
+                    let context = self
+                        .builder
+                        .build_load(pointer_type, context, "context")
+                        .ok()
+                        .map(|value| value.into_pointer_value());
+                    let Some(context) = context else {
+                        continue;
+                    };
+                    let _ = self
+                        .builder
+                        .build_call(free, &[context.into(), memory.into()], "deferred");
                 }
             }
         }
@@ -3827,6 +4397,11 @@ impl Emitter {
         if name == "print" || name == "println" {
             return self.write_builtin(module, name, args, span);
         }
+        // The allocation builtins belong to the prelude, so a program that
+        // declares its own `make` wins.
+        if matches!(name, "new" | "make" | "free" | "del") && !self.functions.contains_key(name) {
+            return self.memory_builtin(module, name, args, span);
+        }
         if self.skipped.contains(name) {
             return Some(Typed::error());
         }
@@ -3841,12 +4416,16 @@ impl Emitter {
             );
             return None;
         };
-        let (params, return_ty) = {
+        let (params, return_ty, hidden_context) = {
             let signature = self
                 .signatures
                 .get(name)
                 .expect("a callable function has a recorded signature");
-            (signature.params.clone(), signature.return_ty)
+            (
+                signature.params.clone(),
+                signature.return_ty,
+                signature.hidden_context,
+            )
         };
         if args.len() != params.len() {
             self.diagnostics.push(
@@ -3876,6 +4455,10 @@ impl Emitter {
                     return None;
                 }
             }
+        }
+        if hidden_context {
+            let context = self.context_value(span)?;
+            arguments.push(context.into());
         }
         self.invoke(function, arguments, return_ty)
     }
@@ -3941,6 +4524,7 @@ impl Emitter {
             .expect("a callable method has a recorded signature");
         let params = signature.params.clone();
         let return_ty = signature.return_ty;
+        let hidden_context = signature.hidden_context;
         let want = signature.receiver.unwrap_or(DuxType::Struct(record));
         let receiver = self.receiver(module, base_ty, base_at, want, name, base.span())?;
         if args.len() != params.len() {
@@ -3979,6 +4563,10 @@ impl Emitter {
                     return None;
                 }
             }
+        }
+        if hidden_context {
+            let context = self.context_value(span)?;
+            arguments.push(context.into());
         }
         self.invoke(function, arguments, return_ty)
     }
@@ -4429,10 +5017,21 @@ impl Emitter {
     }
 
     fn alloca(&mut self, ty: DuxType, name: &str) -> PointerValue<'static> {
+        self.alloca_in_entry(ty.llvm(self.context), name)
+    }
+
+    /// An alloca in the entry block, whatever block the builder is in. The
+    /// generated code keeps every slot in the entry block so a repeated loop
+    /// iteration never stacks allocations on the stack.
+    fn alloca_in_entry(
+        &mut self,
+        ty: BasicTypeEnum<'static>,
+        name: &str,
+    ) -> PointerValue<'static> {
         let Some(entry) = self.allocas else {
             return self
                 .builder
-                .build_alloca(ty.llvm(self.context), name)
+                .build_alloca(ty, name)
                 .expect("alloca outside a function");
         };
         let current = self.builder.get_insert_block();
@@ -4442,7 +5041,7 @@ impl Emitter {
         }
         let slot = self
             .builder
-            .build_alloca(ty.llvm(self.context), name)
+            .build_alloca(ty, name)
             .expect("alloca in the entry block");
         if let Some(block) = current {
             self.builder.position_at_end(block);
@@ -4474,7 +5073,7 @@ impl Emitter {
             .context
             .i32_type()
             .fn_type(&[c_char.into()], true);
-        let fn_value = module.add_function("printf", printf, None);
+        let fn_value = declared(module, "printf", printf);
         self.printf = Some(fn_value);
         fn_value
     }
@@ -4485,7 +5084,7 @@ impl Emitter {
         }
         let c_char = self.context.ptr_type(AddressSpace::default());
         let fn_type = self.context.i32_type().fn_type(&[c_char.into()], false);
-        let fn_value = module.add_function("puts", fn_type, None);
+        let fn_value = declared(module, "puts", fn_type);
         self.puts = Some(fn_value);
         fn_value
     }
@@ -4499,7 +5098,7 @@ impl Emitter {
             .context
             .i32_type()
             .fn_type(&[c_char.into(), c_char.into()], false);
-        let fn_value = module.add_function("fputs", fn_type, None);
+        let fn_value = declared(module, "fputs", fn_type);
         self.fputs = Some(fn_value);
         fn_value
     }
@@ -4928,4 +5527,191 @@ fn expression_name(expr: &Expr) -> &'static str {
         Expr::Error { .. } => "an erroneous expression",
         _ => "this expression",
     }
+}
+
+/// What a function body contributes to the allocation analysis.
+#[derive(Default)]
+struct Scan {
+    /// A call to `new`, `make`, `free` or `del`.
+    allocates: bool,
+    /// A read or rebinding of `context`.
+    reads_context: bool,
+    /// A write to `context`, which the enclosing block must undo.
+    rebinds_context: bool,
+    /// The callees written in the body, by the name they are written with.
+    calls: Vec<String>,
+}
+
+impl Scan {
+    fn block(&mut self, block: &Block) {
+        for stmt in &block.stmts {
+            self.stmt(stmt);
+        }
+    }
+
+    fn stmt(&mut self, stmt: &Stmt) {
+        match stmt {
+            Stmt::Binding { value, .. } => {
+                if let Some(value) = value {
+                    self.expr(value);
+                }
+            }
+            Stmt::Assign { target, value, .. } => {
+                if matches!(target, Expr::Ident { name, .. } if name == "context") {
+                    self.rebinds_context = true;
+                }
+                self.expr(target);
+                self.expr(value);
+            }
+            Stmt::Expr { expr, .. } => self.expr(expr),
+            Stmt::Return { value, .. } => {
+                if let Some(value) = value {
+                    self.expr(value);
+                }
+            }
+            Stmt::Break { .. } | Stmt::Continue { .. } | Stmt::Error { .. } => {}
+            Stmt::Defer { stmt, .. } => self.stmt(stmt),
+            Stmt::Block { block, .. } => self.block(block),
+            Stmt::If {
+                cond,
+                then_branch,
+                else_branch,
+                ..
+            } => {
+                self.expr(cond);
+                self.block(then_branch);
+                if let Some(other) = else_branch {
+                    self.stmt(other);
+                }
+            }
+            Stmt::While { cond, body, .. } => {
+                self.expr(cond);
+                self.block(body);
+            }
+            Stmt::Loop { body, .. } => self.block(body),
+            Stmt::For { kind, body, .. } => {
+                match kind {
+                    ForKind::ThreeClause {
+                        init,
+                        cond,
+                        step,
+                    } => {
+                        self.stmt(init);
+                        self.expr(cond);
+                        self.stmt(step);
+                    }
+                    ForKind::In { iterable, .. } => self.expr(iterable),
+                }
+                self.block(body);
+            }
+        }
+    }
+
+    fn expr(&mut self, expr: &Expr) {
+        match expr {
+            Expr::Call { callee, args, .. } => {
+                match callee.as_ref() {
+                    Expr::Ident { name, .. } if matches!(name.as_str(), "new" | "make" | "free" | "del") => {
+                        self.allocates = true;
+                    }
+                    Expr::Ident { name, .. } => self.calls.push(name.clone()),
+                    Expr::Field { base, name, .. } => {
+                        self.calls.push(name.name.clone());
+                        self.expr(base);
+                    }
+                    other => self.expr(other),
+                }
+                for arg in args {
+                    self.expr(arg);
+                }
+            }
+            Expr::Ident { name, .. } if name == "context" => self.reads_context = true,
+            Expr::Int { .. }
+            | Expr::Float { .. }
+            | Expr::Str { .. }
+            | Expr::Char { .. }
+            | Expr::Bool { .. }
+            | Expr::Ident { .. }
+            | Expr::Error { .. } => {}
+            Expr::Field { base, .. } | Expr::Member { base, .. } => self.expr(base),
+            Expr::Index { base, index, .. } => {
+                self.expr(base);
+                self.expr(index);
+            }
+            Expr::Range { start, end, .. } => {
+                for bound in start.iter().chain(end.iter()) {
+                    self.expr(bound);
+                }
+            }
+            Expr::ArrayLiteral { elements, .. } => {
+                for element in elements {
+                    self.expr(element);
+                }
+            }
+            Expr::RepeatedArray { value, len, .. } => {
+                self.expr(value);
+                self.expr(len);
+            }
+            Expr::Path { .. } => {}
+            Expr::StructLiteral { fields, .. } => {
+                for (_, value) in fields {
+                    self.expr(value);
+                }
+            }
+            Expr::CondBinding { pattern, value, .. } => {
+                self.expr(pattern);
+                self.expr(value);
+            }
+            Expr::InterpString { parts, .. } => {
+                for part in parts {
+                    if let InterpolationPart::Hole {
+                        written: Some(value), ..
+                    } = part
+                    {
+                        self.expr(value);
+                    }
+                }
+            }
+            Expr::If {
+                cond,
+                then_arm,
+                else_arm,
+                ..
+            } => {
+                self.expr(cond);
+                self.expr(then_arm);
+                if let Some(other) = else_arm {
+                    self.expr(other);
+                }
+            }
+            Expr::Block { block, value, .. } => {
+                self.block(block);
+                self.expr(value);
+            }
+            Expr::Unary { operand, .. } => self.expr(operand),
+            Expr::Binary { lhs, rhs, .. } => {
+                self.expr(lhs);
+                self.expr(rhs);
+            }
+            Expr::Cast { value, .. } => self.expr(value),
+            Expr::Paren { inner, .. } => self.expr(inner),
+        }
+    }
+}
+
+/// A C library declaration, reused when the module already carries one: the
+/// allocator runtime declares the same handful of names.
+fn declared(
+    module: &Module<'static>,
+    name: &str,
+    fn_type: inkwell::types::FunctionType<'static>,
+) -> FunctionValue<'static> {
+    module
+        .get_function(name)
+        .unwrap_or_else(|| module.add_function(name, fn_type, None))
+}
+
+/// Whether a function carries `#[name]`.
+fn has_attribute(attributes: &[dux_ast::Attribute], name: &str) -> bool {
+    attributes.iter().any(|attribute| attribute.name == name)
 }

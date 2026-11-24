@@ -1,0 +1,9 @@
+//@release
+// A release build pays nothing for the debug allocator: a leak is not caught,
+// so this prints no report.
+
+fn main() {
+    kept := new(i32)
+    *kept = 7
+    println($"release build={} and no leak report", *kept)
+}

@@ -1,0 +1,15 @@
+//@stderr dux: leaked 1 allocation(s)
+// The debug allocator reports what is still live when the program exits.
+
+fn spare() -> *i32 {
+    return new(i32)
+}
+
+fn main() {
+    kept := new(i32)
+    *kept = 7
+    loose := spare()
+    *loose = 9
+    println($"sum={}", *kept + *loose)
+    free(loose)
+}

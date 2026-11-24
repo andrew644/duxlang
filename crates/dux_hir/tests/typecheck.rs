@@ -960,3 +960,81 @@ fn main() {
         Vec::<&'static str>::new()
     );
 }
+
+#[test]
+fn new_and_make_carry_their_element_type() {
+    assert_eq!(
+        codes(
+            "package main
+fn main() {
+    p := new(i32)
+    *p = 7
+    xs := make(i32, 4)
+    xs[0] = 1
+    total: i32 = *p + xs[0]
+    println($\"{}\", total)
+    free(p)
+    del(xs)
+}"
+        ),
+        Vec::<&str>::new()
+    );
+}
+
+#[test]
+fn a_heap_pointer_is_a_pointer_with_a_target() {
+    assert_eq!(
+        codes(
+            "package main
+fn main() {
+    p := new(i32)
+    println($\"{}\", *p)
+    q := p as rawptr
+    println($\"{}\", 1)
+    free(p)
+}"
+        ),
+        Vec::<&str>::new()
+    );
+    let found = codes(
+        "package main
+fn main() {
+    p := new(i32)
+    *p = \"text\"
+}",
+    );
+    assert_eq!(found, vec![dux_diag::code::TYPE_MISMATCH]);
+}
+
+#[test]
+fn context_is_an_ordinary_name_a_function_can_read_and_rebind() {
+    assert_eq!(
+        codes(
+            "package main
+fn uses() {
+    outer := context
+    context = outer
+}
+fn main() {
+    uses()
+}"
+        ),
+        Vec::<&str>::new()
+    );
+}
+
+#[test]
+fn a_program_may_declare_its_own_prelude_names() {
+    assert_eq!(
+        codes(
+            "package main
+fn make() -> i32 {
+    return 1
+}
+fn main() {
+    println($\"{}\", make())
+}"
+        ),
+        Vec::<&str>::new()
+    );
+}

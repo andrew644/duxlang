@@ -1,0 +1,33 @@
+// M3: `make` builds a slice over context-allocated memory; `del` releases it.
+
+fn scaled(count: i64, factor: i32) -> []i32 {
+    xs := make(i32, count)
+    for i in 0..count {
+        xs[i] = (i as i32) * factor
+    }
+    return xs
+}
+
+fn main() {
+    ys := scaled(4, 3)
+    total: i32 = 0
+    for i, v in ys {
+        total += v
+        print($"[{i}]={v} ")
+    }
+    print("\n")
+    println($"count={} sum={}", ys.len(), total)
+    del(ys)
+
+    defer release()
+    text := make(byte, 3)
+    defer del(text)
+    text[0] = 104
+    text[1] = 105
+    text[2] = 0
+    println($"bytes {} {} {}", text[0], text[1], text[2])
+}
+
+fn release() {
+    println($"deferred work ran")
+}
