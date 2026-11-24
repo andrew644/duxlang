@@ -923,7 +923,7 @@ impl<'a> Checker<'a> {
                 }
             }
             Expr::Block { block, value, .. } => {
-                self.block(block);
+                self.value_block(block, value);
                 self.typed(value, expected)
             }
             Expr::Error { .. } => Ty::Opaque,
@@ -1082,6 +1082,22 @@ impl<'a> Checker<'a> {
     fn block(&mut self, block: &Block) {
         self.scopes.push(Vec::new());
         for statement in &block.stmts {
+            self.statement(statement);
+        }
+        self.scopes.pop();
+    }
+
+    /// A block in value position stores its tail expression twice: as the
+    /// last statement and as the block's value. Check the statements once.
+    fn value_block(&mut self, block: &Block, value: &Expr) {
+        self.scopes.push(Vec::new());
+        let tail = block.stmts.len().saturating_sub(1);
+        for (index, statement) in block.stmts.iter().enumerate() {
+            if index == tail
+                && matches!(statement, Stmt::Expr { expr, .. } if expr.span() == value.span())
+            {
+                continue;
+            }
             self.statement(statement);
         }
         self.scopes.pop();

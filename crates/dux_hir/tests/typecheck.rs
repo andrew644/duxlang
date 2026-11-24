@@ -398,6 +398,34 @@ fn main() {
 }
 
 #[test]
+fn the_arms_of_an_if_value_must_agree() {
+    assert_eq!(
+        codes(
+            "fn main() {
+    c := true
+    x := if c { 1 } else { \"two\" }
+    println($\"{}\", x)
+}
+"
+        ),
+        vec!["E0201"]
+    );
+    assert_eq!(
+        codes(
+            "fn main() {
+    c := true
+    x := if c { 1 } else { 2 }
+    y := if c { 1 } else { 2.5 }
+    z := if c { \"a\" } else { \"b\" }
+    println($\"{} {} {}\", x, y, z)
+}
+"
+        ),
+        Vec::<&'static str>::new()
+    );
+}
+
+#[test]
 fn struct_fields_are_checked_at_the_literal() {
     assert_eq!(
         codes(

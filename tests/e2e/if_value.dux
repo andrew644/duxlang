@@ -1,0 +1,13 @@
+package main
+
+fn classify(n: i32) -> string {
+    return if n < 0 { "neg" } else if n == 0 { "zero" } else { "pos" }
+}
+
+fn main() {
+    for i := -1, i <= 2, i += 1 {
+        parity := if i % 2 == 0 { "even" } else { "odd" }
+        magnitude := if i < 0 { 0 - i } else { i }
+        println($"{i} {parity} {classify(i)} {magnitude}")
+    }
+}

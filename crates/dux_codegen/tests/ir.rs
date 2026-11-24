@@ -121,6 +121,24 @@ fn bindings_default_integers_to_i32_and_keep_every_alloca_in_the_entry_block() {
 }
 
 #[test]
+fn a_value_if_meets_at_a_phi() {
+    let ir = build(
+        "package main\nfn main() -> i32 { c := true; x := if c { 1 } else { 2 }; return x }",
+    )
+    .expect("builds")
+    .ir_text();
+    assert!(ir.contains("phi i32"), "the arms meet at a phi:\n{ir}");
+    assert!(ir.contains("br i1"), "the condition branches:\n{ir}");
+
+    let ir = build(
+        "package main\nfn pick(c: bool) -> string { s := if c { \"a\" } else { \"b\" }; return s }\nfn main() { pick(true) }",
+    )
+    .expect("builds")
+    .ir_text();
+    assert!(ir.contains("phi ptr"), "string arms meet at a pointer phi:\n{ir}");
+}
+
+#[test]
 fn implicit_conversion_widens_exactly_when_the_destination_is_lossless() {
     let ir = build(
         "package main\nfn main() { wider: i64 = 0; narrow := 1; wider = wider + narrow }",

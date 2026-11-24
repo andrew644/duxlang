@@ -1239,8 +1239,8 @@ impl<'a> Parser<'a> {
     fn if_expression(&mut self) -> Expr {
         let token = self.bump_span();
         let cond = self.condition();
-        let then_branch = self.block();
-        let mut span = token.merge(then_branch.span);
+        let then_branch = self.block_expression();
+        let mut span = token.merge(then_branch.span());
         let else_branch = if self.at_keyword(Keyword::Else) {
             self.bump();
             let inner = if self.at_keyword(Keyword::If) {
@@ -1261,14 +1261,9 @@ impl<'a> Parser<'a> {
             );
             None
         };
-        let then_span = then_branch.span;
         Expr::If {
             cond: Box::new(cond),
-            then_arm: Box::new(Expr::Block {
-                block: then_branch,
-                value: Box::new(Expr::Error { span: then_span }),
-                span: then_span,
-            }),
+            then_arm: Box::new(then_branch),
             else_arm: else_branch,
             span,
         }
@@ -2421,13 +2416,20 @@ mod tests {
             parse_text("fn f(a: i32, b: i32) -> i32 { return if a > b { a } else { b } }\nfn g() { label := if x { \"even\" } else { \"odd\" } }");
         assert!(diagnostics.is_empty(), "{diagnostics:?}");
         let function = program.find_function("f").unwrap();
-        assert!(matches!(
-            &function.body.stmts[0],
-            Stmt::Return {
-                value: Some(Expr::If { .. }),
-                ..
-            }
-        ));
+        let Stmt::Return {
+            value: Some(Expr::If { then_arm, .. }),
+            ..
+        } = &function.body.stmts[0]
+        else {
+            panic!("`f` returns an `if` value");
+        };
+        let Expr::Block { value, .. } = then_arm.as_ref() else {
+            panic!("the then arm is a block with a value: {then_arm:?}");
+        };
+        assert!(
+            matches!(value.as_ref(), Expr::Ident { name, .. } if name == "a"),
+            "the then arm's tail expression is the block's value: {value:?}"
+        );
     }
 
     #[test]

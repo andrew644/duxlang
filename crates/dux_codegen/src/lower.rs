@@ -897,6 +897,118 @@ impl Emitter {
         self.dead = false;
     }
 
+    /// `if` used as a value: both arms lower to a typed value and meet at a
+    /// phi in the merge block. An arm that ends in `return`, `break`, or
+    /// `panic` produces no value; that is reported, not phantomed.
+    fn if_value(
+        &mut self,
+        module: &Module<'static>,
+        cond: &Expr,
+        then_arm: &Expr,
+        else_arm: &Expr,
+        expected: Option<DuxType>,
+        span: Span,
+    ) -> Option<Typed> {
+        let condition = self.condition(module, cond);
+        let then_block = self.new_block("if.then");
+        let else_block = self.new_block("if.else");
+        let merge = self.new_block("if.end");
+        let _ = self
+            .builder
+            .build_conditional_branch(condition, then_block, else_block);
+
+        self.builder.position_at_end(then_block);
+        let then_result = self.value_arm(module, then_arm, expected);
+        self.br(merge);
+
+        self.builder.position_at_end(else_block);
+        let else_result = self.value_arm(module, else_arm, expected);
+        self.br(merge);
+
+        self.builder.position_at_end(merge);
+        self.dead = false;
+        let Some((then_value, then_at)) = then_result else {
+            self.unsupported(span, "a value `if` arm that ends without producing a value");
+            return Some(Typed::error());
+        };
+        let Some((else_value, else_at)) = else_result else {
+            self.unsupported(span, "a value `if` arm that ends without producing a value");
+            return Some(Typed::error());
+        };
+        if then_value.ty == DuxType::Error || else_value.ty == DuxType::Error {
+            return Some(Typed::error());
+        }
+        let common = self.common_type(then_value.ty, else_value.ty, span)?;
+        let then_value = self.convert(then_value, common)?;
+        let else_value = self.convert(else_value, common)?;
+        let phi = self
+            .builder
+            .build_phi(common.llvm(self.context), "iftmp")
+            .ok()?;
+        phi.add_incoming(&[
+            (&then_value.basic()?, then_at),
+            (&else_value.basic()?, else_at),
+        ]);
+        let value = phi.as_basic_value();
+        Some(if common.is_float() {
+            Typed::float(value.into_float_value(), common)
+        } else if common == DuxType::Ptr || common == DuxType::Str {
+            Typed::pointer(value.into_pointer_value(), common)
+        } else if common.is_numeric() {
+            Typed::int(value.into_int_value(), common)
+        } else {
+            Typed::error()
+        })
+    }
+
+    /// One arm of a value `if`, positioned at the start of its own region.
+    /// Returns the arm's value and the block that ends the region — the phi's
+    /// incoming edge must be a real predecessor of the merge.
+    fn value_arm(
+        &mut self,
+        module: &Module<'static>,
+        arm: &Expr,
+        expected: Option<DuxType>,
+    ) -> Option<(Typed, BasicBlock<'static>)> {
+        self.dead = false;
+        self.scopes.push(HashMap::new());
+        let value = match arm {
+            Expr::Block { block, value, .. } => {
+                self.value_block_body(module, block, value);
+                if self.dead {
+                    None
+                } else {
+                    self.expr(module, value, expected)
+                }
+            }
+            other => self.expr(module, other, expected),
+        };
+        self.scopes.pop();
+        let at = self.builder.get_insert_block()?;
+        let value = value?;
+        Some((value, at))
+    }
+
+    /// A block in value position stores its tail expression twice: as the
+    /// last statement and as the block's value. Lower the statements once.
+    fn value_block_body(&mut self, module: &Module<'static>, block: &dux_ast::Block, value: &Expr) {
+        self.dead = false;
+        self.scopes.push(HashMap::new());
+        let tail = block.stmts.len().saturating_sub(1);
+        for (index, stmt) in block.stmts.iter().enumerate() {
+            if self.dead {
+                break;
+            }
+            if index == tail
+                && matches!(stmt, Stmt::Expr { expr, .. } if expr.span() == value.span())
+            {
+                continue;
+            }
+            self.stmt(module, stmt);
+        }
+        self.scopes.pop();
+    }
+
     fn while_stmt(&mut self, module: &Module<'static>, cond: &Expr, body: &Block) {
         let cond_block = self.new_block("while.cond");
         let body_block = self.new_block("while.body");
@@ -1115,6 +1227,25 @@ impl Emitter {
             }
             Expr::Cast { value, target, .. } => self.cast(module, value, target),
             Expr::Call { callee, args, span } => self.call(module, callee, args, *span),
+            Expr::If {
+                cond,
+                then_arm,
+                else_arm,
+                span,
+            } => match else_arm {
+                Some(other) => self.if_value(module, cond, then_arm, other, expected, *span),
+                None => {
+                    self.unsupported(*span, "an `if` in value position without a final `else`");
+                    None
+                }
+            },
+            Expr::Block { block, value, .. } => {
+                self.value_block_body(module, block, value);
+                if self.dead {
+                    return None;
+                }
+                self.expr(module, value, expected)
+            }
             Expr::InterpString { .. } => {
                 self.unsupported(
                     expr.span(),
