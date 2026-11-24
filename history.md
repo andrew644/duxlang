@@ -484,3 +484,32 @@ real DWARF types; richer ones an empty signature — full type DIEs are M7.
 Proof: `if_value.dux`, `arrays_and_loops.dux`, `defer.dux` run with pinned
 stdout; built binaries carry `.debug_line`/`.debug_info`. 147 tests, clippy
 clean, whole corpus still silent.
+
+## Session 11 — M3 begins: records are values
+
+M3 is the aggregate milestone: `struct`/`impl`/methods, `*T`, `&`/`*`, `[]T`,
+`string`, `rawptr`, context + `new`/`make`/`free`/`del`. It starts at the top:
+records, which need the codegen type model to grow up before pointers, slices
+and string views have somewhere to live.
+
+`DuxType::Struct(&'static StructInfo)` is the new variant. A `struct` resolves
+lazily into a **nominal** LLVM struct (`opaque_struct_type` + `set_body`), so
+two records with identical fields stay different types and a field that would
+make the record infinitely large is a diagnostic rather than a hang. Records
+are aggregates in `Core::Aggregate`: a binding is one `store %Vec3, ptr`, an
+assignment is a whole-record copy, and a field is a `getelementptr` — which is
+why `copy.z = 9.0` no longer touches `v`.
+
+- Literals are named-field, in any order, and any field left out is zero.
+- A field of a *place* is reached in place; a field of a *value* (`f().x`) is
+  stored to a temporary first, so no call has to allocate for its caller.
+- `const UNIT: Vec3 = Vec3 { .. }` is a `constant` global, and assigning
+  through it — even `UNIT.x = 2.0` — is `E0203`, from both passes.
+- A missing field is `E0201` at the use, in the checker and in codegen, with
+  the record's own field list in the note.
+- `2.0 + width` where `width: f32` is an `f32`: an untyped float literal beside
+  a concrete float adopts it (D17 said so; the operator path now agrees).
+
+Proof: `records.dux` runs with pinned stdout, `record_field_typo.dux` and
+`record_const_field.dux` pin the diagnostics; three new IR tests, five new
+checker tests. 154 tests, clippy clean, corpus still silent.

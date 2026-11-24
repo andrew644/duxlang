@@ -399,3 +399,90 @@ fn globals_are_module_storage_and_update_in_place() {
         .ir_text();
     assert!(ir.contains("@scratch = global i64 0"), "{ir}");
 }
+
+#[test]
+fn a_record_is_a_nominal_struct_and_assignment_copies_it() {
+    let ir = build(
+        "package main
+struct Vec3 {
+    x: f32,
+    y: f32,
+}
+fn main() {
+    v := Vec3 { y: 2.0, x: 1.0 }
+    c := v
+    c.x = 3.0
+    println($\"{} {}\", v.x, c.x)
+}",
+    )
+    .expect("builds")
+    .ir_text();
+    assert!(
+        ir.contains("%Vec3 = type { float, float }"),
+        "the record type is nominal and structural in LLVM:\n{ir}"
+    );
+    assert!(ir.contains("%v = alloca %Vec3"), "{ir}");
+    assert!(
+        ir.contains("store %Vec3 %load, ptr %v"),
+        "the literal is written through a temporary and copied in:\n{ir}"
+    );
+    assert!(
+        ir.contains("store %Vec3 %load2, ptr %c"),
+        "a binding of a record is a whole-record copy:\n{ir}"
+    );
+    assert!(
+        ir.contains("getelementptr %Vec3, ptr %c, i32 0, i32 0"),
+        "a field is an address, so the store reaches the record in place:\n{ir}"
+    );
+}
+
+#[test]
+fn a_record_constant_is_constant_storage() {
+    let ir = build(
+        "package main
+struct Vec3 {
+    x: f32,
+    y: f32,
+}
+const UNIT: Vec3 = Vec3 { x: 1.0, y: 2.0 }
+fn main() {
+    println($\"{}\", UNIT.y)
+}",
+    )
+    .expect("builds")
+    .ir_text();
+    assert!(
+        ir.contains("@UNIT = constant %Vec3 { float 1.000000e+00, float 2.000000e+00 }"),
+        "the literal becomes a constant initializer:\n{ir}"
+    );
+    let errors = build(
+        "package main
+struct Vec3 {
+    x: f32,
+}
+const UNIT: Vec3 = Vec3 { x: 1.0 }
+fn main() {
+    UNIT.x = 2.0
+}",
+    )
+    .unwrap_err();
+    assert_eq!(errors[0].code, dux_diag::code::ASSIGN_TO_CONST, "{errors:?}");
+}
+
+#[test]
+fn a_field_a_record_does_not_have_is_reported_where_it_is_used() {
+    let errors = build(
+        "package main
+struct Vec3 {
+    x: f32,
+}
+fn main() {
+    v := Vec3 { x: 1.0 }
+    println($\"{}\", v.z)
+}",
+    )
+    .unwrap_err();
+    assert_eq!(errors[0].code, dux_diag::code::TYPE_MISMATCH);
+    assert!(errors[0].message.contains("has no field `z`"), "{errors:?}");
+    assert!(errors[0].message.contains("Vec3"), "{errors:?}");
+}

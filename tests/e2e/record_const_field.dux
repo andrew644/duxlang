@@ -1,0 +1,13 @@
+//@expect-error E0203
+package main
+
+struct Vec3 {
+    x: f32,
+}
+
+const UNIT: Vec3 = Vec3 { x: 1.0 }
+
+fn main() {
+    UNIT.x = 2.0
+    println($"{}", UNIT.x)
+}

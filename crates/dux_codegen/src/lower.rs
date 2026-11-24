@@ -22,9 +22,12 @@ use inkwell::debug_info::{
     DWARFEmissionKind, DWARFSourceLanguage,
 };
 use inkwell::module::Module;
-use inkwell::types::{BasicMetadataTypeEnum, BasicType, BasicTypeEnum, FloatType, IntType};
+use inkwell::types::{
+    BasicMetadataTypeEnum, BasicType, BasicTypeEnum, FloatType, IntType, StructType,
+};
 use inkwell::values::{
     BasicMetadataValueEnum, BasicValueEnum, FloatValue, GlobalValue, IntValue, PointerValue,
+    StructValue,
 };
 use inkwell::values::{FunctionValue, ValueKind};
 use inkwell::{AddressSpace, FloatPredicate, IntPredicate};
@@ -56,6 +59,9 @@ pub(crate) enum DuxType {
     /// `[N x T]` storage; bindings and assignments that must copy do so
     /// element by element.
     Array(&'static ArrayInfo),
+    /// A declared `struct`. The LLVM representation is the nominal struct
+    /// type, so assignment is a copy of the whole record.
+    Struct(&'static StructInfo),
     /// Something we could not type; it silences follow-on diagnostics.
     Error,
 }
@@ -65,6 +71,32 @@ pub(crate) struct ArrayInfo {
     pub(crate) elem: DuxType,
     pub(crate) len: u64,
 }
+
+#[derive(Debug)]
+pub(crate) struct StructInfo {
+    pub(crate) name: &'static str,
+    pub(crate) fields: Vec<(&'static str, DuxType)>,
+    pub(crate) llvm: StructType<'static>,
+}
+
+impl StructInfo {
+    pub(crate) fn field(&self, name: &str) -> Option<(u32, DuxType)> {
+        self.fields
+            .iter()
+            .position(|(field, _)| *field == name)
+            .map(|index| (index as u32, self.fields[index].1))
+    }
+}
+
+/// Records are nominal: the same `struct` resolves to one leaked `StructInfo`,
+/// so identity is the right equality and two look-alike records stay apart.
+impl PartialEq for StructInfo {
+    fn eq(&self, other: &Self) -> bool {
+        std::ptr::eq(self, other)
+    }
+}
+
+impl Eq for StructInfo {}
 
 impl DuxType {
     fn from_ast(ty: &Type) -> Option<DuxType> {
@@ -164,6 +196,7 @@ impl DuxType {
                 context.ptr_type(AddressSpace::default()).into()
             }
             DuxType::Array(info) => info.elem.llvm(context).array_type(info.len as u32).into(),
+            DuxType::Struct(info) => info.llvm.into(),
         }
     }
 
@@ -200,6 +233,7 @@ impl DuxType {
             DuxType::Str => "string".to_string(),
             DuxType::Ptr => "rawptr".to_string(),
             DuxType::Array(info) => format!("[{}; {}]", info.elem.name(), info.len),
+            DuxType::Struct(info) => info.name.to_string(),
             DuxType::Error => "<error>".to_string(),
         }
     }
@@ -216,7 +250,8 @@ impl DuxType {
             DuxType::U32 => 1 << 32,
             DuxType::U64 => 1 << 64,
             DuxType::F32 | DuxType::F64 => return true,
-            _ => return false,
+            DuxType::Array(..) | DuxType::Struct(..) | DuxType::Str | DuxType::Ptr => return false,
+            DuxType::Error => return false,
         };
         if self.is_signed() {
             value < limit + u128::from(negated)
@@ -231,6 +266,7 @@ enum Core {
     Int(IntValue<'static>),
     Float(FloatValue<'static>),
     Ptr(PointerValue<'static>),
+    Aggregate(StructValue<'static>),
     Void,
 }
 
@@ -302,6 +338,7 @@ impl Typed {
             Core::Int(value) => Some(value.into()),
             Core::Float(value) => Some(value.into()),
             Core::Ptr(value) => Some(value.into()),
+            Core::Aggregate(value) => Some(value.into()),
             Core::Void => None,
         }
     }
@@ -318,6 +355,7 @@ enum ConstValue {
     Float(f64),
     Bool(bool),
     Str(String),
+    Struct(Vec<(&'static str, ConstValue)>),
 }
 
 #[derive(Clone)]
@@ -393,11 +431,24 @@ pub(crate) struct Emitter {
     diagnostics: Vec<Diagnostic>,
     functions: HashMap<String, FunctionValue<'static>>,
     signatures: HashMap<String, Signature>,
+    /// The declared `struct` shapes, by name, waiting to be resolved into a
+    /// `StructInfo` (a nominal LLVM struct type plus resolved field types).
+    struct_decls: Vec<dux_ast::StructDecl>,
+    structs: HashMap<String, &'static StructInfo>,
+    /// Names whose field types are being resolved right now, so a size cycle
+    /// is a diagnostic rather than a hang.
+    resolving: Vec<String>,
+    /// Structs already reported as unlowerable, so one bad field is one
+    /// diagnostic rather than one per use.
+    struct_errors: HashSet<String>,
     /// Names already reported as not lowerable by this build; calls to them
     /// stay quiet so the user sees one diagnostic, not a cascade.
     skipped: HashSet<String>,
     scopes: Vec<HashMap<String, (DuxType, PointerValue<'static>)>>,
     consts: HashMap<String, Const>,
+    /// Aggregate `const` values live in constant global storage; the name is
+    /// remembered so an assignment to one is still reported.
+    const_names: HashSet<String>,
     globals: HashMap<String, (DuxType, GlobalValue<'static>)>,
     loops: Vec<Loop>,
     defers: Vec<Deferred>,
@@ -424,9 +475,14 @@ impl Emitter {
             diagnostics: Vec::new(),
             functions: HashMap::new(),
             signatures: HashMap::new(),
+            struct_decls: Vec::new(),
+            structs: HashMap::new(),
+            resolving: Vec::new(),
+            struct_errors: HashSet::new(),
             skipped: HashSet::new(),
             scopes: Vec::new(),
             consts: HashMap::new(),
+            const_names: HashSet::new(),
             globals: HashMap::new(),
             loops: Vec::new(),
             defers: Vec::new(),
@@ -486,9 +542,10 @@ impl Emitter {
                 version,
             );
         }
+        self.struct_decls = program.structs().cloned().collect();
         for decl in &program.decls {
             match decl {
-                Decl::Const(decl) => self.declare_const(decl),
+                Decl::Const(decl) => self.declare_const(module, decl),
                 Decl::Global(decl) => self.declare_global(module, decl),
                 Decl::Extern(block) => {
                     for function in &block.functions {
@@ -514,6 +571,103 @@ impl Emitter {
         self.diagnostics
             .sort_by_key(|diagnostic| diagnostic.span.map(|span| span.start));
         self.diagnostics
+    }
+}
+
+impl Emitter {
+    /// A source type as the lowering sees it. Primitives, pointers and fixed
+    /// arrays come straight from the shared lattice; a `struct` name resolves
+    /// to its nominal record.
+    fn type_of(&mut self, ty: &Type) -> Option<DuxType> {
+        match ty {
+            Type::Named { name, args, .. } if args.is_empty() => match DuxType::named(name) {
+                Some(primitive) => Some(primitive),
+                None => self.struct_type_of(name),
+            },
+            Type::Pointer { pointee, .. } => {
+                let _ = self.type_of(pointee)?;
+                Some(DuxType::Ptr)
+            }
+            Type::Array { element, len, .. } => {
+                let element = self.type_of(element)?;
+                let Expr::Int { value, .. } = len.as_ref() else {
+                    return None;
+                };
+                Some(DuxType::array(element, u64::try_from(*value).ok()?))
+            }
+            other => DuxType::from_ast(other),
+        }
+    }
+
+    /// Resolve (once) the declared `struct` of that name into a nominal LLVM
+    /// struct type. Fields are resolved on demand so a record may be declared
+    /// after the one that embeds it; a cycle that does not pass through a
+    /// pointer has no size and is reported.
+    fn struct_type_of(&mut self, name: &str) -> Option<DuxType> {
+        if let Some(info) = self.structs.get(name).copied() {
+            return Some(DuxType::Struct(info));
+        }
+        if self.struct_errors.contains(name) {
+            return None;
+        }
+        let decl = self
+            .struct_decls
+            .iter()
+            .find(|decl| decl.name.name == name)
+            .cloned()?;
+        if self.resolving.iter().any(|busy| busy == name) {
+            self.diagnostics.push(
+                Diagnostic::error(
+                    code::CODEGEN_FAILED,
+                    format!(
+                        "`{name}` has no size: a `struct` field must reach itself through a pointer"
+                    ),
+                )
+                .with_span(decl.span),
+            );
+            self.struct_errors.insert(name.to_string());
+            return None;
+        }
+        let llvm = self.context.opaque_struct_type(name);
+        self.resolving.push(name.to_string());
+        let mut fields = Vec::new();
+        let mut field_types = Vec::new();
+        let mut unresolved = false;
+        for field in &decl.fields {
+            let Some(ty) = self.type_of(&field.ty) else {
+                self.unsupported(
+                    field.ty.span(),
+                    &format!("the type of the `{name}::{}` field", field.name.name),
+                );
+                unresolved = true;
+                break;
+            };
+            fields.push((
+                Box::leak(field.name.name.clone().into_boxed_str()) as &str,
+                ty,
+            ));
+            field_types.push(ty.llvm(self.context));
+        }
+        self.resolving.pop();
+        if unresolved {
+            self.struct_errors.insert(name.to_string());
+            return None;
+        }
+        llvm.set_body(&field_types, false);
+        let info: &'static StructInfo = Box::leak(Box::new(StructInfo {
+            name: Box::leak(name.to_string().into_boxed_str()) as &str,
+            fields,
+            llvm,
+        }));
+        self.structs.insert(name.to_string(), info);
+        Some(DuxType::Struct(info))
+    }
+
+    fn struct_of(&self, ty: DuxType) -> Option<&'static StructInfo> {
+        match ty {
+            DuxType::Struct(info) => Some(info),
+            _ => None,
+        }
     }
 }
 
@@ -552,13 +706,13 @@ impl Emitter {
         }
         let mut params = Vec::new();
         for param in &function.params {
-            let Some(ty) = DuxType::from_ast(&param.ty).filter(|ty| ty.array_info().is_none()) else {
+            let Some(ty) = self.type_of(&param.ty).filter(|ty| ty.array_info().is_none()) else {
                 if !external {
                     self.skipped.insert(name);
                     self.unsupported(
                         param.ty.span(),
                         &format!(
-                            "a `{}` parameter (only primitives, pointers and string literals lower today)",
+                            "a `{}` parameter (only primitives, pointers, records and string views lower today)",
                             param.name.name
                         ),
                     );
@@ -571,7 +725,7 @@ impl Emitter {
         }
         let return_ty = match &function.return_ty {
             None => None,
-            Some(ty) => match DuxType::from_ast(ty).filter(|ty| ty.array_info().is_none()) {
+            Some(ty) => match self.type_of(ty).filter(|ty| ty.array_info().is_none()) {
                 Some(ty) => Some(ty),
                 None => {
                     if !external {
@@ -627,7 +781,7 @@ impl Emitter {
         };
 
         for (index, param) in function.params.iter().enumerate() {
-            let Some(ty) = DuxType::from_ast(&param.ty) else {
+            let Some(ty) = self.type_of(&param.ty) else {
                 continue;
             };
             let Some(argument) = fn_value.get_nth_param(index as u32) else {
@@ -638,6 +792,7 @@ impl Emitter {
                 BasicValueEnum::IntValue(value) => Core::Int(value),
                 BasicValueEnum::FloatValue(value) => Core::Float(value),
                 BasicValueEnum::PointerValue(value) => Core::Ptr(value),
+                BasicValueEnum::StructValue(value) => Core::Aggregate(value),
                 _ => continue,
             };
             if let Some(basic) = (Typed { core, ty }).basic() {
@@ -782,10 +937,10 @@ impl Emitter {
         span: Span,
     ) {
         let annotated = match ty {
-            Some(ty) => match DuxType::from_ast(ty) {
+            Some(ty) => match self.type_of(ty) {
                 Some(ty) => Some(ty),
                 None => {
-                    self.unsupported(ty.span(), "this type annotation (primitives and pointers today)");
+                    self.unsupported(ty.span(), "this type annotation (primitives, pointers and records today)");
                     return;
                 }
             },
@@ -846,7 +1001,19 @@ impl Emitter {
         use dux_ast::AssignOp;
         let (ty, slot) = match target {
             Expr::Ident { name, span: target_span } => match self.slot_of(name) {
-                Some(target) => target,
+                Some(target) => {
+                    if self.const_names.contains(name.as_str()) {
+                        self.diagnostics.push(
+                            Diagnostic::error(
+                                code::ASSIGN_TO_CONST,
+                                format!("`{name}` is a `const`; it cannot be assigned"),
+                            )
+                            .with_span(*target_span),
+                        );
+                        return;
+                    }
+                    target
+                },
                 None => {
                     let message = if self.consts.contains_key(name.as_str()) {
                         format!("`{name}` is a `const`; it cannot be assigned")
@@ -874,6 +1041,30 @@ impl Emitter {
                     None => return,
                 }
             }
+            Expr::Field { .. } => {
+                if let Some(root) = place_root(target) {
+                    if self.const_names.contains(root) {
+                        self.diagnostics.push(
+                            Diagnostic::error(
+                                code::ASSIGN_TO_CONST,
+                                format!("`{root}` is a `const`; its fields cannot be assigned"),
+                            )
+                            .with_span(target.span()),
+                        );
+                        return;
+                    }
+                }
+                match self.place_of_expr(module, target) {
+                    Some(place) => place,
+                    None => {
+                        self.unsupported(
+                            target.span(),
+                            "assigning to a field of a value (only a field of a place can be stored)",
+                        );
+                        return;
+                    }
+                }
+            },
             _ => {
                 self.unsupported(
                     target.span(),
@@ -2046,6 +2237,148 @@ impl Emitter {
         self.context.bool_type().const_zero()
     }
 
+    /// The address of a place expression: a binding, a field of a place, an
+    /// array element. `None` for an expression that is a value rather than a
+    /// place (a call result, a literal, an arithmetic result).
+    fn place_of_expr(
+        &mut self,
+        module: &Module<'static>,
+        expr: &Expr,
+    ) -> Option<(DuxType, PointerValue<'static>)> {
+        match expr {
+            Expr::Paren { inner, .. } => self.place_of_expr(module, inner),
+            Expr::Ident { name, .. } => self.slot_of(name),
+            Expr::Field { base, name, .. } => {
+                let (ty, at) = self.place_of_expr(module, base)?;
+                let info = self.struct_of(ty)?;
+                let (index, field_ty) = self.field_of(info, &name.name, name.span)?;
+                Some((field_ty, self.field_address(info, at, index)?))
+            }
+            Expr::Index { base, index, .. } => self.place_of(module, base, index),
+            _ => None,
+        }
+    }
+
+    /// `info.field`, with the missing-field diagnostic in one place.
+    fn field_of(
+        &mut self,
+        info: &'static StructInfo,
+        name: &str,
+        span: Span,
+    ) -> Option<(u32, DuxType)> {
+        if let Some(field) = info.field(name) {
+            return Some(field);
+        }
+        let mut known: Vec<&str> = info.fields.iter().map(|(field, _)| *field).collect();
+        known.sort_unstable();
+        self.diagnostics.push(
+            Diagnostic::error(
+                code::TYPE_MISMATCH,
+                format!("`{}` has no field `{name}`", info.name),
+            )
+            .with_span(span)
+            .with_note(format!("the fields are {}", known.join(", "))),
+        );
+        None
+    }
+
+    fn field_address(
+        &self,
+        info: &'static StructInfo,
+        base: PointerValue<'static>,
+        index: u32,
+    ) -> Option<PointerValue<'static>> {
+        let zero = self.context.i32_type().const_zero();
+        let at = self.context.i32_type().const_int(index as u64, false);
+        unsafe { self.builder.build_gep(info.llvm, base, &[zero, at], "field") }.ok()
+    }
+
+    /// `base.name` where `base` is a record. A place reaches its field
+    /// directly; a value is stored to a temporary first, so `f().x` works
+    /// without every call having to allocate.
+    fn field_expr(
+        &mut self,
+        module: &Module<'static>,
+        base: &Expr,
+        name: &str,
+        name_span: Span,
+        span: Span,
+    ) -> Option<Typed> {
+        if let Some((ty, at)) = self.place_of_expr(module, base) {
+            let Some(info) = self.struct_of(ty) else {
+                self.unsupported(
+                    span,
+                    &format!("reading `.{name}` on a `{}`", ty.name()),
+                );
+                return None;
+            };
+            let (index, field_ty) = self.field_of(info, name, name_span)?;
+            let at = self.field_address(info, at, index)?;
+            return self.load(field_ty, at);
+        }
+        let value = self.expr(module, base, None)?;
+        let Some(info) = self.struct_of(value.ty) else {
+            self.unsupported(
+                span,
+                &format!("reading `.{name}` on a `{}`", value.ty.name()),
+            );
+            return None;
+        };
+        let (index, field_ty) = self.field_of(info, name, name_span)?;
+        let slot = self.alloca(value.ty, "record");
+        let basic = value.basic()?;
+        let _ = self.builder.build_store(slot, basic).ok()?;
+        let at = self.field_address(info, slot, index)?;
+        self.load(field_ty, at)
+    }
+
+    /// A named-field record literal. Fields are written in any order and may
+    /// be left out, which leaves them zero-initialised.
+    fn struct_literal(
+        &mut self,
+        module: &Module<'static>,
+        name: &str,
+        fields: &[(dux_ast::Ident, Expr)],
+        span: Span,
+    ) -> Option<Typed> {
+        let Some(ty) = self.struct_type_of(name) else {
+            self.unsupported(
+                span,
+                &format!("a value of the record type `{name}` (no such `struct` is declared)"),
+            );
+            return None;
+        };
+        let info = self.struct_of(ty)?;
+        let slot = self.alloca(ty, "record");
+        let _ = self.builder.build_store(slot, info.llvm.const_zero());
+        for (field, value) in fields {
+            let Some((index, field_ty)) = self.field_of(info, &field.name, field.span) else {
+                continue;
+            };
+            let written = self.expr(module, value, Some(field_ty))?;
+            if written.ty == DuxType::Error {
+                return Some(Typed::error());
+            }
+            let written = self.coerce_implicit(module, written, field_ty, field.span)?;
+            let at = self.field_address(info, slot, index)?;
+            match (field_ty.array_info(), written.core) {
+                (Some(array), Core::Ptr(source)) => self.copy_array(at, source, array),
+                (None, _) => {
+                    let Some(basic) = written.basic() else {
+                        self.unsupported(field.span, "storing this value in a record field");
+                        return None;
+                    };
+                    let _ = self.builder.build_store(at, basic).ok()?;
+                }
+                (Some(_), _) => {
+                    self.unsupported(field.span, "storing this array value in a record field");
+                    return None;
+                }
+            }
+        }
+        self.load(ty, slot)
+    }
+
     /// One line of the line table: every subsequent instruction carries the
     /// span's line and column until the next statement claims one.
     fn set_location(&mut self, span: Span) {
@@ -2288,6 +2621,12 @@ impl Emitter {
             Expr::Index {
                 base, index, span, ..
             } => self.index_expr(module, base, index, *span),
+            Expr::Field { base, name, span } => {
+                self.field_expr(module, base, &name.name, name.span, *span)
+            }
+            Expr::StructLiteral { name, fields, span } => {
+                self.struct_literal(module, name, fields, *span)
+            }
             Expr::InterpString { .. } => {
                 self.unsupported(
                     expr.span(),
@@ -2408,8 +2747,7 @@ impl Emitter {
         if matches!(op, BinaryOp::And | BinaryOp::Or) {
             return self.short_circuit(module, op, lhs, rhs);
         }
-        let left = self.expr(module, lhs, None)?;
-        let right = self.expr(module, rhs, None)?;
+        let (left, right) = self.operands(module, lhs, rhs)?;
         if left.ty == DuxType::Error || right.ty == DuxType::Error {
             return Some(Typed::error());
         }
@@ -2433,6 +2771,32 @@ impl Emitter {
             return None;
         }
         self.binary_typed(module, op, left, right, span)
+    }
+
+    /// Lower both operands of a binary operator. A float literal beside an
+    /// `f32` is an `f32` (D17: an untyped literal takes the type the program
+    /// asked for), so the pair is lowered with the concrete side first.
+    fn operands(
+        &mut self,
+        module: &Module<'static>,
+        lhs: &Expr,
+        rhs: &Expr,
+    ) -> Option<(Typed, Typed)> {
+        if matches!(lhs, Expr::Float { .. }) && !matches!(rhs, Expr::Float { .. }) {
+            let right = self.expr(module, rhs, None)?;
+            let hint = right.ty.is_float().then_some(right.ty);
+            let left = self.expr(module, lhs, hint)?;
+            return Some((left, right));
+        }
+        if matches!(rhs, Expr::Float { .. }) && !matches!(lhs, Expr::Float { .. }) {
+            let left = self.expr(module, lhs, None)?;
+            let hint = left.ty.is_float().then_some(left.ty);
+            let right = self.expr(module, rhs, hint)?;
+            return Some((left, right));
+        }
+        let left = self.expr(module, lhs, None)?;
+        let right = self.expr(module, rhs, None)?;
+        Some((left, right))
     }
 
     fn binary_typed(
@@ -2607,7 +2971,7 @@ impl Emitter {
 
     fn cast(&mut self, module: &Module<'static>, target: &Expr, ty: &Type) -> Option<Typed> {
         let value = self.expr(module, target, None)?;
-        let Some(to) = DuxType::from_ast(ty) else {
+        let Some(to) = self.type_of(ty) else {
             self.unsupported(ty.span(), "casting to this type");
             return None;
         };
@@ -2869,6 +3233,7 @@ impl Emitter {
             ValueKind::Basic(BasicValueEnum::IntValue(value)) => Core::Int(value),
             ValueKind::Basic(BasicValueEnum::FloatValue(value)) => Core::Float(value),
             ValueKind::Basic(BasicValueEnum::PointerValue(value)) => Core::Ptr(value),
+            ValueKind::Basic(BasicValueEnum::StructValue(value)) => Core::Aggregate(value),
             _ => return Some(Typed::error()),
         };
         Some(Typed {
@@ -3185,6 +3550,16 @@ impl Emitter {
                 );
                 None
             }
+            DuxType::Struct(info) => {
+                self.unsupported(
+                    span,
+                    &format!(
+                        "printing a `{}` whole (print its fields, or give the record a `to_string`)",
+                        info.name
+                    ),
+                );
+                None
+            }
             _ => value.basic(),
         }
     }
@@ -3203,6 +3578,7 @@ impl Emitter {
             BasicValueEnum::IntValue(value) => Core::Int(value),
             BasicValueEnum::FloatValue(value) => Core::Float(value),
             BasicValueEnum::PointerValue(value) => Core::Ptr(value),
+            BasicValueEnum::StructValue(value) => Core::Aggregate(value),
             _ => return None,
         };
         Some(Typed { core, ty })
@@ -3316,17 +3692,17 @@ impl Emitter {
 }
 
 impl Emitter {
-    fn declare_const(&mut self, decl: &ConstDecl) {
+    fn declare_const(&mut self, module: &Module<'static>, decl: &ConstDecl) {
         let name = decl.name.name.clone();
         let Some(ty) = decl
             .ty
             .as_ref()
-            .and_then(DuxType::from_ast)
+            .and_then(|ty| self.type_of(ty))
             .filter(|ty| ty.array_info().is_none())
         else {
             self.unsupported(
                 decl.span,
-                "a `const` whose type is not a primitive yet",
+                "a `const` whose type is not a primitive or a record yet",
             );
             return;
         };
@@ -3336,7 +3712,28 @@ impl Emitter {
         let Some(value) = value.checked(ty, decl.span, self) else {
             return;
         };
-        self.consts.insert(name, Const { ty, value });
+        if self.struct_of(ty).is_none() {
+            self.consts.insert(name, Const { ty, value });
+            return;
+        }
+        let initializer = self.const_initializer(&value, ty);
+        let global = self.module_global(module, ty, &name);
+        global.set_initializer(&initializer);
+        global.set_constant(true);
+        self.globals.insert(name.clone(), (ty, global));
+        self.const_names.insert(name);
+    }
+
+    fn module_global(
+        &mut self,
+        module: &Module<'static>,
+        ty: DuxType,
+        name: &str,
+    ) -> GlobalValue<'static> {
+        if let Some(existing) = module.get_global(name) {
+            return existing;
+        }
+        module.add_global(ty.llvm(self.context), None, name)
     }
 
     fn declare_global(&mut self, module: &Module<'static>, decl: &GlobalDecl) {
@@ -3344,12 +3741,12 @@ impl Emitter {
         let Some(ty) = decl
             .ty
             .as_ref()
-            .and_then(DuxType::from_ast)
+            .and_then(|ty| self.type_of(ty))
             .filter(|ty| ty.array_info().is_none())
         else {
             self.unsupported(
                 decl.span,
-                "a `global` whose type is not a primitive yet",
+                "a `global` whose type is not a primitive or a record yet",
             );
             return;
         };
@@ -3389,6 +3786,23 @@ impl Emitter {
                 .into(),
             ConstValue::Bool(b) => self.context.bool_type().const_int(u64::from(*b), false).into(),
             ConstValue::Str(_) => ty.llvm(self.context).const_zero(),
+            ConstValue::Struct(values) => {
+                let Some(info) = self.struct_of(ty) else {
+                    return ty.llvm(self.context).const_zero();
+                };
+                let mut fields = Vec::new();
+                for (field, field_ty) in &info.fields {
+                    let field_value = values
+                        .iter()
+                        .find(|(written, _)| written == field)
+                        .map(|(_, value)| value.clone());
+                    fields.push(match field_value {
+                        Some(field_value) => self.const_initializer(&field_value, *field_ty),
+                        None => field_ty.llvm(self.context).const_zero(),
+                    });
+                }
+                info.llvm.const_named_struct(&fields).into()
+            }
         }
     }
 
@@ -3410,6 +3824,16 @@ impl Emitter {
             Expr::Float { value, .. } => Some(ConstValue::Float(*value)),
             Expr::Bool { value, .. } => Some(ConstValue::Bool(*value)),
             Expr::Str { text, .. } => Some(ConstValue::Str(text.clone())),
+            Expr::StructLiteral { fields, .. } => {
+                let mut values = Vec::new();
+                for (field, value) in fields {
+                    values.push((
+                        Box::leak(field.name.clone().into_boxed_str()) as &str,
+                        self.const_expr(value)?,
+                    ));
+                }
+                Some(ConstValue::Struct(values))
+            }
             Expr::Paren { inner, .. } => self.const_expr(inner),
             Expr::Unary {
                 op: UnaryOp::Neg,
@@ -3557,6 +3981,16 @@ impl Emitter {
                 DuxType::Bool,
             ),
             ConstValue::Str(text) => self.string_literal(text, span),
+            ConstValue::Struct(_) => {
+                self.diagnostics.push(
+                    Diagnostic::error(
+                        code::CODEGEN_FAILED,
+                        "a record constant lost its storage",
+                    )
+                    .with_span(span),
+                );
+                Typed::error()
+            }
         }
     }
 
@@ -3567,6 +4001,17 @@ impl Emitter {
         self.globals
             .get(name)
             .map(|(ty, global)| (*ty, global.as_pointer_value()))
+    }
+}
+
+/// The name a place expression is rooted in: `unit.min.x` is rooted in
+/// `unit`. Used to refuse an assignment through a `const` record.
+fn place_root(expr: &Expr) -> Option<&str> {
+    match expr {
+        Expr::Ident { name, .. } => Some(name.as_str()),
+        Expr::Paren { inner, .. } => place_root(inner),
+        Expr::Field { base, .. } | Expr::Index { base, .. } => place_root(base),
+        _ => None,
     }
 }
 
@@ -3620,13 +4065,12 @@ fn spec_for(ty: DuxType) -> Option<&'static str> {
         DuxType::F32 | DuxType::F64 => "g",
         DuxType::Str => "s",
         DuxType::Ptr => "p",
-        DuxType::Array(..) | DuxType::Error => return None,
+        DuxType::Array(..) | DuxType::Struct(..) | DuxType::Error => return None,
     })
 }
 
 fn expression_name(expr: &Expr) -> &'static str {
     match expr {
-        Expr::Field { .. } => "a field access (lands at M3)",
         Expr::Member { .. } => "a tuple member (lands at M3)",
         Expr::Range { .. } => "a range (lands at M3)",
         Expr::Path { .. } => "a qualified path",

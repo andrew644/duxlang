@@ -464,6 +464,112 @@ fn main() {
 }
 
 #[test]
+fn a_field_of_a_record_that_does_not_exist_is_reported_once_per_use() {
+    assert_eq!(
+        codes(
+            "struct Point {
+    x: i32,
+    y: i32,
+}
+
+fn main() {
+    p := Point { x: 1, y: 2 }
+    p.z = 3
+    println($\"{}\", p.w)
+}
+"
+        ),
+        vec!["E0201", "E0201"]
+    );
+}
+
+#[test]
+fn a_record_field_is_assigned_a_value_of_its_own_type() {
+    assert_eq!(
+        codes(
+            "struct Window {
+    title: string,
+    width: i32,
+}
+
+fn main() {
+    w := Window { title: \"dux\", width: 8 }
+    w.title = \"duxlang\"
+    w.width += 2
+    println($\"{} {}\", w.title, w.width)
+}
+"
+        ),
+        Vec::<&'static str>::new()
+    );
+    assert_eq!(
+        codes(
+            "struct Window {
+    title: string,
+    width: i32,
+}
+
+fn main() {
+    w := Window { title: \"dux\", width: 8 }
+    w.title = 8
+    println($\"{}\", w.title)
+}
+"
+        ),
+        vec!["E0201"]
+    );
+}
+
+#[test]
+fn a_record_nested_in_a_record_keeps_its_own_fields() {
+    assert_eq!(
+        codes(
+            "struct Vec3 {
+    x: f32,
+    y: f32,
+}
+
+struct AABB {
+    min: Vec3,
+    max: Vec3,
+}
+
+fn main() {
+    box := AABB { min: Vec3 { x: 0.0, y: 0.0 }, max: Vec3 { x: 1.0, y: 1.0 } }
+    edge: f32 = box.max.x
+    wide: f64 = edge
+    box.min.y = 3.0
+    println($\"{} {}\", wide, box.min.y)
+}
+"
+        ),
+        Vec::<&'static str>::new()
+    );
+    assert_eq!(
+        codes(
+            "struct Vec3 {
+    x: f32,
+    y: f32,
+}
+
+struct AABB {
+    min: Vec3,
+    max: Vec3,
+}
+
+fn main() {
+    box := AABB { min: Vec3 { x: 0.0, y: 0.0 }, max: Vec3 { x: 1.0, y: 1.0 } }
+    box.max.x = \"east\"
+    box.min = 2.0
+    println($\"{}\", box.max.x)
+}
+"
+        ),
+        vec!["E0201", "E0201"]
+    );
+}
+
+#[test]
 fn indexing_an_array_yields_its_element_type() {
     assert_eq!(
         codes(

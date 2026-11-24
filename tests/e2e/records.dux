@@ -1,0 +1,32 @@
+package main
+
+struct Vec3 {
+    x: f32,
+    y: f32,
+    z: f32,
+}
+
+struct AABB {
+    min: Vec3,
+    max: Vec3,
+}
+
+const UNIT: Vec3 = Vec3 { x: 1.0, y: 1.0, z: 1.0 }
+
+fn shifted(amount: f32) -> Vec3 {
+    return Vec3 { z: 0.0, y: 2.0 + amount, x: UNIT.x }
+}
+
+fn main() {
+    v := Vec3 { x: 3.0, y: 4.0, z: 0.0 }
+    box := AABB { min: Vec3 { x: 0.0, y: 0.0, z: 0.0 }, max: UNIT }
+
+    copy := v
+    copy.z = 9.0
+
+    zero: Vec3
+    tall := shifted(1.0)
+
+    println($"v=({v.x}, {v.y}, {v.z})")
+    println($"copy.z={} v.z={} box.max.y={} zero.z={} tall.y={}", copy.z, v.z, box.max.y, zero.z, tall.y)
+}

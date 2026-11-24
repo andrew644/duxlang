@@ -119,6 +119,17 @@ impl Ty {
         }
     }
 
+    /// An untyped literal next to a concrete value takes that type (D17): a
+    /// float literal beside an `f32` is an `f32`, so `2.0 + width` stays in
+    /// the precision the program asked for. Beside an `f64`, or beside
+    /// anything but a float, the literal keeps its own default.
+    fn adopt(&self, other: &Ty) -> Ty {
+        match self {
+            Ty::FloatConst(_) if other.is_float() => other.clone(),
+            concrete => concrete.clone(),
+        }
+    }
+
     /// Does this literal value fit a target of `self`? Mirrors the signed
     /// limits exactly, so `-128: i8` is fine and `128: i8` is not.
     fn fits(&self, value: i128) -> bool {
@@ -545,6 +556,7 @@ impl<'a> Checker<'a> {
         if left == Ty::Opaque || right == Ty::Opaque {
             return Ty::Opaque;
         }
+        let (left, right) = (left.adopt(&right), right.adopt(&left));
         let left = left.defaulted();
         let right = right.defaulted();
         if left == Ty::Str || right == Ty::Str {
@@ -826,7 +838,7 @@ impl<'a> Checker<'a> {
             Expr::Call { callee, args, span } => self.call(callee, args, *span),
             Expr::Field { base, name, .. } => {
                 let base = self.infer(base);
-                self.field_type(&base, &name.name)
+                self.field_type(&base, &name.name, name.span)
             }
             Expr::Index { base, index, span } => {
                 let base = self.infer(base);
@@ -886,6 +898,7 @@ impl<'a> Checker<'a> {
                             }
                             None => {
                                 let _ = self.infer(value);
+                                self.missing_field(name, &field.name, field.span);
                             }
                         },
                         None => {
@@ -978,15 +991,36 @@ impl<'a> Checker<'a> {
         Ty::Array(Box::new(known.unwrap_or(Ty::Opaque)))
     }
 
-    fn field_type(&mut self, base: &Ty, field: &str) -> Ty {
+    /// The type of `base.field`. A field of a declared `struct` that does not
+    /// exist is reported; anything the checker does not know the shape of
+    /// stays silent.
+    fn field_type(&mut self, base: &Ty, field: &str, span: Span) -> Ty {
         if let Ty::Struct(name) = base {
             if let Some(fields) = self.structs.get(name) {
                 if let Some((_, ty)) = fields.iter().find(|(known, _)| known == field) {
                     return self.resolve_type(ty);
                 }
+                self.missing_field(name, field, span);
             }
         }
         Ty::Opaque
+    }
+
+    fn missing_field(&mut self, owner: &str, field: &str, span: Span) {
+        let mut known: Vec<&str> = self
+            .structs
+            .get(owner)
+            .map(|fields| fields.iter().map(|(known, _)| known.as_str()).collect())
+            .unwrap_or_default();
+        known.sort_unstable();
+        self.report(
+            span,
+            Diagnostic::error(
+                code::TYPE_MISMATCH,
+                format!("`{owner}` has no field `{field}`"),
+            )
+            .with_note(format!("the fields of `{owner}` are {}", known.join(", "))),
+        );
     }
 
     fn call(&mut self, callee: &Expr, args: &[Expr], span: Span) -> Ty {
@@ -1227,8 +1261,33 @@ impl<'a> Checker<'a> {
                 None => {}
             }
         }
+        if let Expr::Field { base, name, .. } = target {
+            if let Some(root) = place_root(target) {
+                if self.lookup(&root).is_some_and(|context| context.is_const) {
+                    self.report(
+                        target.span(),
+                        Diagnostic::error(
+                            code::ASSIGN_TO_CONST,
+                            format!("`{root}` is a `const`; its fields cannot be assigned"),
+                        ),
+                    );
+                    return;
+                }
+            }
+            let base = self.infer(base);
+            let field = self.field_type(&base, &name.name, name.span);
+            if field != Ty::Opaque {
+                self.expect(value, &field);
+                if op != AssignOp::Set {
+                    self.compound(op, &field, span);
+                }
+                return;
+            }
+            let _ = self.infer(value);
+            return;
+        }
         match target {
-            Expr::Field { base, .. } | Expr::Index { base, .. } => {
+            Expr::Index { base, .. } => {
                 let _ = self.infer(base);
             }
             Expr::Unary { operand, .. } => {
@@ -1240,7 +1299,7 @@ impl<'a> Checker<'a> {
     }
 
     fn compound(&mut self, op: AssignOp, target: &Ty, span: Span) {
-        if *target == Ty::Opaque || target.is_numeric() || *target == Ty::Ptr {
+        if *target == Ty::Opaque || target.is_numeric() || *target == Ty::Ptr || *target == Ty::Str {
             return;
         }
         self.error(
@@ -1393,6 +1452,17 @@ fn float_fold(op: BinaryOp, a: f64, b: f64) -> Option<Ty> {
         _ => return None,
     };
     Some(Ty::FloatConst(value))
+}
+
+/// The name a place expression is rooted in: `unit.min.x` is rooted in
+/// `unit`, so a `const` record keeps its fields frozen too.
+fn place_root(expr: &Expr) -> Option<String> {
+    match expr {
+        Expr::Ident { name, .. } => Some(name.clone()),
+        Expr::Paren { inner, .. } => place_root(inner),
+        Expr::Field { base, .. } | Expr::Index { base, .. } => place_root(base),
+        _ => None,
+    }
 }
 
 fn symbol(op: BinaryOp) -> &'static str {

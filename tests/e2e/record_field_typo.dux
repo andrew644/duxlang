@@ -1,0 +1,14 @@
+//@expect-error E0201
+package main
+
+struct Vec3 {
+    x: f32,
+    y: f32,
+    z: f32,
+}
+
+fn main() {
+    v := Vec3 { x: 1.0, y: 2.0, z: 3.0 }
+    v.w = 4.0
+    println($"{}", v.z)
+}

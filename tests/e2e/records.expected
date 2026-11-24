@@ -1,0 +1,2 @@
+v=(3, 4, 0)
+copy.z=9 v.z=0 box.max.y=1 zero.z=0 tall.y=3
