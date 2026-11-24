@@ -1,0 +1,8 @@
+//@expect-error E0005
+package main
+
+fn main() {
+    wide := 1
+    narrow: i8 = 0
+    narrow = wide
+}

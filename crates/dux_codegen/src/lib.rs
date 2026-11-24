@@ -1,16 +1,16 @@
-use dux_ast::{Expr, FnDecl, Program, Stmt, StrKind};
+use dux_ast::{FnDecl, Program};
 use dux_diag::{code, Diagnostic};
-use dux_source::Span;
 use inkwell::context::Context;
 use inkwell::module::Module;
-use inkwell::builder::Builder;
 use inkwell::targets::{
     CodeModel, FileType, InitializationConfig, RelocMode, Target, TargetMachine,
 };
-use inkwell::types::IntType;
-use inkwell::values::{BasicMetadataValueEnum, FunctionValue, IntValue, PointerValue};
-use inkwell::{AddressSpace, OptimizationLevel};
+use inkwell::{OptimizationLevel};
 use std::path::Path;
+
+mod lower;
+
+use lower::Emitter;
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum OptLevel {
@@ -90,17 +90,10 @@ impl CompiledModule {
         module.set_triple(&machine.get_triple());
         module.set_data_layout(&machine.get_target_data().get_data_layout());
 
-        let mut emitter = Emitter {
-            context,
-            puts: None,
-            fputs: None,
-            diagnostics: Vec::new(),
-        };
-        let main = select_main(program)?;
-        emitter.lower_main(&module, main);
-
-        if !emitter.diagnostics.is_empty() {
-            return Err(emitter.diagnostics);
+        select_main(program)?;
+        let diagnostics = Emitter::new(context).lower(&module, program);
+        if !diagnostics.is_empty() {
+            return Err(diagnostics);
         }
         module.verify().map_err(|e| {
             vec![Diagnostic::error(
@@ -161,7 +154,11 @@ fn target_machine(opt_level: OptLevel) -> Result<TargetMachine, Vec<Diagnostic>>
         })
 }
 
-fn run_passes(module: &Module, machine: &TargetMachine, opt_level: OptLevel) -> Result<(), Vec<Diagnostic>> {
+fn run_passes(
+    module: &Module,
+    machine: &TargetMachine,
+    opt_level: OptLevel,
+) -> Result<(), Vec<Diagnostic>> {
     if opt_level == OptLevel::None {
         return Ok(());
     }
@@ -216,202 +213,4 @@ fn select_main(program: &Program) -> Result<&FnDecl, Vec<Diagnostic>> {
         }
     }
     Ok(main)
-}
-
-struct Emitter {
-    context: &'static Context,
-    puts: Option<FunctionValue<'static>>,
-    fputs: Option<FunctionValue<'static>>,
-    diagnostics: Vec<Diagnostic>,
-}
-
-impl Emitter {
-    fn lower_main(&mut self, module: &Module<'static>, main: &FnDecl) {
-        let i32: IntType = self.context.i32_type();
-        let zero: IntValue = i32.const_int(0, false);
-        let fn_value = module.add_function("main", i32.fn_type(&[], false), None);
-        let block = self.context.append_basic_block(fn_value, "entry");
-        let builder = self.context.create_builder();
-        builder.position_at_end(block);
-
-        for stmt in &main.body.stmts {
-            self.lower_stmt(module, &builder, stmt);
-        }
-        if let Err(e) = builder.build_return(Some(&zero)) {
-            self.diagnostics.push(Diagnostic::error(
-                code::CODEGEN_FAILED,
-                format!("failed to emit the return from main: {e}"),
-            ));
-        }
-    }
-
-    fn lower_stmt(
-        &mut self,
-        module: &Module<'static>,
-        builder: &Builder<'static>,
-        stmt: &Stmt,
-    ) {
-        match stmt {
-            Stmt::Expr { expr, .. } => {
-                if !matches!(expr, Expr::Call { .. }) {
-                    self.unsupported(expr.span(), "an expression statement that is not a call");
-                }
-                self.lower_call_as_statement(module, builder, expr);
-            }
-            Stmt::Return { value, span } => match value {
-                None => self.unsupported(*span, "`return` in `fn main()`"),
-                Some(_) => self.unsupported(*span, "`return` with a value"),
-            },
-            other => self.unsupported(other.span(), statement_name(other)),
-        }
-    }
-
-    fn lower_call_as_statement(
-        &mut self,
-        module: &Module<'static>,
-        builder: &Builder<'static>,
-        expr: &Expr,
-    ) {
-        let Expr::Call { callee, args, span } = expr else {
-            self.unsupported(expr.span(), "this statement");
-            return;
-        };
-        let Expr::Ident { ref name, .. } = **callee else {
-            self.unsupported(*span, "calling anything but a plain named function");
-            return;
-        };
-        if !matches!(name.as_str(), "print" | "println") {
-            self.unsupported(*span, &format!("call to `{name}`"));
-            return;
-        }
-        if args.len() != 1 {
-            self.unsupported(*span, &format!("`{name}` with {} arguments", args.len()));
-            return;
-        }
-        let Expr::Str { text, kind, span: arg_span } = &args[0] else {
-            self.unsupported(args[0].span(), &format!("a non-literal argument to `{name}`"));
-            return;
-        };
-        if *kind == StrKind::Interpolated {
-            self.unsupported(*arg_span, "string interpolation");
-            return;
-        }
-        let payload = text.clone();
-        let global = match builder.build_global_string_ptr(&payload, "lit") {
-            Ok(global) => global,
-            Err(e) => {
-                self.diagnostics.push(
-                    Diagnostic::error(
-                        code::CODEGEN_FAILED,
-                        format!("failed to emit the string literal: {e}"),
-                    )
-                    .with_span(*arg_span),
-                );
-                return;
-            }
-        };
-        let text_ptr = global.as_pointer_value();
-        let arguments: Vec<BasicMetadataValueEnum> = if name == "println" {
-            vec![text_ptr.into()]
-        } else {
-            let Some(stream) = self.stdout(module, builder) else {
-                return;
-            };
-            vec![text_ptr.into(), stream.into()]
-        };
-        let callee = if name == "println" {
-            self.libc_puts(module)
-        } else {
-            self.libc_fputs(module)
-        };
-        if let Err(e) = builder.build_call(callee, &arguments, "write") {
-            self.diagnostics.push(
-                Diagnostic::error(
-                    code::CODEGEN_FAILED,
-                    format!("failed to emit the write call: {e}"),
-                )
-                .with_span(*span),
-            );
-        }
-    }
-
-    fn libc_puts(&mut self, module: &Module<'static>) -> FunctionValue<'static> {
-        if let Some(puts) = self.puts {
-            return puts;
-        }
-        let c_char = self.context.ptr_type(AddressSpace::default());
-        let puts = module.add_function(
-            "puts",
-            self.context.i32_type().fn_type(&[c_char.into()], false),
-            None,
-        );
-        self.puts = Some(puts);
-        puts
-    }
-
-    fn libc_fputs(&mut self, module: &Module<'static>) -> FunctionValue<'static> {
-        if let Some(fputs) = self.fputs {
-            return fputs;
-        }
-        let c_char = self.context.ptr_type(AddressSpace::default());
-        let fputs = module.add_function(
-            "fputs",
-            self.context
-                .i32_type()
-                .fn_type(&[c_char.into(), c_char.into()], false),
-            None,
-        );
-        self.fputs = Some(fputs);
-        fputs
-    }
-
-    fn stdout(
-        &mut self,
-        module: &Module<'static>,
-        builder: &Builder<'static>,
-    ) -> Option<PointerValue<'static>> {
-        let c_char = self.context.ptr_type(AddressSpace::default());
-        let stream = module
-            .get_global("stdout")
-            .unwrap_or_else(|| module.add_global(c_char, None, "stdout"));
-        match builder.build_load(c_char, stream.as_pointer_value(), "stdout") {
-            Ok(loaded) => Some(loaded.into_pointer_value()),
-            Err(e) => {
-                self.diagnostics.push(Diagnostic::error(
-                    code::CODEGEN_FAILED,
-                    format!("failed to reach `stdout`: {e}"),
-                ));
-                None
-            }
-        }
-    }
-
-    fn unsupported(&mut self, span: Span, what: &str) {
-        self.diagnostics.push(
-            Diagnostic::error(
-                code::UNSUPPORTED_IN_BUILD,
-                format!("{what} is not supported by this compiler build yet"),
-            )
-            .with_span(span)
-            .with_note("this is a milestone limitation, not a language decision"),
-        );
-    }
-}
-
-fn statement_name(stmt: &Stmt) -> &'static str {
-    match stmt {
-        Stmt::Binding { .. } => "a binding",
-        Stmt::Assign { .. } => "an assignment",
-        Stmt::Expr { .. } => "an expression statement",
-        Stmt::Return { .. } => "a return",
-        Stmt::Break { .. } => "`break`",
-        Stmt::Continue { .. } => "`continue`",
-        Stmt::Defer { .. } => "`defer`",
-        Stmt::Block { .. } => "a nested block",
-        Stmt::If { .. } => "an `if`",
-        Stmt::While { .. } => "a `while`",
-        Stmt::Loop { .. } => "a `loop`",
-        Stmt::For { .. } => "a `for`",
-        Stmt::Error { .. } => "an erroneous statement",
-    }
 }

@@ -242,3 +242,46 @@ patterns at M4), and `Expr::InterpString { parts }` with `InterpolationPart::{Te
 
 Fixed while writing the tests: an early `for_clauses` treated `for i, v in xs` as three-clause,
 and a pattern condition's value was parsed outside the no-struct-literal guard.
+
+
+## Session 6 — the emitter lowers a real program
+
+Finished the half-written `crates/dux_codegen/src/lower.rs` (it had been left untracked and
+disconnected: `binary_op` was a stub, the `&&`/`||` phi was fake, `declare` gave every function a
+void return) and wired it into `CompiledModule::build`, replacing the hello-only `Emitter`.
+`cargo test`: 86 passing, clippy clean. **`example/fizzbuzz.dux` now compiles, runs, and matches
+`fizzbuzz.expected` in debug and `--release`** — that is the first non-trivial program the
+compiler can actually build.
+
+The emitter today:
+
+- Functions: two passes (declare signatures, then lower bodies). Primitive parameters/results,
+  `return`, arity checked at the call. `main` is `int main(void)` (D12); fall-through returns 0.
+- Bindings and assignment: one alloca per binding in the entry block (inserted *before* the
+  terminator, which is what the verifier demands), compound assignment through the same binary
+  lowering. Integer literals default to `i32` (types.dux comment) and adopt an annotated target
+  type when they fit; `-2147483648` reaches `i32` through the negation-of-a-literal path.
+- D25 implemented where it bites: implicit conversion exactly when lossless (s→s/u→w, u→s
+  strictly wider, ≤i32→f64, f32→f64); anything else is one diagnostic that prints the `as`
+  spelling. `as` maps to the full cast set (sext/zext/trunc, sitofp/fptosi, fptrunc/fpext,
+  ptr↔int). Mixed signedness at one rank picks the wider signed type.
+- Control flow: `if`/`else if`/`else`, `while`, `loop`, three-clause `for` (cond/body/step/exit,
+  `continue` binds to the step block), `break`/`continue` through a loop stack. Failed conditions
+  become `false` so every block keeps a terminator and the verifier stays quiet.
+- `&&`/`||` short-circuit with a real `phi i1`.
+- `print`/`println`: literal strings stay `puts`/`fputs` (no libc stdio setup for hello world);
+  `$".."` lowers to one `printf` with the holes' conversions chosen from their types
+  (`%d/%u/%ld/%lu/%g/%s/%p`, bool selects a `"true"`/`"false"` literal, small ints and f32
+  promote for varargs, `%%` escaped). Written holes read scope; `{}` holes consume the call's
+  trailing arguments in order — `println($"{}", i)` (rule 10) works.
+
+Still `E0007` by milestone, each named in its diagnostic: `defer`, `for .. in` (M3); pattern
+conditions and `match` (M4); generics (M5); `const`/`global` (the resolver's side of M2).
+
+Fixed while writing the tests: allocas after the entry terminator; void return type on every
+declared function; the old `x := 1` milestone test now uses `defer` since bindings work.
+
+Promoted into `tests/e2e/`: `fizzbuzz.dux` (with `//@release`) and `flow.dux` (functions, all
+three loop forms, break/continue, short-circuit, interpolation), plus `lossy_narrow.dux`
+(`//@expect-error E0005`) as the first negative codegen fixture. 11 new `ir.rs` tests pin the
+shapes above.
