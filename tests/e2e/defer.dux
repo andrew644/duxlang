@@ -1,0 +1,28 @@
+package main
+
+fn mark(name: string) {
+    println($"mark {name}")
+}
+
+fn closer(id: i32) {
+    println($"close {id}")
+}
+
+fn early() -> i32 {
+    defer mark("early exit")
+    closer(7)
+    if true {
+        return 1
+    }
+    println("never reached")
+    return 0
+}
+
+fn main() {
+    defer mark("one")
+    defer println($"two + 1 = {2 + 1}")
+    defer closer(42)
+    println("body")
+    x := early()
+    println($"got {x}")
+}

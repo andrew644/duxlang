@@ -84,7 +84,7 @@ fn a_program_without_main_is_reported_before_any_ir_is_emitted() {
 
 #[test]
 fn unlowered_code_reports_the_milestone_code_with_a_span() {
-    let errors = build("package main\nfn main() { defer println(\"x\") }").unwrap_err();
+    let errors = build("package main\nfn main() { x := Point { y: 1 } }").unwrap_err();
     assert_eq!(
         errors[0].code,
         dux_diag::code::UNSUPPORTED_IN_BUILD,
@@ -136,6 +136,24 @@ fn a_value_if_meets_at_a_phi() {
     .expect("builds")
     .ir_text();
     assert!(ir.contains("phi ptr"), "string arms meet at a pointer phi:\n{ir}");
+}
+
+#[test]
+fn defer_replays_captured_calls_at_every_exit() {
+    let ir = build(
+        "package main\nfn bye(n: i32) { print(\"bye\") }\nfn main() { defer bye(7); if true { return } }",
+    )
+    .expect("builds")
+    .ir_text();
+    assert!(
+        ir.contains("call void @bye(i32 %load"),
+        "the argument is captured at the `defer`:\n{ir}"
+    );
+    assert_eq!(
+        ir.matches("call void @bye(i32 %load").count(),
+        2,
+        "both exits replay the call:\n{ir}"
+    );
 }
 
 #[test]
@@ -288,7 +306,10 @@ fn milestone_gaps_report_e0007_with_the_milestone_in_the_message() {
             "package main\nfn main() { for b in \"abc\" { print(b) } }",
             "iterating a `string`",
         ),
-        ("package main\nfn main() { defer println(\"x\") }", "`defer`"),
+        (
+            "package main\nfn main() { if true { defer println(\"x\") } }",
+            "nested block",
+        ),
     ];
     for (source, needle) in cases {
         let errors = build(source).unwrap_err();

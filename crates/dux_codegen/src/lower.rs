@@ -357,9 +357,25 @@ fn fits_i128(value: i128, ty: DuxType) -> bool {
     }
 }
 
+#[derive(Clone)]
 struct Signature {
     params: Vec<DuxType>,
     return_ty: Option<DuxType>,
+}
+
+/// A call captured by `defer`: its arguments were evaluated at the point of
+/// the `defer` statement and live in slots; the epilogue replays the call.
+enum Deferred {
+    Write {
+        newline: bool,
+        parts: Vec<InterpolationPart>,
+        slots: Vec<(DuxType, PointerValue<'static>)>,
+        span: Span,
+    },
+    Call {
+        name: String,
+        slots: Vec<(DuxType, PointerValue<'static>)>,
+    },
 }
 
 pub(crate) struct Emitter {
@@ -375,6 +391,7 @@ pub(crate) struct Emitter {
     consts: HashMap<String, Const>,
     globals: HashMap<String, (DuxType, GlobalValue<'static>)>,
     loops: Vec<Loop>,
+    defers: Vec<Deferred>,
     allocas: Option<BasicBlock<'static>>,
     result_ty: Option<DuxType>,
     is_main: bool,
@@ -398,6 +415,7 @@ impl Emitter {
             consts: HashMap::new(),
             globals: HashMap::new(),
             loops: Vec::new(),
+            defers: Vec::new(),
             allocas: None,
             result_ty: None,
             is_main: false,
@@ -538,6 +556,7 @@ impl Emitter {
         self.scopes.clear();
         self.scopes.push(HashMap::new());
         self.loops.clear();
+        self.defers.clear();
         self.dead = false;
         self.is_main = name == "main";
         self.result_ty = if self.is_main {
@@ -576,6 +595,7 @@ impl Emitter {
             .get_insert_block()
             .is_some_and(|block| block.get_terminator().is_none())
         {
+            self.fire_defers(module);
             self.finish_function(function);
         }
         self.allocas = None;
@@ -685,10 +705,7 @@ impl Emitter {
                 }
             }
             Stmt::Return { value, span } => self.return_stmt(module, value.as_ref(), *span),
-            Stmt::Defer { .. } => {
-                self.unsupported(stmt.span(), "`defer` (lands at M3)");
-                self.dead = true;
-            }
+            Stmt::Defer { stmt, span } => self.defer_stmt(module, stmt, *span),
             Stmt::Block { block, .. } => self.block_body(module, block),
             Stmt::Error { .. } => {}
         }
@@ -840,6 +857,7 @@ impl Emitter {
     }
 
     fn return_stmt(&mut self, module: &Module<'static>, value: Option<&Expr>, span: Span) {
+        self.fire_defers(module);
         match (value, self.result_ty) {
             (None, Some(ty)) => {
                 if self.is_main || ty == DuxType::I32 || ty == DuxType::I64 {
@@ -1039,6 +1057,260 @@ impl Emitter {
         let at = self.builder.get_insert_block()?;
         let value = value?;
         Some((value, at))
+    }
+
+    /// Capture a deferred call. The callee and its arguments are evaluated
+    /// now, at the `defer` statement; only the call itself is postponed to
+    /// every exit of the enclosing function.
+    fn defer_stmt(&mut self, module: &Module<'static>, stmt: &Stmt, span: Span) {
+        if self.scopes.len() != 2 {
+            self.unsupported(
+                span,
+                "`defer` inside a nested block (per-path defer chains land at M3)",
+            );
+            return;
+        }
+        let Stmt::Expr {
+            expr: Expr::Call { callee, args, .. },
+            ..
+        } = stmt
+        else {
+            self.unsupported(span, "deferring anything but a call expression");
+            return;
+        };
+        let Expr::Ident { name, .. } = callee.as_ref() else {
+            self.unsupported(span, "deferring a call to anything but a plain named function");
+            return;
+        };
+        if name == "print" || name == "println" {
+            self.defer_write(module, name, args, span);
+            return;
+        }
+        if self.skipped.contains(name.as_str()) {
+            return;
+        }
+        let Some(signature) = self.signatures.get(name.as_str()).cloned() else {
+            self.diagnostics.push(
+                Diagnostic::error(
+                    code::UNDECLARED,
+                    format!("`{name}` is not declared in this scope"),
+                )
+                .with_span(callee.span()),
+            );
+            return;
+        };
+        if args.len() != signature.params.len() {
+            self.diagnostics.push(
+                Diagnostic::error(
+                    code::WRONG_ARITY,
+                    format!(
+                        "`{name}` takes {} arguments, given {}",
+                        signature.params.len(),
+                        args.len()
+                    ),
+                )
+                .with_span(span),
+            );
+            return;
+        }
+        let mut slots = Vec::new();
+        for (index, (parameter, arg)) in
+            signature.params.iter().zip(args.iter()).enumerate()
+        {
+            let Some(value) = self.expr(module, arg, Some(*parameter)) else {
+                return;
+            };
+            if value.ty == DuxType::Error {
+                return;
+            }
+            let Some(value) = self.coerce_implicit(module, value, *parameter, arg.span()) else {
+                return;
+            };
+            let Some(slot) = self.capture(module, value, &format!("defer{index}"), arg.span())
+            else {
+                return;
+            };
+            slots.push(slot);
+        }
+        self.defers.push(Deferred::Call {
+            name: name.clone(),
+            slots,
+        });
+    }
+
+    fn defer_write(
+        &mut self,
+        module: &Module<'static>,
+        name: &str,
+        args: &[Expr],
+        span: Span,
+    ) {
+        let newline = name == "println";
+        let (parts, values) = match args.first() {
+            None => {
+                if name == "print" {
+                    self.unsupported(span, "`print` with no argument");
+                    return;
+                }
+                (Vec::new(), Vec::new())
+            }
+            Some(Expr::Str { text, .. }) if args.len() == 1 => (
+                vec![dux_ast::InterpolationPart::Text(text.clone())],
+                Vec::new(),
+            ),
+            Some(Expr::InterpString { parts, .. }) => {
+                match self.lower_holes(module, parts, &args[1..], span) {
+                    Some(values) => (parts.clone(), values),
+                    None => return,
+                }
+            }
+            Some(other) => {
+                if args.len() > 1 {
+                    self.unsupported(
+                        span,
+                        "extra arguments to a value that is not an interpolated string",
+                    );
+                    return;
+                };
+                let Some(value) = self.expr(module, other, None) else {
+                    return;
+                };
+                if value.ty != DuxType::Str {
+                    self.unsupported(
+                        other.span(),
+                        &format!(
+                            "printing a `{}` directly (wrap it in a $\"..\" string)",
+                            value.ty.name()
+                        ),
+                    );
+                    return;
+                }
+                (
+                    vec![dux_ast::InterpolationPart::Hole {
+                        written: None,
+                        span: other.span(),
+                    }],
+                    vec![value],
+                )
+            }
+        };
+        let mut slots = Vec::new();
+        for (index, value) in values.into_iter().enumerate() {
+            let Some(slot) = self.capture(module, value, &format!("defer{index}"), span) else {
+                return;
+            };
+            slots.push(slot);
+        }
+        self.defers.push(Deferred::Write {
+            newline,
+            parts,
+            slots,
+            span,
+        });
+    }
+
+    /// Store a value into a fresh slot so a deferred call can replay it.
+    fn capture(
+        &mut self,
+        _module: &Module<'static>,
+        value: Typed,
+        name: &str,
+        span: Span,
+    ) -> Option<(DuxType, PointerValue<'static>)> {
+        let slot = self.alloca(value.ty, name);
+        match (value.ty.array_info(), value.core) {
+            (Some(info), Core::Ptr(source)) => {
+                self.copy_array(slot, source, info);
+                Some((value.ty, slot))
+            }
+            (None, _) => {
+                let Some(basic) = value.basic() else {
+                    self.unsupported(span, "capturing this value for `defer`");
+                    return None;
+                };
+                let _ = self.builder.build_store(slot, basic);
+                Some((value.ty, slot))
+            }
+            (Some(_), _) => {
+                self.unsupported(span, "capturing this array value for `defer`");
+                None
+            }
+        }
+    }
+
+    /// Replay every deferred call at a function exit, innermost first. The
+    /// list is left intact: each exit block replays the same registrations.
+    fn fire_defers(&mut self, module: &Module<'static>) {
+        enum Owned {
+            Write {
+                newline: bool,
+                parts: Vec<InterpolationPart>,
+                slots: Vec<(DuxType, PointerValue<'static>)>,
+                span: Span,
+            },
+            Call {
+                name: String,
+                slots: Vec<(DuxType, PointerValue<'static>)>,
+            },
+        }
+        for index in (0..self.defers.len()).rev() {
+            let owned = match &self.defers[index] {
+                Deferred::Write {
+                    newline,
+                    parts,
+                    slots,
+                    span,
+                } => Owned::Write {
+                    newline: *newline,
+                    parts: parts.clone(),
+                    slots: slots.clone(),
+                    span: *span,
+                },
+                Deferred::Call { name, slots } => Owned::Call {
+                    name: name.clone(),
+                    slots: slots.clone(),
+                },
+            };
+            match owned {
+                Owned::Write {
+                    newline,
+                    parts,
+                    slots,
+                    span,
+                } => {
+                    let mut values = Vec::new();
+                    for (ty, slot) in &slots {
+                        let Some(value) = self.load(*ty, *slot) else {
+                            continue;
+                        };
+                        values.push(value);
+                    }
+                    let _ = self.write_prepared(module, &parts, &values, newline, span);
+                }
+                Owned::Call { name, slots } => {
+                    let Some(function) = self.functions.get(name.as_str()).copied() else {
+                        continue;
+                    };
+                    let mut arguments = Vec::new();
+                    let mut ready = true;
+                    for (ty, slot) in &slots {
+                        match self.load(*ty, *slot).and_then(|value| value.basic()) {
+                            Some(basic) => arguments.push(BasicMetadataValueEnum::from(basic)),
+                            None => {
+                                ready = false;
+                                break;
+                            }
+                        }
+                    }
+                    if ready {
+                        let _ = self
+                            .builder
+                            .build_call(function, &arguments, "deferred")
+                            .ok();
+                    }
+                }
+            }
+        }
     }
 
     /// A block in value position stores its tail expression twice: as the
@@ -2528,29 +2800,33 @@ impl Emitter {
         newline: bool,
         span: Span,
     ) -> Option<()> {
-        let mut format = String::new();
+        let values = self.lower_holes(module, parts, positional, span)?;
+        self.write_prepared(module, parts, &values, newline, span)
+    }
+
+    /// Lower every hole of an interpolated string, in order: written holes
+    /// from the string, bare `{}` holes from the trailing arguments.
+    fn lower_holes(
+        &mut self,
+        module: &Module<'static>,
+        parts: &[InterpolationPart],
+        positional: &[Expr],
+        span: Span,
+    ) -> Option<Vec<Typed>> {
         let mut values: Vec<Typed> = Vec::new();
         let mut next_positional = 0usize;
         for part in parts {
             match part {
-                InterpolationPart::Text(text) => {
-                    for c in text.chars() {
-                        if c == '%' {
-                            format.push_str("%%");
-                        } else {
-                            format.push(c);
-                        }
-                    }
-                }
+                InterpolationPart::Text(_) => {}
                 InterpolationPart::Hole {
                     written: Some(expr), ..
                 } => {
                     let value = self.expr(module, expr, None)?;
                     values.push(value);
-                    format.push('%');
-                    format.push_str(spec_for(value.ty)?);
                 }
-                InterpolationPart::Hole { written: None, .. } => {
+                InterpolationPart::Hole {
+                    written: None, ..
+                } => {
                     let Some(expr) = positional.get(next_positional) else {
                         self.diagnostics.push(
                             Diagnostic::error(
@@ -2564,8 +2840,6 @@ impl Emitter {
                     next_positional += 1;
                     let value = self.expr(module, expr, None)?;
                     values.push(value);
-                    format.push('%');
-                    format.push_str(spec_for(value.ty)?);
                 }
             }
         }
@@ -2577,6 +2851,67 @@ impl Emitter {
                         "{} arguments given for {} holes",
                         positional.len(),
                         next_positional
+                    ),
+                )
+                .with_span(span),
+            );
+            return None;
+        }
+        Some(values)
+    }
+
+    /// Emit a printf call for an interpolated string whose hole values are
+    /// already lowered — the same path `defer` replays.
+    fn write_prepared(
+        &mut self,
+        module: &Module<'static>,
+        parts: &[InterpolationPart],
+        values: &[Typed],
+        newline: bool,
+        span: Span,
+    ) -> Option<()> {
+        let mut format = String::new();
+        let mut next_value = 0usize;
+        for part in parts {
+            match part {
+                InterpolationPart::Text(text) => {
+                    for c in text.chars() {
+                        if c == '%' {
+                            format.push_str("%%");
+                        } else {
+                            format.push(c);
+                        }
+                    }
+                }
+                InterpolationPart::Hole { .. } => {
+                    let Some(value) = values.get(next_value) else {
+                        self.diagnostics.push(
+                            Diagnostic::error(
+                                code::CODEGEN_FAILED,
+                                "an interpolated string lost one of its values",
+                            )
+                            .with_span(span),
+                        );
+                        return None;
+                    };
+                    next_value += 1;
+                    format.push('%');
+                    let spec = spec_for(value.ty).or_else(|| {
+                        self.unsupported(span, "printing a value in a $\"..\" hole");
+                        None
+                    })?;
+                    format.push_str(spec);
+                }
+            }
+        }
+        if next_value != values.len() {
+            self.diagnostics.push(
+                Diagnostic::error(
+                    code::UNEXPECTED_TOKEN,
+                    format!(
+                        "{} arguments given for {} holes",
+                        values.len(),
+                        next_value
                     ),
                 )
                 .with_span(span),
@@ -2601,7 +2936,7 @@ impl Emitter {
         };
         let mut arguments: Vec<BasicMetadataValueEnum> = vec![format_ptr.into()];
         for value in values {
-            let prepared = self.prepare_for_format(value, span)?;
+            let prepared = self.prepare_for_format(*value, span)?;
             arguments.push(prepared.into());
         }
         let printf = self.printf_fn(module);
