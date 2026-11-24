@@ -440,3 +440,47 @@ then.
 Tests: 18 in `dux_hir/tests/typecheck.rs` (per-code negatives, lattice
 positives, corpus silence), 4 new e2e fixtures, `lossy_narrow` upgraded from
 E0005 to E0200. 142 tests, clippy clean.
+
+## Session 10 — M2 closes: value `if`, arrays, `for .. in`, `defer`, line tables
+
+Five steps, each committed green.
+
+**Value `if`.** The parser had been stubbing a value-position `if`'s then arm
+to a placeholder `Error`; both arms now parse as blocks whose tail expression
+is the block's value (the parser already did this for `else`). The checker's
+arm-unify rule became reachable the moment the arms were real — the test that
+was deliberately parked in session 9 was restored and passes. Codegen meets
+the arms at a phi, coercing both to a common type first. A block in value
+position stores its tail expression twice (last statement *and* `Block.value`),
+so the checker and the emitter each skip the duplicate — otherwise `{ "a" }`
+checks or lowers twice.
+
+**Fixed arrays.** `DuxType` gains `Array(&'static ArrayInfo)` (interned so the
+enum stays `Copy`). A `[T; N]` value is always a pointer to `[N x T]` storage;
+bindings that must copy (`copy := dims`) copy element by element, so `dims`
+stays untouched. Literals, repeated `[0; N]`, zero-initialised annotations
+`scratch: [i32; 4]`, and index read/write all lower through GEPs. No bounds
+traps — there is no panic runtime yet; recorded in `docs/status.md`.
+
+**`for .. in`.** Over an array (`v` or `i, v`, counter walks `[0,len)`) and
+over a range (`a..b`, `a..=b`, `i64` counter). `break`/`continue` bind to the
+loop, `continue` runs the step. Iterating a string/slice and `for i, v in` a
+range stay honest E0007 gaps.
+
+**`defer`.** Registers at its lowering point, evaluates callee + arguments
+eagerly into slots, and replays the call innermost-first at every function
+exit (return, early return, fall-through). Interpolated strings defer through
+the same prepared-printf path as `println`. Body-level only: per-path defer
+chains need a runtime defer chain (M3).
+
+**Line-table debug info.** A `DICompileUnit`, one `DISubprogram` per function
+(attached with `set_subprogram` — without it the backend drops everything), a
+per-statement `DILocation`, and the `Debug Info Version` module flag. The
+builder's location resets at each function entry or an alloca inherits a
+neighbour function's scope (verify() caught exactly that). Primitive params get
+real DWARF types; richer ones an empty signature — full type DIEs are M7.
+`gdb` now stops at `main () at tests/e2e/defer.dux:25` and prints the source.
+
+Proof: `if_value.dux`, `arrays_and_loops.dux`, `defer.dux` run with pinned
+stdout; built binaries carry `.debug_line`/`.debug_info`. 147 tests, clippy
+clean, whole corpus still silent.

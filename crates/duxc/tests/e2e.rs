@@ -189,6 +189,35 @@ fn the_normative_hello_example_compiles_runs_and_prints_exactly_hello_world() {
 }
 
 #[test]
+fn a_built_binary_carries_the_line_table() {
+    let hello = Path::new(EXAMPLE_DIR).join("hello.dux");
+    let scratch = Path::new(SCRATCH_DIR).join("example_hello_debug");
+    let _ = std::fs::remove_dir_all(&scratch);
+    let output = Command::new(env!("CARGO_BIN_EXE_duxc"))
+        .arg("build")
+        .arg(&hello)
+        .arg("--out-dir")
+        .arg(&scratch)
+        .output()
+        .expect("duxc is runnable");
+    assert_eq!(output.status.code(), Some(0), "build must succeed");
+    let bytes = std::fs::read(scratch.join("hello")).expect("the built binary");
+    let has_section = |needle: &str| {
+        bytes
+            .windows(needle.len())
+            .any(|window| window == needle.as_bytes())
+    };
+    assert!(
+        has_section(".debug_line"),
+        "the binary must carry a DWARF line table"
+    );
+    assert!(
+        has_section(".debug_info"),
+        "the binary must carry DWARF subprogram info"
+    );
+}
+
+#[test]
 fn every_example_dumps_its_ast_so_milestone_gaps_never_hide_the_tree() {
     let scratch = Path::new(SCRATCH_DIR).join("ast-dumps");
     let _ = std::fs::remove_dir_all(&scratch);
