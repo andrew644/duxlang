@@ -1144,6 +1144,7 @@ impl<'a> Checker<'a> {
                         self.statement(step);
                     }
                     ForKind::In { index, value, iterable } => {
+                        let is_range = matches!(iterable, Expr::Range { .. });
                         let iterable = self.infer(iterable);
                         let element = match &iterable {
                             Ty::Array(inner) => Some((**inner).clone()),
@@ -1151,13 +1152,13 @@ impl<'a> Checker<'a> {
                             _ => None,
                         };
                         if let Some(index) = index {
-                            self.define(&index.name, Ty::Opaque, false);
+                            let ty = if is_range { Ty::Opaque } else { Ty::I64 };
+                            self.define(&index.name, ty, false);
                         }
-                        self.define(
-                            &value.name,
-                            element.unwrap_or(Ty::Opaque),
-                            false,
-                        );
+                        let value_ty = element
+                            .or(if is_range { Some(Ty::I64) } else { None })
+                            .unwrap_or(Ty::Opaque);
+                        self.define(&value.name, value_ty, false);
                         for statement in &body.stmts {
                             self.statement(statement);
                         }

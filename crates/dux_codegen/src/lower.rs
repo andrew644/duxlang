@@ -43,8 +43,18 @@ pub(crate) enum DuxType {
     Str,
     /// `*T` and `rawptr`, both an untyped pointer here.
     Ptr,
+    /// A fixed array `[T; N]`. The LLVM representation is always a pointer to
+    /// `[N x T]` storage; bindings and assignments that must copy do so
+    /// element by element.
+    Array(&'static ArrayInfo),
     /// Something we could not type; it silences follow-on diagnostics.
     Error,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct ArrayInfo {
+    pub(crate) elem: DuxType,
+    pub(crate) len: u64,
 }
 
 impl DuxType {
@@ -52,6 +62,24 @@ impl DuxType {
         match ty {
             Type::Named { name, .. } => DuxType::named(name),
             Type::Pointer { .. } => Some(DuxType::Ptr),
+            Type::Array { element, len, .. } => {
+                let element = DuxType::from_ast(element)?;
+                let Expr::Int { value, .. } = len.as_ref() else {
+                    return None;
+                };
+                Some(DuxType::array(element, u64::try_from(*value).ok()?))
+            }
+            _ => None,
+        }
+    }
+
+    fn array(elem: DuxType, len: u64) -> DuxType {
+        DuxType::Array(Box::leak(Box::new(ArrayInfo { elem, len })))
+    }
+
+    fn array_info(self) -> Option<&'static ArrayInfo> {
+        match self {
+            DuxType::Array(info) => Some(info),
             _ => None,
         }
     }
@@ -126,6 +154,7 @@ impl DuxType {
             DuxType::Str | DuxType::Ptr | DuxType::Error => {
                 context.ptr_type(AddressSpace::default()).into()
             }
+            DuxType::Array(info) => info.elem.llvm(context).array_type(info.len as u32).into(),
         }
     }
 
@@ -146,22 +175,23 @@ impl DuxType {
         }
     }
 
-    fn name(self) -> &'static str {
+    fn name(self) -> String {
         match self {
-            DuxType::Bool => "bool",
-            DuxType::I8 => "i8",
-            DuxType::I16 => "i16",
-            DuxType::I32 => "i32",
-            DuxType::I64 => "i64",
-            DuxType::U8 => "u8",
-            DuxType::U16 => "u16",
-            DuxType::U32 => "u32",
-            DuxType::U64 => "u64",
-            DuxType::F32 => "f32",
-            DuxType::F64 => "f64",
-            DuxType::Str => "string",
-            DuxType::Ptr => "rawptr",
-            DuxType::Error => "<error>",
+            DuxType::Bool => "bool".to_string(),
+            DuxType::I8 => "i8".to_string(),
+            DuxType::I16 => "i16".to_string(),
+            DuxType::I32 => "i32".to_string(),
+            DuxType::I64 => "i64".to_string(),
+            DuxType::U8 => "u8".to_string(),
+            DuxType::U16 => "u16".to_string(),
+            DuxType::U32 => "u32".to_string(),
+            DuxType::U64 => "u64".to_string(),
+            DuxType::F32 => "f32".to_string(),
+            DuxType::F64 => "f64".to_string(),
+            DuxType::Str => "string".to_string(),
+            DuxType::Ptr => "rawptr".to_string(),
+            DuxType::Array(info) => format!("[{}; {}]", info.elem.name(), info.len),
+            DuxType::Error => "<error>".to_string(),
         }
     }
 
@@ -444,7 +474,7 @@ impl Emitter {
         }
         let mut params = Vec::new();
         for param in &function.params {
-            let Some(ty) = DuxType::from_ast(&param.ty) else {
+            let Some(ty) = DuxType::from_ast(&param.ty).filter(|ty| ty.array_info().is_none()) else {
                 if !external {
                     self.skipped.insert(name);
                     self.unsupported(
@@ -463,7 +493,7 @@ impl Emitter {
         }
         let return_ty = match &function.return_ty {
             None => None,
-            Some(ty) => match DuxType::from_ast(ty) {
+            Some(ty) => match DuxType::from_ast(ty).filter(|ty| ty.array_info().is_none()) {
                 Some(ty) => Some(ty),
                 None => {
                     if !external {
@@ -614,16 +644,17 @@ impl Emitter {
             } => self.if_stmt(module, cond, then_branch, else_branch.as_deref()),
             Stmt::While { cond, body, .. } => self.while_stmt(module, cond, body),
             Stmt::Loop { body, .. } => self.loop_stmt(module, body),
-            Stmt::For { kind, body, span } => {
+            Stmt::For { kind, body, .. } => {
                 use dux_ast::ForKind;
                 match kind {
                     ForKind::ThreeClause { init, cond, step } => {
                         self.for_stmt(module, init, cond, step, body)
                     }
-                    ForKind::In { .. } => {
-                        self.unsupported(*span, "`for .. in` (iteration lands at M3)");
-                        self.dead = true;
-                    }
+                    ForKind::In {
+                        index,
+                        value,
+                        iterable,
+                    } => self.for_in_stmt(module, index.as_ref(), value, iterable, body),
                 }
             }
             Stmt::Break { span } | Stmt::Continue { span } => {
@@ -703,11 +734,15 @@ impl Emitter {
                     return;
                 }
                 if let Some(value) = self.coerce_implicit(module, value, ty, span) {
-                    match value.basic() {
-                        Some(basic) => {
-                            let _ = self.builder.build_store(slot, basic);
-                        }
-                        None => self.unsupported(span, "storing this value"),
+                    match (ty.array_info(), value.core) {
+                        (Some(info), Core::Ptr(source)) => self.copy_array(slot, source, info),
+                        (None, _) => match value.basic() {
+                            Some(basic) => {
+                                let _ = self.builder.build_store(slot, basic);
+                            }
+                            None => self.unsupported(span, "storing this value"),
+                        },
+                        (Some(_), _) => self.unsupported(span, "storing this array value"),
                     }
                 }
             }
@@ -730,31 +765,40 @@ impl Emitter {
         span: Span,
     ) {
         use dux_ast::AssignOp;
-        let Expr::Ident { name, span: target_span } = target else {
-            self.unsupported(target.span(), "assigning to anything but a plain local");
-            return;
-        };
-        let (ty, slot) = match self.slot_of(name) {
-            Some(target) => target,
-            None => {
-                let message = if self.consts.contains_key(name.as_str()) {
-                    format!("`{name}` is a `const`; it cannot be assigned")
-                } else {
-                    format!("`{name}` is not declared in this scope")
-                };
-                self.diagnostics.push(
-                    Diagnostic::error(
-                        if self.consts.contains_key(name.as_str()) {
-                            code::ASSIGN_TO_CONST
-                        } else {
-                            code::UNDECLARED
-                        },
-                        message,
-                    )
+        let (ty, slot) = match target {
+            Expr::Ident { name, span: target_span } => match self.slot_of(name) {
+                Some(target) => target,
+                None => {
+                    let message = if self.consts.contains_key(name.as_str()) {
+                        format!("`{name}` is a `const`; it cannot be assigned")
+                    } else {
+                        format!("`{name}` is not declared in this scope")
+                    };
+                    self.diagnostics.push(
+                        Diagnostic::error(
+                            if self.consts.contains_key(name.as_str()) {
+                                code::ASSIGN_TO_CONST
+                            } else {
+                                code::UNDECLARED
+                            },
+                            message,
+                        )
                         .with_span(*target_span)
-                        .with_note(
-                            "the resolver lands at M2; until then an unknown name is reported here",
-                        ),
+                        .with_note("the checker reports undeclared names; this path only fires when codegen is driven directly"),
+                    );
+                    return;
+                }
+            },
+            Expr::Index { base, index, .. } => {
+                match self.place_of(module, base, index) {
+                    Some(place) => place,
+                    None => return,
+                }
+            }
+            _ => {
+                self.unsupported(
+                    target.span(),
+                    "assigning to anything but a local or an array element",
                 );
                 return;
             }
@@ -783,11 +827,15 @@ impl Emitter {
                 None => return,
             }
         };
-        match final_value.basic() {
-            Some(basic) => {
-                let _ = self.builder.build_store(slot, basic);
-            }
-            None => self.unsupported(span, "storing this value"),
+        match (ty.array_info(), final_value.core) {
+            (Some(info), Core::Ptr(source)) => self.copy_array(slot, source, info),
+            (None, _) => match final_value.basic() {
+                Some(basic) => {
+                    let _ = self.builder.build_store(slot, basic);
+                }
+                None => self.unsupported(span, "storing this value"),
+            },
+            (Some(_), _) => self.unsupported(span, "storing this array value"),
         }
     }
 
@@ -939,6 +987,10 @@ impl Emitter {
             return Some(Typed::error());
         }
         let common = self.common_type(then_value.ty, else_value.ty, span)?;
+        if common.array_info().is_some() {
+            self.unsupported(span, "an array produced by an `if` arm (arrays do not travel as values yet)");
+            return Some(Typed::error());
+        }
         let then_value = self.convert(then_value, common)?;
         let else_value = self.convert(else_value, common)?;
         let phi = self
@@ -1096,6 +1148,538 @@ impl Emitter {
         self.scopes.pop();
     }
 
+    fn for_in_stmt(
+        &mut self,
+        module: &Module<'static>,
+        index: Option<&dux_ast::Ident>,
+        value: &dux_ast::Ident,
+        iterable: &Expr,
+        body: &Block,
+    ) {
+        self.scopes.push(HashMap::new());
+        match iterable {
+            Expr::Range {
+                start,
+                end,
+                inclusive,
+                ..
+            } => self.for_in_range(
+                module,
+                index,
+                value,
+                start.as_deref(),
+                end.as_deref(),
+                *inclusive,
+                iterable.span(),
+                body,
+            ),
+            _ => self.for_in_array(module, index, value, iterable, body),
+        }
+        self.scopes.pop();
+    }
+
+    /// `for x in start..end` walks an `i64` counter. `break` and `continue`
+    /// behave as in the three-clause loop: continue runs the step.
+    #[allow(clippy::too_many_arguments)]
+    fn for_in_range(
+        &mut self,
+        module: &Module<'static>,
+        index: Option<&dux_ast::Ident>,
+        value: &dux_ast::Ident,
+        start: Option<&Expr>,
+        end: Option<&Expr>,
+        inclusive: bool,
+        span: Span,
+        body: &Block,
+    ) {
+        if index.is_some() {
+            self.unsupported(
+                span,
+                "`for i, v in` over a range (positions belong to arrays and slices)",
+            );
+            self.dead = true;
+            return;
+        }
+        let Some(end_expr) = end else {
+            self.unsupported(
+                span,
+                "an open-ended range in `for .. in` (an unbounded loop is spelled `loop`)",
+            );
+            self.dead = true;
+            return;
+        };
+        let start_value = match start {
+            Some(expr) => self.expr(module, expr, Some(DuxType::I64)),
+            None => Some(Typed::int(self.context.i64_type().const_zero(), DuxType::I64)),
+        };
+        let end_value = self.expr(module, end_expr, Some(DuxType::I64));
+        let (Some(start_int), Some(end_int)) =
+            (start_value.and_then(|v| v.int_value()), end_value.and_then(|v| v.int_value()))
+        else {
+            self.dead = true;
+            return;
+        };
+        let counter = self.alloca(DuxType::I64, "iter");
+        let limit = self.alloca(DuxType::I64, "limit");
+        let _ = self.builder.build_store(counter, start_int);
+        let _ = self.builder.build_store(limit, end_int);
+        let value_slot = if value.name != "_" {
+            let slot = self.alloca(DuxType::I64, &value.name);
+            if let Some(scope) = self.scopes.last_mut() {
+                scope.insert(value.name.clone(), (DuxType::I64, slot));
+            }
+            Some(slot)
+        } else {
+            None
+        };
+
+        let cond_block = self.new_block("in.cond");
+        let body_block = self.new_block("in.body");
+        let step_block = self.new_block("in.step");
+        let exit_block = self.new_block("in.end");
+        self.br(cond_block);
+
+        self.builder.position_at_end(cond_block);
+        self.dead = false;
+        let Some(current) = self.load(DuxType::I64, counter).and_then(|v| v.int_value()) else {
+            self.dead = true;
+            return;
+        };
+        let Some(bound) = self.load(DuxType::I64, limit).and_then(|v| v.int_value()) else {
+            self.dead = true;
+            return;
+        };
+        let predicate = if inclusive {
+            IntPredicate::SLE
+        } else {
+            IntPredicate::SLT
+        };
+        let Ok(done) = self
+            .builder
+            .build_int_compare(predicate, current, bound, "in.cmp")
+        else {
+            self.dead = true;
+            return;
+        };
+        let _ = self
+            .builder
+            .build_conditional_branch(done, body_block, exit_block);
+
+        self.builder.position_at_end(body_block);
+        self.dead = false;
+        if let Some(slot) = value_slot {
+            if let Some(current) = self.load(DuxType::I64, counter).and_then(|v| v.basic()) {
+                let _ = self.builder.build_store(slot, current);
+            }
+        }
+        self.loops.push(Loop {
+            continuation: step_block,
+            exit: exit_block,
+        });
+        self.block_body(module, body);
+        self.loops.pop();
+        self.br(step_block);
+
+        self.step_counter(step_block, counter);
+        self.br(cond_block);
+
+        self.builder.position_at_end(exit_block);
+        self.dead = false;
+    }
+
+    /// `for v in xs` and `for i, v in xs` over a fixed array. The iterable is
+    /// evaluated once; the counter walks `[0, len)`.
+    fn for_in_array(
+        &mut self,
+        module: &Module<'static>,
+        index: Option<&dux_ast::Ident>,
+        value: &dux_ast::Ident,
+        iterable: &Expr,
+        body: &Block,
+    ) {
+        let Some(iter) = self.expr(module, iterable, None) else {
+            self.dead = true;
+            return;
+        };
+        if iter.ty == DuxType::Error {
+            return;
+        }
+        let Some(info) = iter.ty.array_info() else {
+            self.unsupported(
+                iterable.span(),
+                &format!(
+                    "iterating a `{}` (strings and slices land at M3)",
+                    iter.ty.name()
+                ),
+            );
+            self.dead = true;
+            return;
+        };
+        let Core::Ptr(array) = iter.core else {
+            self.dead = true;
+            return;
+        };
+        let counter = self.alloca(DuxType::I64, "iter");
+        let _ = self
+            .builder
+            .build_store(counter, self.context.i64_type().const_zero());
+        let index_slot = match index.filter(|bind| bind.name != "_") {
+            Some(bind) => {
+                let slot = self.alloca(DuxType::I64, &bind.name);
+                if let Some(scope) = self.scopes.last_mut() {
+                    scope.insert(bind.name.clone(), (DuxType::I64, slot));
+                }
+                Some(slot)
+            }
+            None => None,
+        };
+        let value_slot = if value.name != "_" {
+            let slot = self.alloca(info.elem, &value.name);
+            if let Some(scope) = self.scopes.last_mut() {
+                scope.insert(value.name.clone(), (info.elem, slot));
+            }
+            Some(slot)
+        } else {
+            None
+        };
+
+        let cond_block = self.new_block("in.cond");
+        let body_block = self.new_block("in.body");
+        let step_block = self.new_block("in.step");
+        let exit_block = self.new_block("in.end");
+        self.br(cond_block);
+
+        self.builder.position_at_end(cond_block);
+        self.dead = false;
+        let Some(current) = self.load(DuxType::I64, counter).and_then(|v| v.int_value()) else {
+            self.dead = true;
+            return;
+        };
+        let limit = self.context.i64_type().const_int(info.len, false);
+        let Ok(more) = self
+            .builder
+            .build_int_compare(IntPredicate::ULT, current, limit, "in.cmp")
+        else {
+            self.dead = true;
+            return;
+        };
+        let _ = self
+            .builder
+            .build_conditional_branch(more, body_block, exit_block);
+
+        self.builder.position_at_end(body_block);
+        self.dead = false;
+        if let Some(slot) = index_slot {
+            if let Some(current) = self.load(DuxType::I64, counter).and_then(|v| v.basic()) {
+                let _ = self.builder.build_store(slot, current);
+            }
+        }
+        if let Some(slot) = value_slot {
+            let current = self.load(DuxType::I64, counter).and_then(|v| v.int_value());
+            if let Some(i) = current {
+                let array_ty = info.elem.llvm(self.context).array_type(info.len as u32);
+                let zero = self.context.i64_type().const_zero();
+                let element = unsafe { self.builder.build_gep(array_ty, array, &[zero, i], "elem") };
+                if let Ok(at) = element {
+                    if let Some(element) = self.load(info.elem, at) {
+                        match (info.elem.array_info(), element.core) {
+                            (Some(elem_info), Core::Ptr(source)) => {
+                                self.copy_array(slot, source, elem_info)
+                            }
+                            (None, _) => {
+                                if let Some(basic) = element.basic() {
+                                    let _ = self.builder.build_store(slot, basic);
+                                }
+                            }
+                            (Some(_), _) => {}
+                        }
+                    }
+                }
+            }
+        }
+        self.loops.push(Loop {
+            continuation: step_block,
+            exit: exit_block,
+        });
+        self.block_body(module, body);
+        self.loops.pop();
+        self.br(step_block);
+
+        self.step_counter(step_block, counter);
+        self.br(cond_block);
+
+        self.builder.position_at_end(exit_block);
+        self.dead = false;
+    }
+
+    fn step_counter(&mut self, step_block: BasicBlock<'static>, counter: PointerValue<'static>) {
+        self.builder.position_at_end(step_block);
+        self.dead = false;
+        let Some(current) = self.load(DuxType::I64, counter).and_then(|v| v.int_value()) else {
+            return;
+        };
+        let one = self.context.i64_type().const_int(1, false);
+        if let Ok(next) = self.builder.build_int_add(current, one, "iter.next") {
+            let _ = self.builder.build_store(counter, next);
+        }
+    }
+
+    fn array_literal(
+        &mut self,
+        module: &Module<'static>,
+        elements: &[Expr],
+        expected: Option<DuxType>,
+        span: Span,
+    ) -> Option<Typed> {
+        let declared = expected.and_then(DuxType::array_info);
+        let Some(first) = elements.first() else {
+            if let Some(info) = declared.filter(|info| info.len == 0) {
+                let ty = DuxType::Array(info);
+                return Some(Typed::pointer(self.alloca(ty, "arr"), ty));
+            }
+            let message = declared.map_or(
+                "an empty array literal with no annotation to give it a type".to_string(),
+                |info| {
+                    format!(
+                        "an empty array literal for a `[{}; {}]`",
+                        info.elem.name(),
+                        info.len
+                    )
+                },
+            );
+            self.unsupported(span, &message);
+            return None;
+        };
+        if let Some(info) = declared {
+            if info.len != elements.len() as u64 {
+                self.diagnostics.push(
+                    Diagnostic::error(
+                        code::TYPE_MISMATCH,
+                        format!(
+                            "this array literal has {} values; the annotation wants {}",
+                            elements.len(),
+                            info.len
+                        ),
+                    )
+                    .with_span(span),
+                );
+                return Some(Typed::error());
+            }
+        }
+        let hint = declared.map(|info| info.elem);
+        let first_value = self.expr(module, first, hint)?;
+        let elem_ty = declared.map_or(first_value.ty, |info| info.elem);
+        if elem_ty == DuxType::Error {
+            return Some(Typed::error());
+        }
+        let ty = DuxType::array(elem_ty, elements.len() as u64);
+        let slot = self.alloca(ty, "arr");
+        let array_ty = elem_ty.llvm(self.context).array_type(elements.len() as u32);
+        let zero = self.context.i64_type().const_zero();
+        for (position, element) in elements.iter().enumerate() {
+            let value = if position == 0 {
+                first_value
+            } else {
+                match self.expr(module, element, Some(elem_ty)) {
+                    Some(value) => value,
+                    None => return Some(Typed::error()),
+                }
+            };
+            if value.ty == DuxType::Error {
+                return Some(Typed::error());
+            }
+            let Some(value) = self.coerce_implicit(module, value, elem_ty, span) else {
+                return Some(Typed::error());
+            };
+            let i = self.context.i64_type().const_int(position as u64, false);
+            let Ok(at) = (unsafe { self.builder.build_gep(array_ty, slot, &[zero, i], "elem") })
+            else {
+                return None;
+            };
+            match (elem_ty.array_info(), value.core) {
+                (Some(info), Core::Ptr(source)) => self.copy_array(at, source, info),
+                (None, _) => {
+                    let Some(basic) = value.basic() else {
+                        self.unsupported(span, "storing this value in an array");
+                        return None;
+                    };
+                    let _ = self.builder.build_store(at, basic);
+                }
+                (Some(_), _) => {
+                    self.unsupported(span, "storing this array value in an array");
+                    return None;
+                }
+            }
+        }
+        Some(Typed::pointer(slot, ty))
+    }
+
+    fn repeated_array(
+        &mut self,
+        module: &Module<'static>,
+        value: &Expr,
+        len: &Expr,
+        expected: Option<DuxType>,
+        span: Span,
+    ) -> Option<Typed> {
+        let Expr::Int { value: count, .. } = len else {
+            self.unsupported(
+                len.span(),
+                "a repeated array whose length is not a literal (constant folding lands at M3)",
+            );
+            return None;
+        };
+        let Ok(count) = u64::try_from(*count) else {
+            self.unsupported(len.span(), "an array length that does not fit a `u64`");
+            return None;
+        };
+        if count > u32::MAX as u64 {
+            self.unsupported(len.span(), "an array longer than `u32::MAX` elements");
+            return None;
+        }
+        let declared = expected.and_then(DuxType::array_info);
+        if let Some(info) = declared {
+            if info.len != count {
+                self.diagnostics.push(
+                    Diagnostic::error(
+                        code::TYPE_MISMATCH,
+                        format!(
+                            "this repeated array has {} values; the annotation wants {}",
+                            count, info.len
+                        ),
+                    )
+                    .with_span(span),
+                );
+                return Some(Typed::error());
+            }
+        }
+        let hint = declared.map(|info| info.elem);
+        let fill = self.expr(module, value, hint)?;
+        let elem_ty = declared.map_or(fill.ty, |info| info.elem);
+        if elem_ty == DuxType::Error {
+            return Some(Typed::error());
+        }
+        let Some(fill) = self.coerce_implicit(module, fill, elem_ty, span) else {
+            return Some(Typed::error());
+        };
+        let ty = DuxType::array(elem_ty, count);
+        let slot = self.alloca(ty, "arr");
+        let array_ty = elem_ty.llvm(self.context).array_type(count as u32);
+        let zero = self.context.i64_type().const_zero();
+        for position in 0..count {
+            let i = self.context.i64_type().const_int(position, false);
+            let Ok(at) = (unsafe { self.builder.build_gep(array_ty, slot, &[zero, i], "elem") })
+            else {
+                return None;
+            };
+            match (elem_ty.array_info(), fill.core) {
+                (Some(info), Core::Ptr(source)) => self.copy_array(at, source, info),
+                (None, _) => {
+                    let Some(basic) = fill.basic() else {
+                        self.unsupported(span, "storing this value in an array");
+                        return None;
+                    };
+                    let _ = self.builder.build_store(at, basic);
+                }
+                (Some(_), _) => {
+                    self.unsupported(span, "storing this array value in an array");
+                    return None;
+                }
+            }
+        }
+        Some(Typed::pointer(slot, ty))
+    }
+
+    fn index_expr(
+        &mut self,
+        module: &Module<'static>,
+        base: &Expr,
+        index: &Expr,
+        _span: Span,
+    ) -> Option<Typed> {
+        let (elem, at) = self.place_of(module, base, index)?;
+        self.load(elem, at)
+    }
+
+    /// Resolve `base[index]` to the element's address.
+    fn place_of(
+        &mut self,
+        module: &Module<'static>,
+        base: &Expr,
+        index: &Expr,
+    ) -> Option<(DuxType, PointerValue<'static>)> {
+        let base_span = base.span();
+        let base = self.expr(module, base, None)?;
+        let Some(info) = base.ty.array_info() else {
+            self.unsupported(
+                base_span,
+                &format!(
+                    "indexing a `{}` (strings and slices land at M3)",
+                    base.ty.name()
+                ),
+            );
+            return None;
+        };
+        let Core::Ptr(array) = base.core else {
+            return None;
+        };
+        let index_value = self.expr(module, index, None)?;
+        if index_value.ty == DuxType::Error {
+            return None;
+        }
+        if !index_value.ty.is_integral() {
+            self.diagnostics.push(
+                Diagnostic::error(
+                    code::TYPE_MISMATCH,
+                    format!(
+                        "an array index must be an integer, found `{}`",
+                        index_value.ty.name()
+                    ),
+                )
+                .with_span(index.span()),
+            );
+            return None;
+        }
+        let index64 = if index_value.ty == DuxType::I64 {
+            index_value
+        } else {
+            self.convert(index_value, DuxType::I64)?
+        };
+        let array_ty = info.elem.llvm(self.context).array_type(info.len as u32);
+        let zero = self.context.i64_type().const_zero();
+        let at = unsafe {
+            self.builder
+                .build_gep(array_ty, array, &[zero, index64.int_value()?], "idx")
+        }
+        .ok()?;
+        Some((info.elem, at))
+    }
+
+    fn copy_array(
+        &mut self,
+        dest: PointerValue<'static>,
+        source: PointerValue<'static>,
+        info: &ArrayInfo,
+    ) {
+        let array_ty = info.elem.llvm(self.context).array_type(info.len as u32);
+        let elem = info.elem.llvm(self.context);
+        let zero = self.context.i64_type().const_zero();
+        for position in 0..info.len {
+            let i = self.context.i64_type().const_int(position, false);
+            let Ok(from) = (unsafe { self.builder.build_gep(array_ty, source, &[zero, i], "elem") })
+            else {
+                return;
+            };
+            let Ok(into) = (unsafe { self.builder.build_gep(array_ty, dest, &[zero, i], "slot") })
+            else {
+                return;
+            };
+            if let Ok(value) = self.builder.build_load(elem, from, "") {
+                let _ = self.builder.build_store(into, value);
+            }
+        }
+    }
+
     fn condition(&mut self, module: &Module<'static>, cond: &Expr) -> IntValue<'static> {
         match cond {
             Expr::CondBinding { .. } => {
@@ -1246,6 +1830,15 @@ impl Emitter {
                 }
                 self.expr(module, value, expected)
             }
+            Expr::ArrayLiteral {
+                elements, span, ..
+            } => self.array_literal(module, elements, expected, *span),
+            Expr::RepeatedArray { value, len, span } => {
+                self.repeated_array(module, value, len, expected, *span)
+            }
+            Expr::Index {
+                base, index, span, ..
+            } => self.index_expr(module, base, index, *span),
             Expr::InterpString { .. } => {
                 self.unsupported(
                     expr.span(),
@@ -2008,7 +2601,7 @@ impl Emitter {
         };
         let mut arguments: Vec<BasicMetadataValueEnum> = vec![format_ptr.into()];
         for value in values {
-            let prepared = self.prepare_for_format(value)?;
+            let prepared = self.prepare_for_format(value, span)?;
             arguments.push(prepared.into());
         }
         let printf = self.printf_fn(module);
@@ -2019,7 +2612,11 @@ impl Emitter {
         Some(())
     }
 
-    fn prepare_for_format(&mut self, value: Typed) -> Option<BasicValueEnum<'static>> {
+    fn prepare_for_format(
+        &mut self,
+        value: Typed,
+        span: Span,
+    ) -> Option<BasicValueEnum<'static>> {
         match value.ty {
             DuxType::Bool => {
                 let true_text = self
@@ -2069,6 +2666,13 @@ impl Emitter {
                     .ok()?;
                 Some(widened.into())
             }
+            DuxType::Array(..) => {
+                self.unsupported(
+                    span,
+                    "printing an array (array formatting lands at M3)",
+                );
+                None
+            }
             _ => value.basic(),
         }
     }
@@ -2076,6 +2680,9 @@ impl Emitter {
 
 impl Emitter {
     fn load(&mut self, ty: DuxType, slot: PointerValue<'static>) -> Option<Typed> {
+        if ty.array_info().is_some() {
+            return Some(Typed::pointer(slot, ty));
+        }
         let loaded = self
             .builder
             .build_load(ty.llvm(self.context), slot, "load")
@@ -2199,7 +2806,12 @@ impl Emitter {
 impl Emitter {
     fn declare_const(&mut self, decl: &ConstDecl) {
         let name = decl.name.name.clone();
-        let Some(ty) = decl.ty.as_ref().and_then(DuxType::from_ast) else {
+        let Some(ty) = decl
+            .ty
+            .as_ref()
+            .and_then(DuxType::from_ast)
+            .filter(|ty| ty.array_info().is_none())
+        else {
             self.unsupported(
                 decl.span,
                 "a `const` whose type is not a primitive yet",
@@ -2217,7 +2829,12 @@ impl Emitter {
 
     fn declare_global(&mut self, module: &Module<'static>, decl: &GlobalDecl) {
         let name = decl.name.name.clone();
-        let Some(ty) = decl.ty.as_ref().and_then(DuxType::from_ast) else {
+        let Some(ty) = decl
+            .ty
+            .as_ref()
+            .and_then(DuxType::from_ast)
+            .filter(|ty| ty.array_info().is_none())
+        else {
             self.unsupported(
                 decl.span,
                 "a `global` whose type is not a primitive yet",
@@ -2491,22 +3108,17 @@ fn spec_for(ty: DuxType) -> Option<&'static str> {
         DuxType::F32 | DuxType::F64 => "g",
         DuxType::Str => "s",
         DuxType::Ptr => "p",
-        DuxType::Error => return None,
+        DuxType::Array(..) | DuxType::Error => return None,
     })
 }
 
 fn expression_name(expr: &Expr) -> &'static str {
     match expr {
         Expr::Field { .. } => "a field access (lands at M3)",
-        Expr::Index { .. } => "an index (lands at M3)",
         Expr::Member { .. } => "a tuple member (lands at M3)",
         Expr::Range { .. } => "a range (lands at M3)",
         Expr::Path { .. } => "a qualified path",
         Expr::StructLiteral { .. } => "a struct value (lands at M3)",
-        Expr::ArrayLiteral { .. } => "an array value (lands at M3)",
-        Expr::RepeatedArray { .. } => "a repeated array value (lands at M3)",
-        Expr::If { .. } => "an `if` expression (value-position control flow)",
-        Expr::Block { .. } => "a block in value position",
         Expr::CondBinding { .. } => "a pattern condition (lands at M4)",
         Expr::Error { .. } => "an erroneous expression",
         _ => "this expression",

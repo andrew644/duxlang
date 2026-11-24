@@ -139,6 +139,26 @@ fn a_value_if_meets_at_a_phi() {
 }
 
 #[test]
+fn fixed_arrays_live_in_slots_and_iterate_with_a_counter() {
+    let ir = build(
+        "package main\nfn main() -> i32 { xs := [1, 2, 3]; total := 0; for v in xs { total += v }; return total }",
+    )
+    .expect("builds")
+    .ir_text();
+    assert!(ir.contains("alloca [3 x i32]"), "the literal backs a slot:\n{ir}");
+    assert!(ir.contains("getelementptr"), "elements are addressed by GEP:\n{ir}");
+    assert!(ir.contains("ult"), "the counter walks the length:\n{ir}");
+
+    let ir = build(
+        "package main\nfn sum() -> i64 { z := [0; 4]; s: i64 = 0; for i in 0..4 { s += i }; return s }\nfn main() { sum() }",
+    )
+    .expect("builds")
+    .ir_text();
+    assert!(ir.contains("alloca [4 x i32]"), "repeats back a slot:\n{ir}");
+    assert!(ir.contains("slt"), "the range compares against its limit:\n{ir}");
+}
+
+#[test]
 fn implicit_conversion_widens_exactly_when_the_destination_is_lossless() {
     let ir = build(
         "package main\nfn main() { wider: i64 = 0; narrow := 1; wider = wider + narrow }",
@@ -264,7 +284,10 @@ fn missing_return_on_one_path_is_reported() {
 #[test]
 fn milestone_gaps_report_e0007_with_the_milestone_in_the_message() {
     let cases = [
-        ("package main\nfn main() { for v in xs { print(\"x\") } }", "`for .. in`"),
+        (
+            "package main\nfn main() { for b in \"abc\" { print(b) } }",
+            "iterating a `string`",
+        ),
         ("package main\nfn main() { defer println(\"x\") }", "`defer`"),
     ];
     for (source, needle) in cases {

@@ -1,0 +1,29 @@
+package main
+
+fn main() {
+    dims: [i32; 3] = [10, 20, 30]
+    scratch: [i32; 4]
+    flags := [true, false]
+    total := 0
+    for i, v in dims {
+        scratch[i] = v * 2
+        total += scratch[i]
+    }
+    println($"total={total}")
+    for _ in 0..3 {
+        println("tick")
+    }
+    for n in 1..=4 {
+        println($"{n}^2={n * n}")
+    }
+    for b in flags {
+        if b {
+            println("on")
+        } else {
+            println("off")
+        }
+    }
+    copy := dims
+    copy[0] = 99
+    println($"{dims[0]} {copy[0]} {scratch[3]}")
+}
