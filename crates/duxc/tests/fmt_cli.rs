@@ -1,0 +1,132 @@
+use std::path::PathBuf;
+use std::process::Command;
+
+const SCRATCH_DIR: &str = env!("CARGO_TARGET_TMPDIR");
+
+fn scratch(name: &str) -> PathBuf {
+    let dir = PathBuf::from(SCRATCH_DIR).join(name);
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("scratch directory");
+    dir
+}
+
+struct Run {
+    stdout: String,
+    stderr: String,
+    code: i32,
+}
+
+fn duxc(args: &[&str]) -> Run {
+    let output = Command::new(env!("CARGO_BIN_EXE_duxc"))
+        .args(args)
+        .output()
+        .expect("duxc is runnable");
+    Run {
+        stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+        code: output.status.code().unwrap_or(-1),
+    }
+}
+
+const UGLY: &str = "package main\nfn   main( ){\nprintln(\"hi\") ; x:=2\n}\n";
+const CANONICAL: &str = "package main\n\nfn main() {\n    println(\"hi\")\n    x := 2\n}\n";
+
+#[test]
+fn fmt_rewrites_files_in_place_and_is_quiet_once_clean() {
+    let dir = scratch("fmt_in_place");
+    let file = dir.join("app.dux");
+    std::fs::write(&file, UGLY).unwrap();
+
+    let run = duxc(&["fmt", file.to_str().unwrap()]);
+    assert_eq!(run.code, 0, "{}", run.stderr);
+    assert!(run.stdout.contains("formatted"), "{}", run.stdout);
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), CANONICAL);
+
+    let run = duxc(&["fmt", file.to_str().unwrap()]);
+    assert_eq!(run.code, 0, "{}", run.stderr);
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), CANONICAL);
+
+    let run = duxc(&["fmt", "--check", file.to_str().unwrap()]);
+    assert_eq!(run.code, 0, "{}", run.stderr);
+    assert!(run.stdout.contains("all 1 file(s) formatted"), "{}", run.stdout);
+}
+
+#[test]
+fn check_reports_unformatted_files_without_changing_them() {
+    let dir = scratch("fmt_check");
+    let file = dir.join("app.dux");
+    std::fs::write(&file, UGLY).unwrap();
+
+    let run = duxc(&["fmt", "--check", dir.to_str().unwrap()]);
+    assert_eq!(run.code, 1);
+    assert!(run.stderr.contains("not formatted"), "{}", run.stderr);
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), UGLY);
+}
+
+#[test]
+fn fmt_recurses_into_subdirectories_and_skips_foreign_files() {
+    let dir = scratch("fmt_recursive");
+    let nested = dir.join("deep");
+    std::fs::create_dir_all(&nested).unwrap();
+    std::fs::write(nested.join("app.dux"), UGLY).unwrap();
+    std::fs::write(nested.join("notes.txt"), "  not dux  ").unwrap();
+
+    let run = duxc(&["fmt", dir.to_str().unwrap()]);
+    assert_eq!(run.code, 0, "{}", run.stderr);
+    assert_eq!(
+        std::fs::read_to_string(nested.join("app.dux")).unwrap(),
+        CANONICAL
+    );
+    assert_eq!(std::fs::read_to_string(nested.join("notes.txt")).unwrap(), "  not dux  ");
+}
+
+#[test]
+fn a_broken_file_fails_fmt_and_stays_untouched() {
+    let dir = scratch("fmt_broken");
+    let file = dir.join("bad.dux");
+    std::fs::write(&file, "fn main() { x := }").unwrap();
+
+    let run = duxc(&["fmt", file.to_str().unwrap()]);
+    assert_eq!(run.code, 1);
+    assert!(run.stderr.contains("E0005"), "{}", run.stderr);
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), "fn main() { x := }");
+}
+
+#[test]
+fn a_milestone_gap_that_would_degrade_the_ast_refuses_formatting() {
+    let dir = scratch("fmt_gap");
+    let file = dir.join("sums.dux");
+    std::fs::write(
+        &file,
+        "fn main() {\n    shape := 1\n    match shape { _ => println(\"x\") }\n}\n",
+    )
+    .unwrap();
+
+    let run = duxc(&["fmt", file.to_str().unwrap()]);
+    assert_eq!(run.code, 1);
+    assert!(run.stderr.contains("E0007"), "{}", run.stderr);
+    assert!(
+        std::fs::read_to_string(&file).unwrap().contains("match"),
+        "the formatter must never emit a file with the match erased"
+    );
+}
+
+#[test]
+fn formatter_output_is_a_fixed_point() {
+    let dir = scratch("fmt_corpus");
+    let source = concat!(env!("CARGO_MANIFEST_DIR"), "/../../tests/e2e/flow.dux");
+    let copy = dir.join("flow.dux");
+    std::fs::copy(source, &copy).expect("the fixture copies to scratch");
+
+    let run = duxc(&["fmt", copy.to_str().unwrap()]);
+    assert_eq!(run.code, 0, "{}", run.stderr);
+    let run = duxc(&["fmt", copy.to_str().unwrap()]);
+    assert_eq!(run.code, 0, "{}", run.stderr);
+    assert!(
+        !run.stdout.contains("formatted"),
+        "a second pass must change nothing: {}",
+        run.stdout
+    );
+    let run = duxc(&["fmt", "--check", dir.to_str().unwrap()]);
+    assert_eq!(run.code, 0, "{}", run.stderr);
+}

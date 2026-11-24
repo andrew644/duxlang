@@ -1,4 +1,5 @@
 pub mod dump;
+pub mod fmt;
 
 use dux_source::Span;
 

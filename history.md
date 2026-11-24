@@ -322,3 +322,39 @@ pins it for the whole normative corpus.
 `AssignOp/UnaryOp/BinaryOp` grew `symbol()` for the renderer. Tests: four dump-shape tests in
 `dux_driver/tests/ast_dump.rs` (the lexer+parser live below `dux_ast`, so the dump is tested
 from a crate that can run them), one CLI parse test, one e2e. 94 tests, clippy clean.
+
+
+## Session 7 — `dux fmt`
+
+The formatter is the AST printer DESIGN §6 promises: `dux_ast::fmt::format` renders a
+`Program` canonically (four-space indent, one statement per line, no semicolons, one blank
+line between top-level declarations, attributes one per line, `self` shorthand receivers)
+and `duxc fmt [paths] [--check]` runs it over files or directory trees, in place.
+
+The round-trip property decides every printing question: re-parsing the output must produce
+the same AST, which `dux_ast::dump` compares span-free. That drove the real decisions:
+
+- No parentheses are ever *added*: the parser's precedence climbing makes every `Binary`
+  tree reprintable flat (left operand always prec >= parent, right always strictly greater),
+  and `Paren` nodes are kept exactly where the user wrote them.
+- Expressions never wrap across lines — a binary chain may not break before an operator
+  (the lexer's `newline_before` flag ends the chain), so statements stay one-liners.
+- Struct fields print with trailing commas (the field list is comma-separated; newlines are
+  not separators); enum variants are one per line (variants need no separator); slices print
+  as the language writes them, `[]T`.
+- Literals are re-escaped from their decoded values (`"` `\` `\n` `\t` `\r` `\0`), floats get
+  a `.0` so `1.0` never re-lexes as an `Int`, and interpolation text re-doubles `{`/`}` while
+  keeping backslash sequences verbatim (the parser rescans holes from raw source).
+- **A parse error of any kind — including `E0007` — refuses the file.** Parser-level
+  milestone gaps (`match`, tuple literals, generic call paths) degrade the AST to `Error`
+  or drop arguments, and formatting such a file would silently delete the construct.
+  Warnings are tolerated; comments are not preserved because the lexer drops them, which is
+  the formatter's one real lie until comments join the AST.
+
+`dux_driver::format_text/format_path` lex+parse+print for the CLI; `--check` lists
+unformatted files and exits 1 without touching anything.
+
+Tests: six round-trip/golden tests in `dux_driver/tests/format.rs` (the whole `example/`
+and `tests/e2e/` corpora must round-trip or be legitimately refused; formatted fixtures
+still run to byte-identical stdout), six CLI tests in `duxc/tests/fmt_cli.rs`, one CLI
+parse test. Clippy clean.

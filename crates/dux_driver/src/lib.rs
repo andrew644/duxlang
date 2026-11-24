@@ -73,6 +73,39 @@ pub fn analyze(path: &std::path::Path) -> Result<Analyzed, Failure> {
     })
 }
 
+#[derive(Debug)]
+pub struct FormattedFile {
+    pub original: String,
+    pub text: String,
+}
+
+pub fn format_text(name: &str, text: &str) -> Result<String, Failure> {
+    let mut sources = SourceMap::new();
+    let file = sources.add(name, text);
+    let lexed = dux_lexer::lex(&sources, file);
+    let mut diagnostics = lexed.diagnostics;
+    let parsed = parse(&sources, &lexed.tokens);
+    diagnostics.extend(parsed.diagnostics);
+    if dux_diag::has_errors(&diagnostics) {
+        return Err(Failure {
+            sources,
+            diagnostics,
+        });
+    }
+    Ok(dux_ast::fmt::format(&parsed.program))
+}
+
+pub fn format_path(path: &std::path::Path) -> Result<FormattedFile, Failure> {
+    let original = std::fs::read_to_string(path).map_err(|e| {
+        Failure::bare(vec![Diagnostic::error(
+            code::SOURCE_IO,
+            format!("cannot read {}: {e}", path.display()),
+        )])
+    })?;
+    let text = format_text(&path.display().to_string(), &original)?;
+    Ok(FormattedFile { original, text })
+}
+
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum Emit {
     Execute,

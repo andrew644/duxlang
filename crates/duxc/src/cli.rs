@@ -12,6 +12,7 @@ COMMANDS:
     check <file>      lex, parse and report diagnostics without code generation
     build <file>      compile and link an executable
     run <file>        compile, link and execute, forwarding program arguments
+    fmt [paths]       rewrite .dux files in their canonical form (drops comments)
 
 OPTIONS:
     -o <path>         write the result to <path>
@@ -21,6 +22,7 @@ OPTIONS:
     --emit=ast        write the parsed AST dump instead of linking
     --emit=obj        keep the object file
     --emit=exe        link an executable (default)
+    --check           with fmt: report unformatted files, change nothing
     --help            show this message
 ";
 
@@ -49,6 +51,10 @@ pub enum Command {
         out_dir: PathBuf,
         release: bool,
         args: Vec<String>,
+    },
+    Fmt {
+        paths: Vec<PathBuf>,
+        check: bool,
     },
 }
 
@@ -167,6 +173,21 @@ pub fn parse<I: IntoIterator<Item = OsString>>(argv: I) -> Result<Command, Usage
                 args,
             })
         }
+        "fmt" | "f" => {
+            let mut paths = Vec::new();
+            let mut check = false;
+            for arg in rest {
+                match arg.as_str() {
+                    "--check" => check = true,
+                    "--help" | "-h" => return Ok(Command::Help),
+                    other if other.starts_with('-') && other.len() > 1 => {
+                        return Err(UsageError::ExpectedOption(other.to_string()))
+                    }
+                    other => paths.push(PathBuf::from(other)),
+                }
+            }
+            Ok(Command::Fmt { paths, check })
+        }
         other => Err(UsageError::UnknownCommand(other.to_string())),
     }
 }
@@ -269,6 +290,28 @@ mod tests {
         };
         assert_eq!(file, PathBuf::from("app.dux"));
         assert_eq!(args, vec!["-x", "--release", "tail"]);
+    }
+
+    #[test]
+    fn fmt_accepts_paths_and_the_check_flag() {
+        assert_eq!(
+            parse(argv(&["fmt"])),
+            Ok(Command::Fmt {
+                paths: vec![],
+                check: false,
+            })
+        );
+        assert_eq!(
+            parse(argv(&["fmt", "src", "app.dux", "--check"])),
+            Ok(Command::Fmt {
+                paths: vec![PathBuf::from("src"), PathBuf::from("app.dux")],
+                check: true,
+            })
+        );
+        assert_eq!(
+            parse(argv(&["fmt", "--dry-run"])),
+            Err(UsageError::ExpectedOption("--dry-run".to_string()))
+        );
     }
 
     #[test]

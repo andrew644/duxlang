@@ -3,7 +3,7 @@ mod cli;
 use cli::{Command, Emit, USAGE};
 use dux_driver::{BuildRequest, Emit as DriverEmit, Optimization};
 use std::io::Write;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 const LLVM_VERSION: &str = "23.1";
@@ -58,7 +58,112 @@ fn main() -> ExitCode {
                 }
             }
         }
+        Command::Fmt { paths, check } => fmt(&paths, check, &mut err),
     }
+}
+
+fn fmt(paths: &[PathBuf], check: bool, err: &mut impl Write) -> ExitCode {
+    let mut files = Vec::new();
+    let mut failed = false;
+    let roots: Vec<&Path> = if paths.is_empty() {
+        vec![Path::new(".")]
+    } else {
+        paths.iter().map(|p| p.as_path()).collect()
+    };
+    for root in roots {
+        if !collect_dux_files(root, &mut files, err) {
+            failed = true;
+        }
+    }
+    files.sort();
+    files.dedup();
+    let mut unformatted = Vec::new();
+    for file in &files {
+        match dux_driver::format_path(file) {
+            Ok(formatted) => {
+                if formatted.text == formatted.original {
+                    continue;
+                }
+                if check {
+                    unformatted.push(file.clone());
+                } else {
+                    match std::fs::write(file, &formatted.text) {
+                        Ok(()) => {
+                            let _ = writeln!(std::io::stdout(), "formatted {}", file.display());
+                        }
+                        Err(e) => {
+                            report_io(err, file, e);
+                            failed = true;
+                        }
+                    }
+                }
+            }
+            Err(failure) => {
+                failure.report(err);
+                failed = true;
+            }
+        }
+    }
+    if failed {
+        return ExitCode::FAILURE;
+    }
+    if check {
+        if !unformatted.is_empty() {
+            for file in &unformatted {
+                let _ = writeln!(err, "not formatted: {}", file.display());
+            }
+            return ExitCode::FAILURE;
+        }
+        let _ = writeln!(
+            std::io::stdout(),
+            "all {} file(s) formatted",
+            files.len()
+        );
+    }
+    ExitCode::SUCCESS
+}
+
+fn collect_dux_files(root: &Path, files: &mut Vec<PathBuf>, err: &mut impl Write) -> bool {
+    if root.is_dir() {
+        let entries = match std::fs::read_dir(root) {
+            Ok(entries) => entries,
+            Err(e) => {
+                report_io(err, root, e);
+                return false;
+            }
+        };
+        let mut children: Vec<PathBuf> = entries
+            .filter_map(|entry| entry.ok().map(|e| e.path()))
+            .collect();
+        children.sort();
+        let mut ok = true;
+        for child in children {
+            if child.is_dir() {
+                ok &= collect_dux_files(&child, files, err);
+            } else if child.extension().is_some_and(|e| e == "dux") {
+                files.push(child);
+            }
+        }
+        ok
+    } else if root.extension().is_some_and(|e| e == "dux") {
+        files.push(root.to_path_buf());
+        true
+    } else {
+        let diagnostic = dux_diag::Diagnostic::error(
+            dux_diag::code::SOURCE_IO,
+            format!("{} is not a .dux file or directory", root.display()),
+        );
+        dux_driver::report(&dux_driver::SourceMap::new(), &[diagnostic], err);
+        false
+    }
+}
+
+fn report_io(err: &mut impl Write, path: &Path, error: std::io::Error) {
+    let diagnostic = dux_diag::Diagnostic::error(
+        dux_diag::code::SOURCE_IO,
+        format!("cannot access {}: {error}", path.display()),
+    );
+    dux_driver::report(&dux_driver::SourceMap::new(), &[diagnostic], err);
 }
 
 fn check(file: &Path, err: &mut impl Write) -> ExitCode {
