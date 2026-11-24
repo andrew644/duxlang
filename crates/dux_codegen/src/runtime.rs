@@ -39,6 +39,9 @@ pub struct Runtime {
     pub free: FunctionValue<'static>,
     /// `void @dux.runtime.report()` — unreleased blocks, in debug mode.
     pub report: Option<FunctionValue<'static>>,
+    /// `noreturn @dux.runtime.trap(ptr message)` — a language rule the running
+    /// program broke, such as a `match` whose every arm declined.
+    pub trap: FunctionValue<'static>,
 }
 
 impl Runtime {
@@ -82,6 +85,7 @@ impl Runtime {
             context.void_type().fn_type(&[ptr.into()], false),
         );
         let oom = emit_oom(context, module, &builder);
+        let trap = emit_trap(context, module, &builder);
 
         emit_alloc(context, &builder, alloc, malloc, oom, live, bytes, debug);
         let report = if debug {
@@ -117,6 +121,7 @@ impl Runtime {
             alloc,
             free,
             report,
+            trap,
         }
     }
 }
@@ -306,6 +311,39 @@ fn emit_report(
     builder.position_at_end(done);
     builder.build_return(None).expect("return");
     report
+}
+
+/// A broken language rule stops the program where it happened, with a word
+/// about it on stderr.
+fn emit_trap(
+    context: &'static Context,
+    module: &Module<'static>,
+    builder: &Builder<'static>,
+) -> FunctionValue<'static> {
+    let ptr = context.ptr_type(AddressSpace::default());
+    let trap = module.add_function(
+        "dux.runtime.trap",
+        context.void_type().fn_type(&[ptr.into()], false),
+        None,
+    );
+    trap.set_linkage(Linkage::Internal);
+    let entry = context.append_basic_block(trap, "entry");
+    builder.position_at_end(entry);
+    let message = builder
+        .get_insert_block()
+        .unwrap()
+        .get_parent()
+        .unwrap()
+        .get_first_param()
+        .expect("message");
+    let stderr = stream(context, module, builder, "stderr");
+    let _ = builder.build_call(
+        fputs(context, module),
+        &[message.into(), stderr.into()],
+        "report",
+    );
+    abort(context, module, builder);
+    trap
 }
 
 fn emit_oom(

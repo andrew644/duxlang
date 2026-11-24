@@ -1,0 +1,18 @@
+//@expect-error E0201
+package main
+
+enum Shape {
+    Rect { w: f32, h: f32 },
+    Point,
+}
+
+fn width(s: Shape) -> f32 {
+    return match s {
+        Shape::Rect { w } => w,
+        Shape::Point => 0.0,
+    }
+}
+
+fn main() {
+    println($"{width(Shape::Point)}")
+}

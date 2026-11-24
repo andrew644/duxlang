@@ -12,4 +12,5 @@ dux_parser = { workspace = true }
 dux_source = { workspace = true }
 dux_diag = { workspace = true }
 dux_ast = { workspace = true }
+dux_hir = { workspace = true }
 inkwell = { workspace = true }

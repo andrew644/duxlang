@@ -1,0 +1,13 @@
+//@expect-error E0133
+package main
+
+fn tally(n: i32) -> string {
+    return match n {
+        x if x > 0 => "positive",
+        x if x < 0 => "negative",
+    }
+}
+
+fn main() {
+    println($"{tally(1)}")
+}

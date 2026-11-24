@@ -1,0 +1,23 @@
+//@expect-error E0201
+package main
+
+enum Coin {
+    Heads,
+    Tails,
+}
+
+enum Die {
+    Six,
+}
+
+fn show(c: Coin) -> string {
+    return match c {
+        Die::Six => "impossible",
+        Coin::Heads => "heads",
+        Coin::Tails => "tails",
+    }
+}
+
+fn main() {
+    println($"{show(Coin::Heads)}")
+}

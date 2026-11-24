@@ -1,0 +1,19 @@
+//@expect-error E0133
+package main
+
+enum Shape {
+    Circle(f32),
+    Rect { w: f32, h: f32 },
+    Point,
+}
+
+fn area(s: Shape) -> f32 {
+    return match s {
+        Shape::Circle(r) => r,
+        Shape::Point => 0.0,
+    }
+}
+
+fn main() {
+    println($"{area(Shape::Point)}")
+}

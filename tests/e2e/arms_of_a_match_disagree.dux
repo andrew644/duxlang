@@ -1,0 +1,18 @@
+//@expect-error E0201
+package main
+
+enum Coin {
+    Heads,
+    Tails,
+}
+
+fn value(c: Coin) -> i32 {
+    return match c {
+        Coin::Heads => 1,
+        Coin::Tails => "tail",
+    }
+}
+
+fn main() {
+    println($"{value(Coin::Heads)}")
+}

@@ -1,0 +1,18 @@
+//@expect-error E0112
+package main
+
+enum Shape {
+    Circle(f32),
+    Point,
+}
+
+fn radius(s: Shape) -> f32 {
+    return match s {
+        Shape::Circle(a, b) => a,
+        Shape::Point => 0.0,
+    }
+}
+
+fn main() {
+    println($"{radius(Shape::Point)}")
+}

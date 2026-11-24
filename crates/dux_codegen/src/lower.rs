@@ -14,6 +14,7 @@ use dux_ast::{
     Stmt, Type, UnaryOp,
 };
 use dux_diag::{code, Diagnostic};
+use dux_hir::sums::{self, Payload, Shape};
 use dux_source::{FileId, SourceMap, Span};
 use inkwell::basic_block::BasicBlock;
 use inkwell::builder::Builder;
@@ -23,6 +24,7 @@ use inkwell::debug_info::{
     DWARFEmissionKind, DWARFSourceLanguage,
 };
 use inkwell::module::Module;
+use inkwell::targets::TargetData;
 use inkwell::types::{
     BasicMetadataTypeEnum, BasicType, BasicTypeEnum, FloatType, IntType, StructType,
 };
@@ -70,9 +72,17 @@ pub(crate) enum DuxType {
     /// A declared `struct`. The LLVM representation is the nominal struct
     /// type, so assignment is a copy of the whole record.
     Struct(&'static StructInfo),
+    /// A declared `enum` at one instantiation: `Shape`, `Option<i32>`. The LLVM
+    /// representation is the tagged struct of DESIGN 4.2 — a tag beside an area
+    /// big enough for the largest payload — so a sum-type value is a value like
+    /// a record: it copies, travels in registers and lives in a slot.
+    Enum(&'static EnumInfo),
     /// Something we could not type; it silences follow-on diagnostics.
     Error,
 }
+
+/// A name a pattern binds: the name, what it holds, and the slot it holds it in.
+pub(crate) type Binding = (String, DuxType, PointerValue<'static>);
 
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct ArrayInfo {
@@ -83,17 +93,7 @@ pub(crate) struct ArrayInfo {
 #[derive(Debug)]
 pub(crate) struct StructInfo {
     pub(crate) name: &'static str,
-    pub(crate) fields: Vec<(&'static str, DuxType)>,
     pub(crate) llvm: StructType<'static>,
-}
-
-impl StructInfo {
-    pub(crate) fn field(&self, name: &str) -> Option<(u32, DuxType)> {
-        self.fields
-            .iter()
-            .position(|(field, _)| *field == name)
-            .map(|index| (index as u32, self.fields[index].1))
-    }
 }
 
 /// Records are nominal: the same `struct` resolves to one leaked `StructInfo`,
@@ -105,6 +105,48 @@ impl PartialEq for StructInfo {
 }
 
 impl Eq for StructInfo {}
+
+/// One variant of a sum type at one instantiation: what it carries, and where
+/// each piece of it sits inside the value.
+#[derive(Debug)]
+pub(crate) struct VariantInfo {
+    pub(crate) name: &'static str,
+    pub(crate) fields: Vec<(&'static str, DuxType)>,
+    /// Each field's byte offset from the start of the value.
+    pub(crate) offsets: Vec<u64>,
+}
+
+#[derive(Debug)]
+pub(crate) struct EnumInfo {
+    pub(crate) name: &'static str,
+    /// The instantiation, spelled for diagnostics: `Option<i32>`.
+    pub(crate) spelled: String,
+    pub(crate) variants: Vec<VariantInfo>,
+    pub(crate) llvm: BasicTypeEnum<'static>,
+    /// The tag's own type, and its offset — a tagged enum keeps it at zero.
+    pub(crate) tag: IntType<'static>,
+    pub(crate) tag_at: u64,
+    /// The variant whose pointer doubles as the tag; `None` when the enum
+    /// keeps a tag of its own.
+    pub(crate) niche: Option<u32>,
+}
+
+impl PartialEq for EnumInfo {
+    fn eq(&self, other: &Self) -> bool {
+        std::ptr::eq(self, other)
+    }
+}
+
+impl Eq for EnumInfo {}
+
+impl EnumInfo {
+    fn variant(&self, name: &str) -> Option<(u32, &VariantInfo)> {
+        self.variants
+            .iter()
+            .position(|variant| variant.name == name)
+            .map(|index| (index as u32, &self.variants[index]))
+    }
+}
 
 impl DuxType {
     fn from_ast(ty: &Type) -> Option<DuxType> {
@@ -219,6 +261,7 @@ impl DuxType {
             DuxType::Array(info) => info.elem.llvm(context).array_type(info.len as u32).into(),
             DuxType::Slice(_) | DuxType::Str => context.struct_type(&[context.ptr_type(AddressSpace::default()).into(), context.i64_type().into()], false).into(),
             DuxType::Struct(info) => info.llvm.into(),
+            DuxType::Enum(info) => info.llvm,
         }
     }
 
@@ -258,6 +301,7 @@ impl DuxType {
             DuxType::Array(info) => format!("[{}; {}]", info.elem.name(), info.len),
             DuxType::Slice(element) => format!("[]{}", element.name()),
             DuxType::Struct(info) => info.name.to_string(),
+            DuxType::Enum(info) => info.spelled.clone(),
             DuxType::Error => "<error>".to_string(),
         }
     }
@@ -274,7 +318,8 @@ impl DuxType {
             DuxType::U32 => 1 << 32,
             DuxType::U64 => 1 << 64,
             DuxType::F32 | DuxType::F64 => return true,
-            DuxType::Array(..) | DuxType::Struct(..) | DuxType::Str | DuxType::Ptr => return false,
+            DuxType::Array(..) | DuxType::Struct(..) | DuxType::Enum(_) | DuxType::Str
+            | DuxType::Ptr => return false,
             DuxType::Slice(_) => return false,
             DuxType::Pointer(_) => return false,
             DuxType::Error => return false,
@@ -518,9 +563,28 @@ pub(crate) struct Emitter {
     /// `StructInfo` (a nominal LLVM struct type plus resolved field types).
     struct_decls: Vec<dux_ast::StructDecl>,
     structs: HashMap<String, &'static StructInfo>,
+    /// A declared record's fields, by record name. They live here rather than
+    /// on `StructInfo` so a record can exist — and be pointed at — before its
+    /// fields are known, which is what `struct Node { next: *Node }` needs.
+    struct_fields: HashMap<String, Vec<(&'static str, DuxType)>>,
+    /// The declared `enum` shapes — the program's own over the universe's
+    /// `Option` and `Result` — waiting to be resolved at an instantiation.
+    shapes: HashMap<String, Shape>,
+    enums: HashMap<String, &'static EnumInfo>,
+    /// Names whose payload types are being resolved right now, so an enum that
+    /// contains itself by value is a diagnostic rather than a hang.
+    resolving_enums: Vec<String>,
+    enum_errors: HashSet<String>,
+    /// The module's data layout, so a payload area is placed exactly as C
+    /// would place it.
+    layout: String,
     /// Names whose field types are being resolved right now, so a size cycle
     /// is a diagnostic rather than a hang.
     resolving: Vec<String>,
+    /// How deep inside a `*T` the resolver stands. A pointer needs no size for
+    /// what it points at, so a type still being laid out is a raw pointer from
+    /// here on — not the size cycle the by-value fields must not make.
+    pointer_depth: usize,
     /// Structs already reported as unlowerable, so one bad field is one
     /// diagnostic rather than one per use.
     struct_errors: HashSet<String>,
@@ -575,7 +639,14 @@ impl Emitter {
             signatures: HashMap::new(),
             struct_decls: Vec::new(),
             structs: HashMap::new(),
+            struct_fields: HashMap::new(),
+            shapes: HashMap::new(),
+            enums: HashMap::new(),
+            resolving_enums: Vec::new(),
+            enum_errors: HashSet::new(),
+            layout: String::new(),
             resolving: Vec::new(),
+            pointer_depth: 0,
             struct_errors: HashSet::new(),
             skipped: HashSet::new(),
             scopes: Vec::new(),
@@ -654,6 +725,20 @@ impl Emitter {
             );
         }
         self.struct_decls = program.structs().cloned().collect();
+        self.shapes = sums::prelude()
+            .into_iter()
+            .map(|shape| (shape.name.clone(), shape))
+            .collect();
+        for decl in program.enums() {
+            let shape = Shape::from_decl(decl);
+            self.shapes.insert(shape.name.clone(), shape);
+        }
+        self.layout = module
+            .get_data_layout()
+            .as_str()
+            .to_str()
+            .unwrap_or_default()
+            .to_string();
         for decl in &program.decls {
             match decl {
                 Decl::Const(decl) => self.declare_const(module, decl),
@@ -713,15 +798,30 @@ impl Emitter {
         match ty {
             Type::Named { name, args, .. } if args.is_empty() => match DuxType::named(name) {
                 Some(primitive) => Some(primitive),
-                None => self.struct_type_of(name),
+                None => match self.struct_type_of(name) {
+                    Some(record) => Some(record),
+                    None => self.enum_type_of(name, &[]),
+                },
             },
+            Type::Named { name, args, .. } => {
+                let mut given = Vec::new();
+                for argument in args {
+                    given.push(self.type_of(argument)?);
+                }
+                self.enum_type_of(name, &given)
+            }
             Type::Slice { element, .. } => self
                 .type_of(element)
                 .map(|element| DuxType::Slice(Box::leak(Box::new(element)))),
-            Type::Pointer { pointee, .. } => match self.type_of(pointee) {
-                Some(target) => Some(self.pointer_to(target)),
-                None => Some(DuxType::Ptr),
-            },
+            Type::Pointer { pointee, .. } => {
+                self.pointer_depth += 1;
+                let pointee = self.type_of(pointee);
+                self.pointer_depth -= 1;
+                Some(match pointee {
+                    Some(target) => self.pointer_to(target),
+                    None => DuxType::Ptr,
+                })
+            }
             Type::Array { element, len, .. } => {
                 let element = self.type_of(element)?;
                 let Expr::Int { value, .. } = len.as_ref() else {
@@ -733,12 +833,413 @@ impl Emitter {
         }
     }
 
+    /// Resolve a declared `enum` at one instantiation. `Option` and `Result`
+    /// come from the universe scope and are built the same way as a program's
+    /// own; each instantiation gets its own nominal LLVM struct type, so
+    /// `Option<i32>` and `Option<string>` stay different types.
+    fn enum_type_of(&mut self, name: &str, args: &[DuxType]) -> Option<DuxType> {
+        let key = instantiation(name, args);
+        if let Some(info) = self.enums.get(&key).copied() {
+            return Some(DuxType::Enum(info));
+        }
+        if self.enum_errors.contains(&key) {
+            return None;
+        }
+        let shape = self.shapes.get(name)?.clone();
+        if !shape.takes(args.len()) {
+            self.diagnostics.push(
+                Diagnostic::error(
+                    code::CODEGEN_FAILED,
+                    format!(
+                        "`{name}` takes {} argument(s), this one gives {}",
+                        shape.params.len(),
+                        args.len()
+                    ),
+                )
+                .with_note("an enum without its arguments has no size"),
+            );
+            self.enum_errors.insert(key);
+            return None;
+        }
+        if self.resolving_enums.iter().any(|busy| busy == &key) {
+            if self.pointer_depth > 0 {
+                return Some(DuxType::Ptr);
+            }
+            self.diagnostics.push(
+                Diagnostic::error(
+                    code::CODEGEN_FAILED,
+                    format!(
+                        "`{key}` has no size: a variant must reach itself through a pointer"
+                    ),
+                ),
+            );
+            self.enum_errors.insert(key);
+            return None;
+        }
+        let context = self.context;
+        self.resolving_enums.push(key.clone());
+        let mut variants: Vec<VariantInfo> = Vec::new();
+        let mut payloads = Vec::new();
+        let mut broken = false;
+        for (variant, payload) in &shape.clone().variants {
+            let mut fields: Vec<(&'static str, DuxType)> = Vec::new();
+            let mut field_types = Vec::new();
+            for (field, spelled) in payload_fields(payload) {
+                match self.payload_type(spelled, &shape, args) {
+                    Some(ty) => {
+                        fields.push((Box::leak(field.to_string().into_boxed_str()) as &str, ty));
+                        field_types.push(ty.llvm(context));
+                    }
+                    None => {
+                        self.unsupported(
+                            spelled.span(),
+                            &format!("the payload of `{name}::{variant}`"),
+                        );
+                        broken = true;
+                        break;
+                    }
+                }
+            }
+            if broken {
+                break;
+            }
+            let llvm = context.struct_type(&field_types, false);
+            payloads.push(llvm);
+            variants.push(VariantInfo {
+                name: Box::leak(variant.to_string().into_boxed_str()) as &str,
+                fields,
+                offsets: Vec::new(),
+            });
+        }
+        self.resolving_enums.pop();
+        if broken {
+            self.enum_errors.insert(key);
+            return None;
+        }
+        let data = TargetData::create(&self.layout);
+        // DESIGN 4.3: the niche belongs to the predeclared two — `Option` and
+        // `Result` — and not to every enum that happens to hold a pointer.
+        let niche = match shape.name.as_str() {
+            "Option" | "Result" => niche_of(context, &data, &variants, &payloads),
+            _ => None,
+        };
+        let (llvm, tag, tag_at) = match niche {
+            Some(_) => (
+                context.ptr_type(AddressSpace::default()).into(),
+                context.i16_type(),
+                0u64,
+            ),
+            None => {
+                // DESIGN 4.4: the tag is a `u16` unless the enum outgrows one.
+                let tag = if variants.len() <= usize::from(u16::MAX) {
+                    context.i16_type()
+                } else {
+                    context.i32_type()
+                };
+                let storage = storage_area(context, &data, &payloads);
+                (context.struct_type(&[tag.into(), storage], false).into(), tag, 0u64)
+            }
+        };
+        let payload_at = if niche.is_none() {
+            match llvm {
+                BasicTypeEnum::StructType(shape) => data.offset_of_element(&shape, 1).unwrap_or(0),
+                _ => 0,
+            }
+        } else {
+            0
+        };
+        for (index, variant) in variants.iter_mut().enumerate() {
+            variant.offsets = match niche {
+                // DESIGN 4.5: `Option<*T>` is one pointer, and null is the
+                // variant that carries nothing, so the payload sits at zero.
+                Some(carrier) if index == carrier as usize => vec![0u64; variant.fields.len()],
+                Some(_) => Vec::new(),
+                None => variant
+                    .fields
+                    .iter()
+                    .enumerate()
+                    .map(|(field, _)| {
+                        let inside = data
+                            .offset_of_element(&payloads[index], u32::try_from(field).unwrap_or(0))
+                            .unwrap_or(0);
+                        payload_at + inside
+                    })
+                    .collect(),
+            };
+        }
+        let info: &'static EnumInfo = Box::leak(Box::new(EnumInfo {
+            name: Box::leak(name.to_string().into_boxed_str()) as &str,
+            spelled: key.clone(),
+            variants,
+            llvm,
+            tag,
+            tag_at,
+            niche,
+        }));
+        self.enums.insert(key.clone(), info);
+        Some(DuxType::Enum(info))
+    }
+
+    /// Which enum a variant written without its enum belongs to. The universe's
+    /// two answer first; a program's own enum may own the name, and where more
+    /// than one does the spelling is ambiguous, so nothing is claimed.
+    fn owner_of_variant(&self, variant: &str) -> Option<String> {
+        for name in ["Option", "Result"] {
+            if self
+                .shapes
+                .get(name)
+                .is_some_and(|shape| shape.has_variant(variant))
+            {
+                return Some(name.to_string());
+            }
+        }
+        let owners: Vec<&String> = self
+            .shapes
+            .iter()
+            .filter(|(_, shape)| shape.has_variant(variant))
+            .map(|(name, _)| name)
+            .collect();
+        match owners.as_slice() {
+            [one] => Some((*one).clone()),
+            _ => None,
+        }
+    }
+
+    /// `Shape::Circle(2.0)`, `Shape::Rect { w: 1.0, h: 2.0 }`, `Some(3)`,
+    /// `None`: a sum-type value, built in a slot and then loaded so it travels
+    /// like any other value.
+    #[allow(clippy::too_many_arguments)]
+    fn variant_value(
+        &mut self,
+        module: &Module<'static>,
+        owner: &str,
+        variant: &str,
+        given: &[Expr],
+        named: &[(&str, &Expr)],
+        span: Span,
+        expected: Option<DuxType>,
+    ) -> Option<Typed> {
+        let shape = self.shapes.get(owner).cloned()?;
+        let (index, payload) = shape.variant(variant)?;
+        let written = payload_fields(payload);
+        // The context usually says which instantiation this is, and then each
+        // payload value is checked against the field it lands in. A generic
+        // enum written with no context is the one case where the values have to
+        // speak for the parameters first.
+        let known = match expected {
+            Some(DuxType::Enum(info)) if info.name == owner => Some(info),
+            _ if shape.params.is_empty() => match self.enum_type_of(owner, &[]) {
+                Some(ty) => self.enum_of(ty),
+                None => None,
+            },
+            _ => None,
+        };
+        let mut values: Vec<(&str, Typed)> = Vec::new();
+        for (position, argument) in given.iter().enumerate() {
+            let name = written
+                .get(position)
+                .map(|(name, _)| *name)
+                .unwrap_or_default();
+            let want = payload_field_of(known, index, name);
+            values.push((name, self.expr(module, argument, want)?));
+        }
+        for (field, argument) in named {
+            let want = payload_field_of(known, index, field);
+            values.push((field, self.expr(module, argument, want)?));
+        }
+        let info = match known {
+            Some(info) => info,
+            None => {
+                let Some(ty) = self.made_of(&shape, &written, &values) else {
+                    self.diagnostics.push(
+                        Diagnostic::error(
+                            code::CODEGEN_FAILED,
+                            format!("what `{owner}::{variant}` holds is not written anywhere"),
+                        )
+                        .with_span(span)
+                        .with_note("say what it holds: `Option<i32> = None`, or give it a payload"),
+                    );
+                    return None;
+                };
+                self.enum_of(ty)?
+            }
+        };
+        let ty = DuxType::Enum(info);
+        let index = index as u32;
+        let slot = self.alloca(ty, "sum");
+        if info.niche.is_none() {
+            let zero = info
+                .llvm
+                .into_struct_type()
+                .const_zero()
+                .as_basic_value_enum();
+            let _ = self.builder.build_store(slot, zero).ok()?;
+        }
+        let fields = &info.variants[index as usize];
+        if fields.fields.len() != values.len() {
+            self.diagnostics.push(
+                Diagnostic::error(
+                    code::WRONG_ARITY,
+                    format!(
+                        "`{owner}::{variant}` carries {} value(s), this one gives {}",
+                        fields.fields.len(),
+                        values.len()
+                    ),
+                )
+                .with_span(span),
+            );
+            return None;
+        }
+        if let Some(carrier) = info.niche {
+            if index != carrier {
+                let null = self.context.ptr_type(AddressSpace::default()).const_zero();
+                let _ = self.builder.build_store(self.byte_at(slot, 0), null).ok()?;
+            }
+        } else {
+            let tag = info.tag.const_int(index as u64, false);
+            let at = self.byte_at(slot, info.tag_at);
+            let _ = self.builder.build_store(at, tag).ok()?;
+        }
+        for (field, value) in fields.fields.iter().zip(values.iter()) {
+            let offset = fields.offsets.get(values.iter().position(|(name, _)| *name == field.0)?)
+                .copied()
+                .unwrap_or(0);
+            let want = self.coerce_implicit(module, value.1, field.1, span)?;
+            let at = self.byte_at(slot, offset);
+            match (field.1.array_info(), want.core) {
+                (Some(array), Core::Ptr(source)) => self.copy_array(at, source, array),
+                (None, _) => {
+                    let Some(basic) = want.basic() else {
+                        self.unsupported(span, "storing this value in a sum-type payload");
+                        return None;
+                    };
+                    let _ = self.builder.build_store(at, basic).ok()?;
+                }
+                (Some(_), _) => {
+                    self.unsupported(span, "storing this array value in a sum-type payload");
+                    return None;
+                }
+            }
+        }
+        self.load(ty, slot)
+    }
+
+    /// The instantiation a sum-type value has when nothing says: whichever
+    /// parameters the payload values fill in.
+    fn made_of(
+        &mut self,
+        shape: &Shape,
+        written: &[(&str, &Type)],
+        values: &[(&str, Typed)],
+    ) -> Option<DuxType> {
+        let mut known: Vec<(String, DuxType)> = Vec::new();
+        for ((_, spelled), (_, value)) in written.iter().zip(values) {
+            if value.ty == DuxType::Error {
+                return None;
+            }
+            if let Type::Named { name, args, .. } = spelled {
+                if args.is_empty()
+                    && shape.params.iter().any(|param| param == name)
+                    && !known.iter().any(|(param, _)| param == name)
+                {
+                    known.push((name.clone(), value.ty));
+                }
+            }
+        }
+        let mut arguments = Vec::new();
+        for param in &shape.params {
+            match known.iter().find(|(known, _)| known == param) {
+                Some((_, ty)) => arguments.push(*ty),
+                None => return None,
+            }
+        }
+        self.enum_type_of(&shape.name, &arguments)
+    }
+
+    /// A byte offset inside a value, which is how a payload field is reached:
+    /// the tagged layout places its fields where C would, and only byte
+    /// addresses are sure of that.
+    fn byte_at(&self, at: PointerValue<'static>, offset: u64) -> PointerValue<'static> {
+        if offset == 0 {
+            return at;
+        }
+        let index = self.context.i64_type().const_int(offset, false);
+        unsafe {
+            self.builder
+                .build_gep(self.context.i8_type(), at, &[index], "piece")
+                .expect("byte offset inside a value")
+        }
+    }
+
+    /// Does the sum-type value at `at` hold this variant? For a niche `Option`
+    /// the question is whether the pointer is null; otherwise it is the tag.
+    fn variant_holds(
+        &mut self,
+        info: &'static EnumInfo,
+        index: u32,
+        at: PointerValue<'static>,
+    ) -> Option<IntValue<'static>> {
+        let context = self.context;
+        match info.niche {
+            Some(carrier) => {
+                let pointer = context.ptr_type(AddressSpace::default());
+                let held = self
+                    .builder
+                    .build_load(pointer, at, "held")
+                    .ok()?
+                    .into_pointer_value();
+                let empty = self.builder.build_is_null(held, "empty").ok()?;
+                Some(if carrier == index {
+                    self.builder.build_not(empty, "holds").ok()?
+                } else {
+                    empty
+                })
+            }
+            None => {
+                let tag = self
+                    .builder
+                    .build_load(info.tag, self.byte_at(at, info.tag_at), "tag")
+                    .ok()?
+                    .into_int_value();
+                let want = info.tag.const_int(index as u64, false);
+                self.builder
+                    .build_int_compare(IntPredicate::EQ, tag, want, "holds")
+                    .ok()
+            }
+        }
+    }
+
+    /// A variant's payload type with the enum's parameters filled in.
+    fn payload_type(&mut self, spelled: &Type, shape: &Shape, args: &[DuxType]) -> Option<DuxType> {
+        if let Type::Named { name, args: none, .. } = spelled {
+            if none.is_empty() {
+                if let Some(index) = shape.params.iter().position(|param| param == name) {
+                    return args.get(index).cloned();
+                }
+            }
+        }
+        self.type_of(spelled)
+    }
+
+    fn enum_of(&self, ty: DuxType) -> Option<&'static EnumInfo> {
+        match ty {
+            DuxType::Enum(info) => Some(info),
+            _ => None,
+        }
+    }
+
     /// Resolve (once) the declared `struct` of that name into a nominal LLVM
     /// struct type. Fields are resolved on demand so a record may be declared
     /// after the one that embeds it; a cycle that does not pass through a
     /// pointer has no size and is reported.
     fn struct_type_of(&mut self, name: &str) -> Option<DuxType> {
         if let Some(info) = self.structs.get(name).copied() {
+            // The handle is cached before its fields are, so a record that is
+            // still being laid out is reachable from here: only a pointer may
+            // aim at it.
+            if self.resolving.iter().any(|busy| busy == name) {
+                return self.in_progress(name);
+            }
             return Some(DuxType::Struct(info));
         }
         if self.struct_errors.contains(name) {
@@ -750,19 +1251,17 @@ impl Emitter {
             .find(|decl| decl.name.name == name)
             .cloned()?;
         if self.resolving.iter().any(|busy| busy == name) {
-            self.diagnostics.push(
-                Diagnostic::error(
-                    code::CODEGEN_FAILED,
-                    format!(
-                        "`{name}` has no size: a `struct` field must reach itself through a pointer"
-                    ),
-                )
-                .with_span(decl.span),
-            );
-            self.struct_errors.insert(name.to_string());
-            return None;
+            return self.in_progress(name);
         }
+        // The record's identity and its LLVM handle exist before its fields are
+        // known, so a `*Self` field points at a type that is still being laid
+        // out: a pointer needs no size for what it aims at.
         let llvm = self.context.opaque_struct_type(name);
+        let info: &'static StructInfo = Box::leak(Box::new(StructInfo {
+            name: Box::leak(name.to_string().into_boxed_str()) as &str,
+            llvm,
+        }));
+        self.structs.insert(name.to_string(), info);
         self.resolving.push(name.to_string());
         let mut fields = Vec::new();
         let mut field_types = Vec::new();
@@ -784,17 +1283,45 @@ impl Emitter {
         }
         self.resolving.pop();
         if unresolved {
+            self.structs.remove(name);
             self.struct_errors.insert(name.to_string());
             return None;
         }
         llvm.set_body(&field_types, false);
-        let info: &'static StructInfo = Box::leak(Box::new(StructInfo {
-            name: Box::leak(name.to_string().into_boxed_str()) as &str,
-            fields,
-            llvm,
-        }));
-        self.structs.insert(name.to_string(), info);
+        self.struct_fields.insert(name.to_string(), fields);
         Some(DuxType::Struct(info))
+    }
+
+    /// A record whose fields are still being resolved. A pointer may aim at a
+    /// type with no size yet — a pointer needs none — but a field of it would
+    /// be a type that contains itself, which has no size at all.
+    fn in_progress(&mut self, name: &str) -> Option<DuxType> {
+        if self.pointer_depth > 0 {
+            return self.structs.get(name).copied().map(DuxType::Struct);
+        }
+        let span = self
+            .struct_decls
+            .iter()
+            .find(|decl| decl.name.name == name)
+            .map(|decl| decl.span)
+            .unwrap_or_default();
+        self.diagnostics.push(
+            Diagnostic::error(
+                code::CODEGEN_FAILED,
+                format!("`{name}` has no size: a `struct` field must reach itself through a pointer"),
+            )
+            .with_span(span),
+        );
+        self.struct_errors.insert(name.to_string());
+        None
+    }
+
+    /// A declared record's fields, in declaration order.
+    fn struct_field_list(&self, info: &StructInfo) -> &[(&'static str, DuxType)] {
+        self.struct_fields
+            .get(info.name)
+            .map(Vec::as_slice)
+            .unwrap_or_default()
     }
 
     fn struct_of(&self, ty: DuxType) -> Option<&'static StructInfo> {
@@ -1485,7 +2012,14 @@ impl Emitter {
     }
 
     fn block_body(&mut self, module: &Module<'static>, block: &Block) {
+        self.block_body_bound(module, block, &[]);
+    }
+
+    /// A block whose scope starts with the bindings a pattern made elsewhere:
+    /// `while P := e { … }` tests in one block and binds in the body.
+    fn block_body_bound(&mut self, module: &Module<'static>, block: &Block, bound: &[Binding]) {
         self.scopes.push(HashMap::new());
+        self.declare_bindings(bound);
         let outer = self.save_context(block);
         for stmt in &block.stmts {
             if self.dead {
@@ -1495,6 +2029,624 @@ impl Emitter {
         }
         self.restore_context(outer);
         self.scopes.pop();
+    }
+
+    /// Move a value into a slot of its own type, which is how a `match` gets a
+    /// subject it can take apart. An array is storage rather than a word, so it
+    /// is copied element by element like a binding copies it.
+    fn put_in(
+        &mut self,
+        slot: PointerValue<'static>,
+        value: Typed,
+        span: Span,
+    ) -> Option<()> {
+        match (value.ty.array_info(), value.core) {
+            (Some(array), Core::Ptr(source)) => self.copy_array(slot, source, array),
+            (None, _) => {
+                let basic = value.basic().or_else(|| {
+                    self.unsupported(
+                        span,
+                        "matching on this value (it does not travel as one yet)",
+                    );
+                    None
+                })?;
+                let _ = self.builder.build_store(slot, basic).ok()?;
+            }
+            (Some(_), _) => {
+                self.unsupported(span, "matching on this array value");
+                return None;
+            }
+        }
+        Some(())
+    }
+
+    /// `match e { P => … }`, as a statement or (with `value`) as an expression.
+    /// The subject is copied into a slot of its own, the arms test it in the
+    /// order they are written, and the arm that matches runs and leaves. A
+    /// guarded arm whose guard declines is not a match, so the chain moves on.
+    fn matching(
+        &mut self,
+        module: &Module<'static>,
+        subject: &Expr,
+        arms: &[dux_ast::MatchArm],
+        expected: Option<DuxType>,
+        value: bool,
+        span: Span,
+    ) -> Option<Typed> {
+        let held = self.expr(module, subject, None)?;
+        if held.ty == DuxType::Error {
+            return Some(Typed::error());
+        }
+        let ty = held.ty;
+        let place = self.alloca(ty, "match");
+        self.put_in(place, held, span)?;
+
+        let join = self.new_block("match.end");
+        let mut results: Vec<(Typed, BasicBlock<'static>)> = Vec::new();
+        let mut joined = expected;
+        let mut broken = false;
+        let mut rest = self.new_block("match.test");
+        self.br(rest);
+        for arm in arms {
+            self.builder.position_at_end(rest);
+            self.dead = false;
+            let body = self.new_block("match.arm");
+            let next = self.new_block("match.next");
+            let entered = if arm.guard.is_some() {
+                self.new_block("match.guard")
+            } else {
+                body
+            };
+            let mut bound = Vec::new();
+            self.pattern_holds(module, &arm.pattern, ty, place, entered, next, &mut bound);
+            self.builder.position_at_end(entered);
+            self.dead = false;
+            self.scopes.push(HashMap::new());
+            self.declare_bindings(&bound);
+            if let Some(guard) = &arm.guard {
+                let mut bound = bound.clone();
+                let test = self.condition_bound(module, guard, &mut bound);
+                self.declare_bindings(&bound);
+                let _ = self.builder.build_conditional_branch(test, body, next);
+                self.builder.position_at_end(body);
+                self.dead = false;
+            }
+            let outcome = self.match_body(module, &arm.body, joined);
+            let ended = self.builder.get_insert_block();
+            self.scopes.pop();
+            let Some(one) = outcome else {
+                if value && !self.dead {
+                    self.unsupported(
+                        arm.span,
+                        "an arm of a value `match` that produces no value",
+                    );
+                    broken = true;
+                } else if !self.dead {
+                    self.br(join);
+                }
+                rest = next;
+                continue;
+            };
+            if !self.dead && one.ty != DuxType::Error {
+                if joined.is_none() {
+                    joined = Some(one.ty);
+                }
+                let common = joined.expect("the first arm gives the `match` its type");
+                match (self.convert(one, common), ended) {
+                    (Some(carried), Some(ended)) => {
+                        results.push((carried, ended));
+                        self.br(join);
+                    }
+                    _ => broken = true,
+                }
+            } else if !self.dead {
+                broken = true;
+                self.br(join);
+            }
+            rest = next;
+        }
+
+        // DESIGN 4.4: a `match` that is not exhaustive is an error, so an arm
+        // always matches and the chain never runs out. A hole in that rule is a
+        // compiler bug, and a bug should say so rather than run on.
+        self.builder.position_at_end(rest);
+        self.dead = false;
+        self.trap(module, "dux: no `match` arm matched\n");
+
+        self.builder.position_at_end(join);
+        self.dead = false;
+        if join.get_first_use().is_none() {
+            // Every arm left, so nothing reaches here.
+            let _ = self.builder.build_unreachable();
+            self.dead = true;
+            return if value { Some(Typed::error()) } else { None };
+        }
+        if !value {
+            return None;
+        }
+        if broken || results.is_empty() {
+            let _ = self.builder.build_unreachable();
+            self.dead = true;
+            return Some(Typed::error());
+        }
+        let common = joined.expect("an arm gave the `match` its type");
+        let phi = self
+            .builder
+            .build_phi(common.llvm(self.context), "matchtmp")
+            .ok()?;
+        let mut incoming: Vec<(inkwell::values::BasicValueEnum<'static>, BasicBlock<'static>)> =
+            Vec::new();
+        for (one, ended) in &results {
+            let Some(basic) = one.basic() else {
+                let _ = self.builder.build_unreachable();
+                self.dead = true;
+                return Some(Typed::error());
+            };
+            incoming.push((basic, *ended));
+        }
+        phi.add_incoming(
+            &incoming
+                .iter()
+                .map(|(basic, ended)| (basic as &dyn inkwell::values::BasicValue<'static>, *ended))
+                .collect::<Vec<_>>(),
+        );
+        Some(typed_of(phi.as_basic_value(), common))
+    }
+
+    /// What an arm does. `None` says it produces no value, which a `match` used
+    /// as a statement is fine with and a `match` used as a value is not.
+    fn match_body(
+        &mut self,
+        module: &Module<'static>,
+        body: &dux_ast::MatchBody,
+        expected: Option<DuxType>,
+    ) -> Option<Typed> {
+        match body {
+            dux_ast::MatchBody::Expr(expr) => self.expr(module, expr, expected),
+            dux_ast::MatchBody::Block(block) => {
+                self.scopes.push(HashMap::new());
+                let tail = block.stmts.len().saturating_sub(1);
+                let value = match block.stmts.last() {
+                    Some(Stmt::Expr { expr, .. }) => Some(expr),
+                    _ => None,
+                };
+                for (index, stmt) in block.stmts.iter().enumerate() {
+                    if self.dead {
+                        break;
+                    }
+                    if value.is_some() && index == tail {
+                        continue;
+                    }
+                    self.stmt(module, stmt);
+                }
+                let outcome = match value {
+                    Some(expr) if !self.dead => self.expr(module, expr, expected),
+                    _ => None,
+                };
+                self.scopes.pop();
+                outcome
+            }
+            dux_ast::MatchBody::Stmt(stmt) => {
+                self.stmt(module, stmt);
+                None
+            }
+        }
+    }
+
+    /// Emit the tests that decide whether the value at `place` matches
+    /// `pattern`, branching to `matched` or `declined`. The names the pattern
+    /// binds are collected in `bound`: their slots live in the entry block and
+    /// are written along the path that reaches `matched`, so an arm body that
+    /// reads them sees what it matched.
+    #[allow(clippy::too_many_arguments)]
+    fn pattern_holds(
+        &mut self,
+        module: &Module<'static>,
+        pattern: &dux_ast::Pattern,
+        ty: DuxType,
+        place: PointerValue<'static>,
+        matched: BasicBlock<'static>,
+        declined: BasicBlock<'static>,
+        bound: &mut Vec<Binding>,
+    ) {
+        match pattern {
+            dux_ast::Pattern::Wildcard { .. } | dux_ast::Pattern::Else { .. } => self.br(matched),
+            dux_ast::Pattern::Error { .. } => self.br(declined),
+            dux_ast::Pattern::Name { name, span } => {
+                match self.variant_of(ty, None, &name.name) {
+                    Some((index, _)) => {
+                        self.variant_test(ty, index, place, matched, declined, *span)
+                    }
+                    None => {
+                        self.bind_pattern(&name.name, ty, place, bound);
+                        self.br(matched);
+                    }
+                }
+            }
+            dux_ast::Pattern::Path {
+                qualifier,
+                name,
+                span,
+            } => match self.variant_of(ty, Some(qualifier), name) {
+                Some((index, _)) => {
+                    self.variant_test(ty, index, place, matched, declined, *span)
+                }
+                None => {
+                    self.missing_variant(ty, Some(qualifier), name, *span);
+                    self.br(declined);
+                }
+            },
+            dux_ast::Pattern::Tuple {
+                qualifier,
+                name,
+                elements,
+                span,
+            } => {
+                let Some((index, variant)) = self.variant_of(ty, qualifier.as_deref(), name)
+                else {
+                    self.missing_variant(ty, qualifier.as_deref(), name, *span);
+                    self.br(declined);
+                    return;
+                };
+                if elements.len() != variant.fields.len() {
+                    self.diagnostics.push(
+                        Diagnostic::error(
+                            code::WRONG_ARITY,
+                            format!(
+                                "`{name}` carries {} value(s), the pattern takes apart {}",
+                                variant.fields.len(),
+                                elements.len()
+                            ),
+                        )
+                        .with_span(*span),
+                    );
+                    self.br(declined);
+                    return;
+                }
+                if !self.variant_test_to(ty, index, place, declined) {
+                    self.br(declined);
+                    return;
+                }
+                if elements.is_empty() {
+                    self.br(matched);
+                    return;
+                }
+                for (position, element) in elements.iter().enumerate() {
+                    let (_, field_ty) = variant.fields[position];
+                    let at = self.byte_at(place, variant.offsets[position]);
+                    let last = position + 1 == elements.len();
+                    let onward = if last { matched } else { self.new_block("match.element") };
+                    self.pattern_holds(module, element, field_ty, at, onward, declined, bound);
+                    if !last {
+                        self.builder.position_at_end(onward);
+                        self.dead = false;
+                    }
+                }
+            }
+            dux_ast::Pattern::Struct {
+                qualifier,
+                name,
+                fields,
+                rest,
+                span,
+            } => {
+                let Some((index, variant)) = self.variant_of(ty, qualifier.as_deref(), name)
+                else {
+                    self.missing_variant(ty, qualifier.as_deref(), name, *span);
+                    self.br(declined);
+                    return;
+                };
+                if !fields.is_empty() && !*rest && fields.len() != variant.fields.len() {
+                    self.diagnostics.push(
+                        Diagnostic::error(
+                            code::TYPE_MISMATCH,
+                            format!(
+                                "`{name}` carries {} value(s), the pattern names {}",
+                                variant.fields.len(),
+                                fields.len()
+                            ),
+                        )
+                        .with_note("name them all, or write `..` for the rest")
+                        .with_span(*span),
+                    );
+                    self.br(declined);
+                    return;
+                }
+                if !self.variant_test_to(ty, index, place, declined) {
+                    self.br(declined);
+                    return;
+                }
+                if fields.is_empty() {
+                    self.br(matched);
+                    return;
+                }
+                for (position, field) in fields.iter().enumerate() {
+                    let (field_name, nested) = match field {
+                        dux_ast::FieldPattern::Shorthand { name, .. } => (&name.name, None),
+                        dux_ast::FieldPattern::Nested { name, pattern, .. } => {
+                            (&name.name, Some(&**pattern))
+                        }
+                    };
+                    let inside = variant.fields.iter().position(|(known, _)| known == field_name);
+                    let Some(inside) = inside else {
+                        self.missing_variant_field(ty, name, field_name, *span);
+                        self.br(declined);
+                        return;
+                    };
+                    let (_, field_ty) = variant.fields[inside];
+                    let at = self.byte_at(place, variant.offsets[inside]);
+                    let last = position + 1 == fields.len();
+                    let onward = if last { matched } else { self.new_block("match.field") };
+                    match nested {
+                        Some(nested) => {
+                            self.pattern_holds(module, nested, field_ty, at, onward, declined, bound)
+                        }
+                        None => {
+                            self.bind_pattern(field_name, field_ty, at, bound);
+                            self.br(onward);
+                        }
+                    }
+                    if !last {
+                        self.builder.position_at_end(onward);
+                        self.dead = false;
+                    }
+                }
+            }
+            dux_ast::Pattern::Literal { value, span } => {
+                match self.literal_holds(module, value, ty, place, *span) {
+                    Some(flag) => {
+                        let _ = self.builder.build_conditional_branch(flag, matched, declined);
+                    }
+                    None => self.br(declined),
+                }
+            }
+            dux_ast::Pattern::Range {
+                start,
+                end,
+                inclusive,
+                span,
+            } => {
+                let low = self.range_bound(module, start, true, *inclusive, ty, place, bound, *span);
+                let high = self.range_bound(module, end, false, *inclusive, ty, place, bound, *span);
+                let test = match (low, high) {
+                    (Some(low), Some(high)) => self.builder.build_and(low, high, "within").ok(),
+                    (Some(one), None) => Some(one),
+                    (None, Some(one)) => Some(one),
+                    (None, None) => None,
+                };
+                match test {
+                    Some(flag) => {
+                        let _ = self.builder.build_conditional_branch(flag, matched, declined);
+                    }
+                    // Nothing was written to compare against: the bound named
+                    // the subject, and any subject is within it.
+                    None => self.br(matched),
+                }
+            }
+            dux_ast::Pattern::Or { alternatives, .. } => {
+                // Every alternative tests the same value and binds the same
+                // names, so they all end at `matched` and each writes the one
+                // slot the arm body reads.
+                for alternative in alternatives {
+                    let onward = self.new_block("match.or");
+                    self.pattern_holds(module, alternative, ty, place, matched, onward, bound);
+                    self.builder.position_at_end(onward);
+                    self.dead = false;
+                }
+                self.br(declined);
+            }
+        }
+    }
+
+    /// A variant test that continues into its own block, so a pattern with a
+    /// payload can take it apart there. `false` when the test could not be
+    /// built at all.
+    fn variant_test_to(
+        &mut self,
+        ty: DuxType,
+        index: u32,
+        place: PointerValue<'static>,
+        declined: BasicBlock<'static>,
+    ) -> bool {
+        let Some(info) = self.enum_of(ty) else {
+            return false;
+        };
+        let Some(flag) = self.variant_holds(info, index, place) else {
+            return false;
+        };
+        let payload = self.new_block("match.payload");
+        let _ = self
+            .builder
+            .build_conditional_branch(flag, payload, declined);
+        self.builder.position_at_end(payload);
+        self.dead = false;
+        true
+    }
+
+    /// A nullary variant written by name: the tag is the whole test.
+    fn variant_test(
+        &mut self,
+        ty: DuxType,
+        index: u32,
+        place: PointerValue<'static>,
+        matched: BasicBlock<'static>,
+        declined: BasicBlock<'static>,
+        span: Span,
+    ) {
+        if !self.variant_test_to(ty, index, place, declined) {
+            self.unsupported(span, "matching a variant of a value that is not a sum type");
+            self.br(declined);
+            return;
+        }
+        self.br(matched);
+    }
+
+    /// The variant a pattern names, when the subject's type has it. A pattern
+    /// may name the enum or leave it to be inferred, but a second enum in the
+    /// pattern's place is a different type and matches nothing.
+    fn variant_of(
+        &self,
+        ty: DuxType,
+        qualifier: Option<&str>,
+        name: &str,
+    ) -> Option<(u32, &'static VariantInfo)> {
+        let info = self.enum_of(ty)?;
+        if qualifier.is_some_and(|owner| owner != info.name) {
+            return None;
+        }
+        info.variant(name)
+    }
+
+    fn missing_variant(&mut self, ty: DuxType, qualifier: Option<&str>, name: &str, span: Span) {
+        let spelled = qualifier.map_or_else(|| name.to_string(), |owner| format!("{owner}::{name}"));
+        self.diagnostics.push(
+            Diagnostic::error(
+                code::TYPE_MISMATCH,
+                format!("`{spelled}` is not a variant of `{}`", ty.name()),
+            )
+            .with_span(span)
+            .with_note("a `match` arm names a variant of the type it matches"),
+        );
+    }
+
+    fn missing_variant_field(
+        &mut self,
+        ty: DuxType,
+        variant: &str,
+        field: &str,
+        span: Span,
+    ) {
+        self.diagnostics.push(
+            Diagnostic::error(
+                code::TYPE_MISMATCH,
+                format!("`{variant}` has no field `{field}` in its payload"),
+            )
+            .with_span(span)
+            .with_note(format!("`{}` carries it under other names", ty.name())),
+        );
+    }
+
+    /// A name a pattern binds gets a slot like any other local. An `or` pattern
+    /// names the same local in every alternative, so a name already bound keeps
+    /// the slot it has and the alternative writes it again.
+    fn bind_pattern(
+        &mut self,
+        name: &str,
+        ty: DuxType,
+        from: PointerValue<'static>,
+        bound: &mut Vec<Binding>,
+    ) {
+        let slot = match bound.iter().find(|(known, _, _)| known == name) {
+            Some((_, _, slot)) => *slot,
+            None => {
+                let slot = self.alloca(ty, name);
+                bound.push((name.to_string(), ty, slot));
+                slot
+            }
+        };
+        if let Some(array) = ty.array_info() {
+            self.copy_array(slot, from, array);
+            return;
+        }
+        if let Some(held) = self.load(ty, from) {
+            if let Some(basic) = held.basic() {
+                let _ = self.builder.build_store(slot, basic);
+            }
+        }
+    }
+
+    /// Pattern bindings become ordinary slots in the arm's own scope.
+    fn declare_bindings(&mut self, bound: &[Binding]) {
+        if let Some(scope) = self.scopes.last_mut() {
+            for (name, ty, slot) in bound {
+                scope.insert(name.clone(), (*ty, *slot));
+            }
+        }
+    }
+
+    /// Is the value at `place` equal to this literal?
+    fn literal_holds(
+        &mut self,
+        module: &Module<'static>,
+        value: &Expr,
+        ty: DuxType,
+        place: PointerValue<'static>,
+        span: Span,
+    ) -> Option<IntValue<'static>> {
+        let want = self.expr(module, value, Some(ty))?;
+        let held = self.load(ty, place)?;
+        let same = if ty == DuxType::Str || want.ty == DuxType::Str || ty.slice_element().is_some() {
+            self.text_binary(module, dux_ast::BinaryOp::Eq, held, want, span)
+        } else {
+            self.binary_typed(module, dux_ast::BinaryOp::Eq, held, want, span)
+        };
+        same.and_then(|same| same.int_value())
+    }
+
+    /// One bound of a range pattern. A bound written as a literal is the
+    /// comparison it implies; a bound written as a name names the subject
+    /// itself, which is all the checker asks of it.
+    #[allow(clippy::too_many_arguments)]
+    fn range_bound(
+        &mut self,
+        module: &Module<'static>,
+        bound: &dux_ast::Pattern,
+        is_start: bool,
+        inclusive: bool,
+        ty: DuxType,
+        place: PointerValue<'static>,
+        names: &mut Vec<Binding>,
+        span: Span,
+    ) -> Option<IntValue<'static>> {
+        match bound {
+            dux_ast::Pattern::Literal { value, span } => {
+                let want = self.expr(module, value, Some(ty))?;
+                let held = self.load(ty, place)?;
+                let op = match (is_start, inclusive) {
+                    (true, true) => dux_ast::BinaryOp::Ge,
+                    (true, false) => dux_ast::BinaryOp::Gt,
+                    (false, true) => dux_ast::BinaryOp::Le,
+                    (false, false) => dux_ast::BinaryOp::Lt,
+                };
+                self.binary_typed(module, op, held, want, *span)
+                    .and_then(|within| within.int_value())
+            }
+            dux_ast::Pattern::Name { name, .. } => {
+                self.bind_pattern(&name.name, ty, place, names);
+                None
+            }
+            other => {
+                self.unsupported(
+                    other.span(),
+                    "a range bound that is not a literal or a name",
+                );
+                let _ = span;
+                None
+            }
+        }
+    }
+
+    /// Stop the program where it broke a language rule the compiler could not
+    /// check for it.
+    fn trap(&mut self, module: &Module<'static>, message: &str) {
+        // A program that allocates nothing still has to stop when a language
+        // rule is broken, so the runtime arrives on demand for the trap alone.
+        if self.runtime.is_none() {
+            self.runtime = Some(Runtime::emit(self.context, module, self.debug_allocator));
+        }
+        let Some(trap) = self.runtime.as_ref().map(|runtime| runtime.trap) else {
+            let _ = self.builder.build_unreachable();
+            self.dead = true;
+            return;
+        };
+        let text = self
+            .builder
+            .build_global_string_ptr(message, "trap.message")
+            .expect("trap message")
+            .as_pointer_value();
+        let _ = self.builder.build_call(trap, &[text.into()], "trap");
+        let _ = self.builder.build_unreachable();
+        self.dead = true;
     }
 
     /// A block that rebinds `context` gets the outer value back on exit, so
@@ -1645,8 +2797,8 @@ impl Emitter {
             Stmt::Return { value, span } => self.return_stmt(module, value.as_ref(), *span),
             Stmt::Defer { stmt, span } => self.defer_stmt(module, stmt, *span),
             Stmt::Block { block, .. } => self.block_body(module, block),
-            Stmt::Match { span, .. } => {
-                self.unsupported(*span, "a `match` (the arms land at M4)")
+            Stmt::Match { subject, arms, span } => {
+                self.matching(module, subject, arms, None, false, *span);
             }
             Stmt::Error { .. } => {}
         }
@@ -1916,7 +3068,8 @@ impl Emitter {
         then_branch: &Block,
         else_branch: Option<&Stmt>,
     ) {
-        let condition = self.condition(module, cond);
+        let mut bound = Vec::new();
+        let condition = self.condition_bound(module, cond, &mut bound);
         let then_block = self.new_block("then");
         let else_block = self.new_block("else");
         let merge = self.new_block("endif");
@@ -1927,6 +3080,9 @@ impl Emitter {
         self.builder.position_at_end(then_block);
         self.dead = false;
         self.scopes.push(HashMap::new());
+        // The bindings a pattern condition made live for the `then` arm alone,
+        // which is where the checker can see them too.
+        self.declare_bindings(&bound);
         for stmt in &then_branch.stmts {
             if self.dead {
                 break;
@@ -2014,24 +3170,7 @@ impl Emitter {
             (&then_value.basic()?, then_at),
             (&else_value.basic()?, else_at),
         ]);
-        let value = phi.as_basic_value();
-        Some(if common.is_float() {
-            Typed::float(value.into_float_value(), common)
-        } else if common == DuxType::Ptr {
-            Typed::pointer(value.into_pointer_value(), common)
-        } else if common == DuxType::Str
-            || common.slice_element().is_some()
-            || self.struct_of(common).is_some()
-        {
-            Typed {
-                core: Core::Aggregate(value.into_struct_value()),
-                ty: common,
-            }
-        } else if common.is_numeric() {
-            Typed::int(value.into_int_value(), common)
-        } else {
-            Typed::error()
-        })
+        Some(typed_of(phi.as_basic_value(), common))
     }
 
     /// One arm of a value `if`, positioned at the start of its own region.
@@ -2425,7 +3564,8 @@ impl Emitter {
         self.br(cond_block);
 
         self.builder.position_at_end(cond_block);
-        let condition = self.condition(module, cond);
+        let mut bound = Vec::new();
+        let condition = self.condition_bound(module, cond, &mut bound);
         let _ = self
             .builder
             .build_conditional_branch(condition, body_block, exit_block);
@@ -2436,7 +3576,7 @@ impl Emitter {
             continuation: cond_block,
             exit: exit_block,
         });
-        self.block_body(module, body);
+        self.block_body_bound(module, body, &bound);
         self.loops.pop();
         self.br(cond_block);
 
@@ -3096,14 +4236,23 @@ impl Emitter {
     }
 
     fn condition(&mut self, module: &Module<'static>, cond: &Expr) -> IntValue<'static> {
+        let mut quiet = Vec::new();
+        self.condition_bound(module, cond, &mut quiet)
+    }
+
+    /// A condition as a `bool`. A pattern condition reports the names its
+    /// pattern binds to whoever owns the body they are visible in, because
+    /// `if P := e` binds and a plain condition does not.
+    fn condition_bound(
+        &mut self,
+        module: &Module<'static>,
+        cond: &Expr,
+        bound: &mut Vec<Binding>,
+    ) -> IntValue<'static> {
         match cond {
-            Expr::CondBinding { .. } => {
-                self.unsupported(
-                    cond.span(),
-                    "a pattern condition, `if P := e` (lands at M4)",
-                );
-                self.false_value()
-            }
+            Expr::CondBinding {
+                pattern, value, ..
+            } => self.pattern_condition(module, pattern, value, bound),
             other => {
                 let Some(value) = self.expr(module, other, None) else {
                     return self.false_value();
@@ -3121,6 +4270,48 @@ impl Emitter {
                 self.false_value()
             }
         }
+    }
+
+    /// `if P := e`: the value is tried against the pattern, and the answer is
+    /// whether it matched. DESIGN 4.4 says a pattern condition is a `match` with
+    /// a non-matching fallthrough arm, which is exactly what this builds.
+    fn pattern_condition(
+        &mut self,
+        module: &Module<'static>,
+        pattern: &dux_ast::Pattern,
+        value: &Expr,
+        bound: &mut Vec<Binding>,
+    ) -> IntValue<'static> {
+        let Some(held) = self.expr(module, value, None) else {
+            return self.false_value();
+        };
+        if held.ty == DuxType::Error {
+            return self.false_value();
+        }
+        let ty = held.ty;
+        let place = self.alloca(ty, "pattern");
+        if self.put_in(place, held, value.span()).is_none() {
+            return self.false_value();
+        }
+        let yes = self.new_block("pat.true");
+        let no = self.new_block("pat.false");
+        let done = self.new_block("pat.end");
+        self.pattern_holds(module, pattern, ty, place, yes, no, bound);
+
+        self.builder.position_at_end(yes);
+        self.br(done);
+        self.builder.position_at_end(no);
+        self.br(done);
+        self.builder.position_at_end(done);
+        self.dead = false;
+        let flag = self
+            .builder
+            .build_phi(self.context.bool_type(), "matched")
+            .expect("pattern condition");
+        let matched = self.context.bool_type().const_all_ones();
+        let missed = self.context.bool_type().const_zero();
+        flag.add_incoming(&[(&matched, yes), (&missed, no)]);
+        flag.as_basic_value().into_int_value()
     }
 
     fn false_value(&self) -> IntValue<'static> {
@@ -3394,10 +4585,13 @@ impl Emitter {
         name: &str,
         span: Span,
     ) -> Option<(u32, DuxType)> {
-        if let Some(field) = info.field(name) {
-            return Some(field);
+        let listed = self.struct_field_list(info).to_vec();
+        if let Some((index, (_, ty))) =
+            listed.iter().enumerate().find(|(_, (field, _))| *field == name)
+        {
+            return Some((index as u32, *ty));
         }
-        let mut known: Vec<&str> = info.fields.iter().map(|(field, _)| *field).collect();
+        let mut known: Vec<&str> = listed.iter().map(|(field, _)| *field).collect();
         known.sort_unstable();
         self.diagnostics.push(
             Diagnostic::error(
@@ -3701,6 +4895,12 @@ impl Emitter {
                 if let Some(c) = self.consts.get(name).cloned() {
                     return Some(self.const_reference(&c, expected, *span));
                 }
+                // `None` names a variant as plainly as it names a constant.
+                if !self.functions.contains_key(name.as_str()) {
+                    if let Some(owner) = self.owner_of_variant(name) {
+                        return self.variant_value(module, &owner, name, &[], &[], *span, expected);
+                    }
+                }
                 self.diagnostics.push(
                     Diagnostic::error(
                         code::UNDECLARED,
@@ -3724,7 +4924,20 @@ impl Emitter {
                 self.binary(module, *op, lhs, rhs, *span)
             }
             Expr::Cast { value, target, .. } => self.cast(module, value, target),
-            Expr::Call { callee, args, span } => self.call(module, callee, args, *span),
+            Expr::Call { callee, args, span } => self.call(module, callee, args, *span, expected),
+            Expr::Path {
+                qualifier, name, span,
+            } => {
+                if self.shapes.contains_key(qualifier) {
+                    self.variant_value(module, qualifier, name, &[], &[], *span, expected)
+                } else {
+                    self.unsupported(*span, expression_name(expr));
+                    None
+                }
+            }
+            Expr::Match { subject, arms, span } => {
+                self.matching(module, subject, arms, expected, true, *span)
+            }
             Expr::If {
                 cond,
                 then_arm,
@@ -3757,7 +4970,15 @@ impl Emitter {
                 self.field_expr(module, base, &name.name, name.span, *span)
             }
             Expr::StructLiteral { name, fields, span } => {
-                self.struct_literal(module, name, fields, *span)
+                if self.structs.contains_key(name.as_str()) || !name.contains("::") {
+                    return self.struct_literal(module, name, fields, *span);
+                }
+                let (owner, variant) = name.split_once("::").unwrap_or((name.as_str(), ""));
+                let given: Vec<(&str, &Expr)> = fields
+                    .iter()
+                    .map(|(field, value)| (field.name.as_str(), value))
+                    .collect();
+                self.variant_value(module, owner, variant, &[], &given, *span, expected)
             }
             Expr::InterpString { parts, .. } => {
                 self.build_text(module, parts, &[], expr.span())
@@ -4093,7 +5314,10 @@ impl Emitter {
             return Some((left, right));
         }
         let left = self.expr(module, lhs, None)?;
-        let right = self.expr(module, rhs, None)?;
+        // A sum type beside an operator says what the other side holds, which
+        // is the only way `pick == None` can know which `Option` `None` is.
+        let hint = matches!(left.ty, DuxType::Enum(_)).then_some(left.ty);
+        let right = self.expr(module, rhs, hint)?;
         Some((left, right))
     }
 
@@ -4664,10 +5888,14 @@ impl Emitter {
         callee: &Expr,
         args: &[Expr],
         span: Span,
+        expected: Option<DuxType>,
     ) -> Option<Typed> {
         match callee {
-            Expr::Ident { name, .. } => self.call_named(module, name, args, callee, span),
-            Expr::Paren { inner, .. } => self.call(module, inner, args, span),
+            Expr::Ident { name, .. } => self.call_named(module, name, args, callee, span, expected),
+            Expr::Paren { inner, .. } => self.call(module, inner, args, span, expected),
+            Expr::Path { qualifier, name, .. } if self.shapes.contains_key(qualifier) => {
+                self.variant_value(module, qualifier, name, args, &[], span, expected)
+            }
             Expr::Field { base, name, .. } => {
                 self.call_method(module, base, name, args, span)
             }
@@ -4685,6 +5913,7 @@ impl Emitter {
         args: &[Expr],
         callee: &Expr,
         span: Span,
+        expected: Option<DuxType>,
     ) -> Option<Typed> {
         if name == "print" || name == "println" {
             return self.write_builtin(module, name, args, span);
@@ -4696,6 +5925,14 @@ impl Emitter {
         }
         if self.skipped.contains(name) {
             return Some(Typed::error());
+        }
+        // `Some(3)` and `Err(e)` are spelled without their enum, which is how
+        // the predeclared sum types are meant to read. A program's own function
+        // of that name wins, as it does for `make`.
+        if !self.functions.contains_key(name) {
+            if let Some(owner) = self.owner_of_variant(name) {
+                return self.variant_value(module, &owner, name, args, &[], span, expected);
+            }
         }
         let Some(function) = self.functions.get(name).copied() else {
             self.diagnostics.push(
@@ -5171,13 +6408,7 @@ impl Emitter {
                         return None;
                     };
                     next_value += 1;
-                    format.push('%');
-                    let spec = spec_for(value.ty).or_else(|| {
-                        self.unsupported(span, "formatting a value in a $\"..\" hole");
-                        None
-                    })?;
-                    format.push_str(spec);
-                    prepared.push(*value);
+                    self.format_hole(*value, &mut format, &mut prepared, span)?;
                 }
             }
         }
@@ -5200,6 +6431,60 @@ impl Emitter {
             arguments.extend(self.prepare_for_format(value, span)?);
         }
         Some((format, arguments))
+    }
+
+    /// One hole of a `$".."` string: the piece of format string it stands for
+    /// and the values that fill it. A record says itself field by field — the
+    /// compiler knows its shape — and nests the same way the value nests.
+    fn format_hole(
+        &mut self,
+        value: Typed,
+        format: &mut String,
+        prepared: &mut Vec<Typed>,
+        span: Span,
+    ) -> Option<()> {
+        let Some(info) = self.struct_of(value.ty) else {
+            format.push('%');
+            let spec = spec_for(value.ty).or_else(|| {
+                self.unsupported(span, "formatting a value in a $\"..\" hole");
+                None
+            })?;
+            format.push_str(spec);
+            prepared.push(value);
+            return Some(());
+        };
+        let listed = self.struct_field_list(info).to_vec();
+        let parts = self.record_parts(value)?;
+        if listed.len() != parts.len() {
+            self.unsupported(span, "formatting a record whose fields are not all visible");
+            return None;
+        }
+        format.push_str("{ ");
+        for (index, (name, _)) in listed.iter().enumerate() {
+            if index > 0 {
+                format.push_str(", ");
+            }
+            format.push_str(name);
+            format.push_str(": ");
+            self.format_hole(parts[index], format, prepared, span)?;
+        }
+        format.push_str(" }");
+        Some(())
+    }
+
+    /// A record's fields, read one at a time out of a slot of its own.
+    fn record_parts(&mut self, value: Typed) -> Option<Vec<Typed>> {
+        let info = self.struct_of(value.ty)?;
+        let held = value.basic()?;
+        let slot = self.alloca(value.ty, "shown");
+        let _ = self.builder.build_store(slot, held).ok()?;
+        let listed = self.struct_field_list(info).to_vec();
+        let mut parts = Vec::new();
+        for (index, (_, ty)) in listed.iter().enumerate() {
+            let at = self.field_address(info, slot, index as u32)?;
+            parts.push(self.load(*ty, at)?);
+        }
+        Some(parts)
     }
 
     fn write_prepared(
@@ -5618,7 +6903,8 @@ impl Emitter {
                     return ty.llvm(self.context).const_zero();
                 };
                 let mut fields = Vec::new();
-                for (field, field_ty) in &info.fields {
+                let listed = self.struct_field_list(info).to_vec();
+                for (field, field_ty) in &listed {
                     let field_value = values
                         .iter()
                         .find(|(written, _)| written == field)
@@ -5895,9 +7181,8 @@ fn spec_for(ty: DuxType) -> Option<&'static str> {
         DuxType::F32 | DuxType::F64 => "g",
         DuxType::Str => ".*s",
         DuxType::Ptr | DuxType::Pointer(_) => "p",
-        DuxType::Array(..) | DuxType::Struct(..) | DuxType::Slice(_) | DuxType::Error => {
-            return None
-        }
+        DuxType::Array(..) | DuxType::Struct(..) | DuxType::Enum(_) | DuxType::Slice(_)
+        | DuxType::Error => return None,
     })
 }
 
@@ -6219,4 +7504,123 @@ fn declared(
 /// Whether a function carries `#[name]`.
 fn has_attribute(attributes: &[dux_ast::Attribute], name: &str) -> bool {
     attributes.iter().any(|attribute| attribute.name == name)
+}
+
+/// The fields a variant carries, named or positional. A positional payload
+/// names its fields by position, which is what a pattern binds by anyway.
+fn payload_fields(payload: &Payload) -> Vec<(&str, &Type)> {
+    match payload {
+        Payload::Empty => Vec::new(),
+        Payload::Tuple(types) => types
+            .iter()
+            .enumerate()
+            .map(|(index, ty)| (Box::leak(index.to_string().into_boxed_str()) as &str, ty))
+            .collect(),
+        Payload::Named(fields) => fields
+            .iter()
+            .map(|(name, ty)| (name.as_str(), ty))
+            .collect(),
+    }
+}
+
+/// The payload area: bytes aligned for the most strictly aligned payload and
+/// long enough for the longest one. An array of that alignment's type does the
+/// job without a union, which LLVM has no such thing as.
+fn storage_area(
+    context: &'static Context,
+    data: &TargetData,
+    payloads: &[StructType<'static>],
+) -> BasicTypeEnum<'static> {
+    let largest = payloads
+        .iter()
+        .copied()
+        .map(|payload| data.get_abi_size(&payload))
+        .max()
+        .unwrap_or(0);
+    let align_of = payloads
+        .iter()
+        .copied()
+        .map(|payload| data.get_abi_alignment(&payload))
+        .max()
+        .unwrap_or(1);
+    let unit = payloads
+        .iter()
+        .copied()
+        .find(|payload| {
+            data.get_abi_alignment(payload) == align_of && data.get_abi_size(payload) > 0
+        })
+        .unwrap_or_else(|| context.struct_type(&[], false));
+    let units = largest.div_ceil(data.get_abi_size(&unit).max(1)) as u32;
+    unit.array_type(units).into()
+}
+
+/// A sum type whose tag can hide in the spare value of its one pointer: two
+/// variants, one carrying nothing and the other exactly one pointer.
+fn niche_of(
+    context: &'static Context,
+    data: &TargetData,
+    variants: &[VariantInfo],
+    payloads: &[StructType<'static>],
+) -> Option<u32> {
+    if variants.len() != 2 {
+        return None;
+    }
+    let empty = variants.iter().position(|variant| variant.fields.is_empty())?;
+    let carrier = 1 - empty;
+    let fields = &variants[carrier].fields;
+    if !matches!(fields.first()?.1, DuxType::Ptr | DuxType::Pointer(_)) {
+        return None;
+    }
+    let payload = payloads[carrier];
+    let pointer = context.ptr_type(AddressSpace::default());
+    (data.get_abi_size(&payload) == data.get_abi_size(&pointer)
+        && data.get_abi_alignment(&payload) == data.get_abi_alignment(&pointer))
+    .then_some(carrier as u32)
+}
+
+
+/// A `phi` result, said in the type the branches agreed on.
+fn typed_of(value: BasicValueEnum<'static>, ty: DuxType) -> Typed {
+    if ty.is_float() {
+        Typed::float(value.into_float_value(), ty)
+    } else if ty == DuxType::Ptr {
+        Typed::pointer(value.into_pointer_value(), ty)
+    } else if ty == DuxType::Str
+        || ty.slice_element().is_some()
+        || matches!(ty, DuxType::Struct(_) | DuxType::Enum(_))
+    {
+        Typed {
+            core: Core::Aggregate(value.into_struct_value()),
+            ty,
+        }
+    } else if ty.is_numeric() {
+        Typed::int(value.into_int_value(), ty)
+    } else {
+        Typed::error()
+    }
+}
+
+/// The type the payload field of a variant holds, when the instantiation is
+/// already known.
+fn payload_field_of(info: Option<&'static EnumInfo>, variant: usize, name: &str) -> Option<DuxType> {
+    let fields = &info?.variants.get(variant)?.fields;
+    fields
+        .iter()
+        .find(|(field, _)| *field == name)
+        .map(|(_, ty)| *ty)
+}
+
+/// What an enum and its arguments are spelled as, which is also the key the
+/// instantiation is cached under: `Option<i32>`.
+fn instantiation(name: &str, args: &[DuxType]) -> String {
+    if args.is_empty() {
+        return name.to_string();
+    }
+    format!(
+        "{name}<{}>",
+        args.iter()
+            .map(|arg| arg.name())
+            .collect::<Vec<_>>()
+            .join(", ")
+    )
 }

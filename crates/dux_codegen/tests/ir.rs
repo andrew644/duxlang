@@ -1225,3 +1225,149 @@ fn main() {
         "and no block is asked for:\n{ir}"
     );
 }
+
+const SHAPES: &str = "package main
+enum Shape {
+    Circle(f32),
+    Rect { w: f32, h: f32 },
+    Empty,
+}
+fn side(s: Shape) -> f32 {
+    return match s {
+        Shape::Circle(r) => r,
+        Shape::Rect { w, h } => w + h,
+        Shape::Empty => 0.0,
+    }
+}
+fn main() {
+    s := Shape::Rect { w: 3.0, h: 4.0 }
+    println($\"{}\", side(s))
+}";
+
+#[test]
+fn a_sum_type_is_a_tag_beside_an_area_big_enough_for_the_largest_payload() {
+    let ir = build(SHAPES).expect("builds").ir_text();
+    assert!(
+        ir.contains("{ i16, [2 x { float }] }"),
+        "DESIGN 4.4: a u16 tag and a payload area, laid out like a C record:\n{ir}"
+    );
+    assert!(
+        ir.contains("define float @side({ i16, [2 x { float }] } %0)"),
+        "a sum type travels as one value, like a record:\n{ir}"
+    );
+    assert!(
+        ir.contains("store i16 1, ptr"),
+        "constructing `Rect`, the second variant, writes tag 1:\n{ir}"
+    );
+    assert!(
+        ir.contains("getelementptr i8, ptr %sum, i64 4"),
+        "the payload starts where the target's own layout says:\n{ir}"
+    );
+}
+
+#[test]
+fn a_match_switches_on_the_tag_and_meets_its_arms_at_one_phi() {
+    let ir = build(SHAPES).expect("builds").ir_text();
+    assert!(
+        ir.contains("%tag = load i16"),
+        "the first arm tests the tag:\n{ir}"
+    );
+    assert!(
+        ir.contains("icmp eq i16 %tag, 0")
+            && ir.contains("icmp eq i16 %tag5, 1")
+            && ir.contains("icmp eq i16 %tag16, 2"),
+        "the arms are tried in the order they are written:\n{ir}"
+    );
+    assert!(
+        ir.contains("%matchtmp = phi float"),
+        "one phi joins the arms' values:\n{ir}"
+    );
+    assert!(
+        ir.contains("call void @dux.runtime.trap("),
+        "and the chain that cannot run out says so where it could:\n{ir}"
+    );
+}
+
+#[test]
+fn option_of_a_pointer_is_one_pointer_and_none_is_null() {
+    let ir = build(
+        "package main
+struct Node {
+    value: i32,
+    next: Option<*Node>,
+}
+fn main() -> i32 {
+    tail := Node { value: 1, next: None }
+    head := Node { value: 2, next: Some(&tail) }
+    return head.value
+}",
+    )
+    .expect("builds")
+    .ir_text();
+    assert!(
+        ir.contains("%Node = type { i32, ptr }"),
+        "DESIGN 4.3: the niche leaves `Option<*T>` a single word:\n{ir}"
+    );
+    assert!(
+        !ir.contains("type { i32, { i16"),
+        "and a niche pays no tag:\n{ir}"
+    );
+    assert!(
+        ir.contains("store ptr null, ptr"),
+        "`None` is the null address, written where the pointer lives:\n{ir}"
+    );
+}
+
+#[test]
+fn a_pattern_condition_answers_with_one_bool() {
+    let ir = build(
+        "package main
+fn first(o: Option<i32>) -> i32 {
+    if Some(v) := o {
+        return v
+    }
+    return 0 - 1
+}
+fn main() -> i32 {
+    return first(None)
+}",
+    )
+    .expect("builds")
+    .ir_text();
+    assert!(
+        ir.contains("%matched = phi i1 [ true, %pat.true ], [ false, %pat.false ]"),
+        "a pattern condition is a `match` with a non-matching fallthrough arm:\n{ir}"
+    );
+    assert!(
+        ir.contains("%holds = icmp eq i16 %tag, 0") || ir.contains("icmp eq i16"),
+        "and it tests the tag like any other arm:\n{ir}"
+    );
+}
+
+#[test]
+fn an_or_pattern_binds_one_slot_that_every_alternative_writes() {
+    let ir = build(
+        "package main
+enum Coin { Heads(i32), Tails(i32), Edge }
+fn worth(c: Coin) -> i32 {
+    return match c {
+        Coin::Heads(v) | Coin::Tails(v) => v,
+        Coin::Edge => 0,
+    }
+}
+fn main() -> i32 {
+    return worth(Coin::Edge)
+}",
+    )
+    .expect("builds")
+    .ir_text();
+    let slots = ir.matches("%v = alloca").count();
+    assert_eq!(
+        slots, 1,
+        "one binder, one slot, however many alternatives bind it:\n{ir}"
+    );
+    assert!(
+        ir.contains("%v = alloca i32"),
+        "the binder holds the payload:\n{ir}"
+    );
+}

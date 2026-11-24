@@ -37,6 +37,7 @@ version = "0.1.0"
 dependencies = [
  "dux_ast",
  "dux_diag",
+ "dux_hir",
  "dux_lexer",
  "dux_parser",
  "dux_source",

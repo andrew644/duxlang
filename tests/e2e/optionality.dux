@@ -1,0 +1,59 @@
+package main
+
+struct Node {
+    value: i32,
+    next: Option<*Node>,
+}
+
+// `Option<*T>` is one pointer wide, so a list link is a word and `None` is the
+// end of the walk.
+fn total(head: Option<*Node>) -> i32 {
+    sum := 0
+    walk := head
+    while Some(node) := walk {
+        sum = sum + (*node).value
+        walk = (*node).next
+    }
+    return sum
+}
+
+fn first(o: Option<i32>) -> i32 {
+    if Some(v) := o {
+        return v
+    }
+    return 0 - 1
+}
+
+fn word(o: Option<i32>) -> string {
+    return match o {
+        Some(v) => "there",
+        None => "nothing",
+    }
+}
+
+fn verdict(r: Result<i32, string>) -> string {
+    match r {
+        Ok(v) if v > 0 => { return "plus" }
+        Ok(_) => { return "not plus" }
+        Err(e) => { return e }
+    }
+}
+
+fn main() {
+    tail := Node { value: 1, next: None }
+    mid := Node { value: 2, next: Some(&tail) }
+    head := Node { value: 3, next: Some(&mid) }
+    println($"{total(Some(&head))}")
+    println($"{total(None)}")
+    println($"{first(Some(9))} {first(None)}")
+    println($"{word(Some(1))} {word(None)}")
+    yes := verdict(Ok(4))
+    no := verdict(Ok(0))
+    bad := verdict(Err("no good"))
+    println($"{yes} {no} {bad}")
+    empty: Option<*Node> = None
+    match empty {
+        None => println("an empty list"),
+        Some(node) => println($"{(*node).value}")
+    }
+}

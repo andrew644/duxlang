@@ -189,6 +189,32 @@ fn the_normative_hello_example_compiles_runs_and_prints_exactly_hello_world() {
 }
 
 #[test]
+fn the_normative_sum_types_example_compiles_runs_and_prints_the_shapes() {
+    let sums = Path::new(EXAMPLE_DIR).join("sum_types.dux");
+    let scratch = Path::new(SCRATCH_DIR).join("example_sum_types");
+    let _ = std::fs::remove_dir_all(&scratch);
+    let output = Command::new(env!("CARGO_BIN_EXE_duxc"))
+        .arg("run")
+        .arg(&sums)
+        .arg("--out-dir")
+        .arg(&scratch)
+        .output()
+        .expect("duxc is runnable");
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    assert!(
+        !stderr.contains("error["),
+        "the sum-type example must compile cleanly:\n{stderr}"
+    );
+    assert_eq!(output.status.code(), Some(0), "stdout: {stdout}");
+    assert_eq!(
+        stdout,
+        "area=12.5664\narea=12\narea=0\n0 -> zero\n2 -> small\n7 -> single digit\n\
+         -5 -> negative -5\n42 -> big\nload save1.dux\n"
+    );
+}
+
+#[test]
 fn a_built_binary_carries_the_line_table() {
     let hello = Path::new(EXAMPLE_DIR).join("hello.dux");
     let scratch = Path::new(SCRATCH_DIR).join("example_hello_debug");
@@ -356,5 +382,47 @@ fn every_run_fixture_ships_an_expected_file() {
     assert!(
         missing.is_empty(),
         "fixtures without a .expected file: {missing:?} (run `UPDATE_EXPECTED=1 cargo test`)"
+    );
+}
+
+fn run_example(stem: &str) -> Run {
+    let path = Path::new(EXAMPLE_DIR).join(format!("{stem}.dux"));
+    let scratch = Path::new(SCRATCH_DIR).join(format!("example_{stem}"));
+    let _ = std::fs::remove_dir_all(&scratch);
+    let output = Command::new(env!("CARGO_BIN_EXE_duxc"))
+        .arg("run")
+        .arg(&path)
+        .arg("--out-dir")
+        .arg(&scratch)
+        .output()
+        .expect("duxc is runnable");
+    Run {
+        stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+        code: output.status.code().unwrap_or(-1),
+    }
+}
+
+#[test]
+fn the_normative_pointers_example_walks_a_list_with_no_null_in_it() {
+    let run = run_example("pointers");
+    assert_eq!(run.stderr, "", "the pointer example must compile cleanly");
+    assert_eq!(run.code, 0, "stdout: {}", run.stdout);
+    assert_eq!(
+        run.stdout,
+        "n=3 through the pointer=3\nhops=2\nlen=4 first=10 last=40\n[0]=20\n[1]=30\n\n\
+         base=10 third=30\nthrough rawptr=30\n"
+    );
+}
+
+#[test]
+fn the_normative_control_flow_example_runs_every_loop_and_a_match() {
+    let run = run_example("control_flow");
+    assert_eq!(run.stderr, "", "the control-flow example must compile cleanly");
+    assert_eq!(run.code, 0, "stdout: {}", run.stdout);
+    assert_eq!(
+        run.stdout,
+        "i=1\ni=2\ni=3\n10 20 30 \n[0]=10 [1]=20 [2]=30 \ntick tick tick \ntock tock tock \n\
+         x=5\nodd medium\nbody\nruns first\nruns second\n"
     );
 }
