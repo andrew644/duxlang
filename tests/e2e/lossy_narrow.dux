@@ -1,4 +1,4 @@
-//@expect-error E0005
+//@expect-error E0200
 package main
 
 fn main() {

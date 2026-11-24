@@ -132,7 +132,7 @@ fn implicit_conversion_widens_exactly_when_the_destination_is_lossless() {
 
     let errors = build("package main\nfn main() { narrow: i8 = 0; wide := 1; narrow = wide }")
         .unwrap_err();
-    assert_eq!(errors[0].code, dux_diag::code::UNEXPECTED_TOKEN);
+    assert_eq!(errors[0].code, dux_diag::code::LOSSY_CONVERSION);
     assert!(
         errors[0].message.contains("as i8"),
         "the hint must show the explicit form: {:?}",
@@ -143,7 +143,11 @@ fn implicit_conversion_widens_exactly_when_the_destination_is_lossless() {
 #[test]
 fn a_literal_that_does_not_fit_its_annotation_is_an_error() {
     let errors = build("package main\nfn main() { small: i8 = 300 }").unwrap_err();
-    assert_eq!(errors[0].code, dux_diag::code::UNEXPECTED_TOKEN, "{errors:?}");
+    assert_eq!(
+        errors[0].code,
+        dux_diag::code::LITERAL_OUT_OF_RANGE,
+        "{errors:?}"
+    );
     assert!(errors[0].message.contains("does not fit"));
 }
 
@@ -235,7 +239,7 @@ fn return_carries_a_value_and_mains_fall_through_to_zero() {
 fn missing_return_on_one_path_is_reported() {
     let errors = build("package main\nfn pick() -> i32 { if true { return 1 } }\nfn main() { }")
         .unwrap_err();
-    assert_eq!(errors[0].code, dux_diag::code::UNEXPECTED_TOKEN);
+    assert_eq!(errors[0].code, dux_diag::code::TYPE_MISMATCH);
     assert!(errors[0].message.contains("not all paths"), "{errors:?}");
 }
 
@@ -273,11 +277,11 @@ fn constants_fold_adopt_the_annotated_type_and_refuse_to_be_assigned() {
     );
 
     let errors = build("package main\nconst K: i32 = 1\nfn main() { K = 2 }").unwrap_err();
-    assert_eq!(errors[0].code, dux_diag::code::UNEXPECTED_TOKEN);
+    assert_eq!(errors[0].code, dux_diag::code::ASSIGN_TO_CONST);
     assert!(errors[0].message.contains("cannot be assigned"), "{errors:?}");
 
     let errors = build("package main\nconst K: i8 = 300\nfn main() { }").unwrap_err();
-    assert_eq!(errors[0].code, dux_diag::code::UNEXPECTED_TOKEN);
+    assert_eq!(errors[0].code, dux_diag::code::LITERAL_OUT_OF_RANGE);
     assert!(errors[0].message.contains("does not fit"), "{errors:?}");
 }
 

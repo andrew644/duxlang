@@ -14,6 +14,10 @@ use dux_diag::{code, Diagnostic};
 use dux_source::Span;
 use std::collections::HashMap;
 
+pub mod ty;
+
+pub use ty::check;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Callable {
     Function { params: usize },

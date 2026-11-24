@@ -396,3 +396,47 @@ Tests: 17 in `dux_hir/tests/resolve.rs` (per-code negatives plus the corpus
 silence gate), four new e2e fixtures `undeclared_name`/`arity_mismatch`/
 `duplicate_definition`/`main_returns_string`, codes E0110–E0112 added to
 dux_diag and the DESIGN 8.1a table. 124 tests, clippy clean.
+
+## Session 9 — the type checker lands in `dux_hir::ty`
+
+DESIGN 6.1's checking step, running in the driver right after the resolver:
+`dux_hir::check(&Program) -> Vec<Diagnostic>`, executed whenever lex+parse and
+the resolver are clean, so `check`, `build` and `run` all fail at the same
+place for the same reason.
+
+The lattice mirrors the codegen's `DuxType` exactly — the two passes can
+never disagree about `lossless` (D25) — and adds the D17 untyped literals:
+integer and float literals carry their value as `IntConst`/`FloatConst`, adopt
+any integer/float target whose range holds them, fold through arithmetic
+(so `const KI = 1024; page: usize = KI + 1` works), and default to
+`i32`/`f64` when nothing asks them to be something else. Constants keep their
+untyped-ness; ordinary bindings materialize to a concrete type at the `:=`.
+
+New codes, one per negative type rule (§8.2), each with a unit test and most
+with an e2e fixture: E0200 lossy implicit conversion (message points at the
+`as` spelling), E0201 mismatch (argument/return/operand messages), E0202 bool
+required (conditions, `!`, `&&`, `||`), E0203 assignment to `const`, E0204
+literal out of range.
+
+Same contract as the resolver: **zero diagnostics on the normative corpus**,
+enforced by its own test plus the existing check/dump gates. What the corpus
+taught us and the checker now gets right: `x := 1` is `i32`, not "the literal
+1" (the first cut's false positives on `i += 1` were exactly this); `"/usr/" +
+name` is string concatenation and legal; `<` on strings is not; `p + 1` on a
+pointer is M3 business and stays silent; `*c_char` and friends are `Opaque`.
+
+The codegen's placeholder `E0005` for type rules is gone: every type-rule
+diagnostic in `lower.rs` now emits the same dedicated code the checker uses,
+so one rule has one code no matter which pass catches it. `E0005` is the
+parser's again. (`not all paths return` still waits on path analysis — it
+moved to E0201 where the checker will take it over.)
+
+Known parser gap the checker surfaced but does not own: `if` in value
+position always parses its `then` arm to a placeholder `Error` (tail-value
+extraction is unimplemented), so arm agreement is checked by `unify` as soon
+as the parser produces real arms; a test for it is deliberately absent until
+then.
+
+Tests: 18 in `dux_hir/tests/typecheck.rs` (per-code negatives, lattice
+positives, corpus silence), 4 new e2e fixtures, `lossy_narrow` upgraded from
+E0005 to E0200. 142 tests, clippy clean.

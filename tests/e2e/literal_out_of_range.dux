@@ -1,0 +1,7 @@
+//@expect-error E0204
+package main
+
+fn main() {
+    small: u8 = 1000
+    println($"{}", small)
+}

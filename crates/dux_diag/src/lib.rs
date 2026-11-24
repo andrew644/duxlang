@@ -14,6 +14,11 @@ pub mod code {
     pub const UNDECLARED: &str = "E0110";
     pub const DUPLICATE_DEFINITION: &str = "E0111";
     pub const WRONG_ARITY: &str = "E0112";
+    pub const LOSSY_CONVERSION: &str = "E0200";
+    pub const TYPE_MISMATCH: &str = "E0201";
+    pub const NOT_BOOLEAN: &str = "E0202";
+    pub const ASSIGN_TO_CONST: &str = "E0203";
+    pub const LITERAL_OUT_OF_RANGE: &str = "E0204";
     pub const LINK_FAILED: &str = "E0900";
     pub const SOURCE_IO: &str = "E0901";
     pub const CODEGEN_FAILED: &str = "E0902";

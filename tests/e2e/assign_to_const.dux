@@ -1,0 +1,9 @@
+//@expect-error E0203
+package main
+
+const MAX: i32 = 10
+
+fn main() {
+    MAX = 11
+    println($"{}", MAX)
+}

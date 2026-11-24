@@ -9,7 +9,7 @@ USAGE:
 
 COMMANDS:
     version           print the compiler version
-    check <file>      lex, parse and resolve; report diagnostics, no code generation
+    check <file>      lex, parse, resolve and type check; report diagnostics, no code generation
     build <file>      compile and link an executable
     run <file>        compile, link and execute, forwarding program arguments
     fmt [paths]       rewrite .dux files in their canonical form (drops comments)

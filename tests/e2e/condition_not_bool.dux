@@ -1,0 +1,9 @@
+//@expect-error E0202
+package main
+
+fn main() {
+    count := 1
+    if count {
+        println("truthy?")
+    }
+}

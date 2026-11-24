@@ -1,0 +1,10 @@
+//@expect-error E0201
+package main
+
+fn count() -> i32 {
+    return "many"
+}
+
+fn main() {
+    println($"{}", count())
+}

@@ -69,7 +69,15 @@ pub fn analyze(path: &std::path::Path) -> Result<Analyzed, Failure> {
         .iter()
         .all(|d| d.severity != Severity::Error || d.code == code::UNSUPPORTED_IN_BUILD);
     if syntax_clean {
-        diagnostics.extend(dux_hir::resolve(&parsed.program).diagnostics);
+        let resolved = dux_hir::resolve(&parsed.program);
+        let names_clean = resolved
+            .diagnostics
+            .iter()
+            .all(|d| d.severity != Severity::Error);
+        diagnostics.extend(resolved.diagnostics);
+        if names_clean {
+            diagnostics.extend(dux_hir::check(&parsed.program));
+        }
     }
     Ok(Analyzed {
         sources,

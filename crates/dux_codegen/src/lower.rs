@@ -296,7 +296,7 @@ impl ConstValue {
                 } else {
                     emitter.diagnostics.push(
                         Diagnostic::error(
-                            code::UNEXPECTED_TOKEN,
+                            code::LITERAL_OUT_OF_RANGE,
                             format!(
                                 "the constant {value} does not fit a `{}`",
                                 ty.name()
@@ -416,7 +416,7 @@ impl Emitter {
             if !external {
                 self.diagnostics.push(
                     Diagnostic::error(
-                        code::UNEXPECTED_TOKEN,
+                        code::DUPLICATE_DEFINITION,
                         format!("`{name}` is declared more than once"),
                     )
                     .with_span(function.name.span),
@@ -561,7 +561,7 @@ impl Emitter {
             Some(ty) => {
                 self.diagnostics.push(
                     Diagnostic::error(
-                        code::UNEXPECTED_TOKEN,
+                        code::TYPE_MISMATCH,
                         format!("not all paths return a value from `{}`", function.name.name),
                     )
                     .with_span(function.name.span)
@@ -743,7 +743,14 @@ impl Emitter {
                     format!("`{name}` is not declared in this scope")
                 };
                 self.diagnostics.push(
-                    Diagnostic::error(code::UNEXPECTED_TOKEN, message)
+                    Diagnostic::error(
+                        if self.consts.contains_key(name.as_str()) {
+                            code::ASSIGN_TO_CONST
+                        } else {
+                            code::UNDECLARED
+                        },
+                        message,
+                    )
                         .with_span(*target_span)
                         .with_note(
                             "the resolver lands at M2; until then an unknown name is reported here",
@@ -793,7 +800,7 @@ impl Emitter {
                 } else {
                     self.diagnostics.push(
                         Diagnostic::error(
-                            code::UNEXPECTED_TOKEN,
+                            code::TYPE_MISMATCH,
                             format!("`return` needs a `{}` here", ty.name()),
                         )
                         .with_span(span),
@@ -831,7 +838,7 @@ impl Emitter {
                 self.expr(module, expr, None);
                 self.diagnostics.push(
                     Diagnostic::error(
-                        code::UNEXPECTED_TOKEN,
+                        code::TYPE_MISMATCH,
                         "`return` with a value in a function that results in nothing",
                     )
                     .with_span(span),
@@ -995,7 +1002,7 @@ impl Emitter {
                 }
                 self.diagnostics.push(
                     Diagnostic::error(
-                        code::UNEXPECTED_TOKEN,
+                        code::NOT_BOOLEAN,
                         format!("a condition must be a `bool`, found `{}`", value.ty.name()),
                     )
                     .with_span(cond.span()),
@@ -1029,7 +1036,7 @@ impl Emitter {
                     }
                     self.diagnostics.push(
                         Diagnostic::error(
-                            code::UNEXPECTED_TOKEN,
+                            code::LITERAL_OUT_OF_RANGE,
                             format!("the literal {value} does not fit a `{}`", to.name()),
                         )
                         .with_span(*span),
@@ -1086,7 +1093,7 @@ impl Emitter {
                 }
                 self.diagnostics.push(
                     Diagnostic::error(
-                        code::UNEXPECTED_TOKEN,
+                        code::UNDECLARED,
                         format!("`{name}` is not declared in this scope"),
                     )
                     .with_span(*span)
@@ -1152,7 +1159,7 @@ impl Emitter {
                 if value.ty != DuxType::Bool {
                     self.diagnostics.push(
                         Diagnostic::error(
-                            code::UNEXPECTED_TOKEN,
+                            code::NOT_BOOLEAN,
                             format!("`!` needs a `bool`, found `{}`", value.ty.name()),
                         )
                         .with_span(span),
@@ -1198,7 +1205,7 @@ impl Emitter {
                 } else {
                     self.diagnostics.push(
                         Diagnostic::error(
-                            code::UNEXPECTED_TOKEN,
+                            code::TYPE_MISMATCH,
                             format!("`-` needs a number, found `{}`", value.ty.name()),
                         )
                         .with_span(span),
@@ -1442,7 +1449,7 @@ impl Emitter {
             None => {
                 self.diagnostics.push(
                     Diagnostic::error(
-                        code::UNEXPECTED_TOKEN,
+                        code::TYPE_MISMATCH,
                         format!("cannot `as` a `{}` into a `{}`", value.ty.name(), to.name()),
                     )
                     .with_span(ty.span()),
@@ -1476,7 +1483,7 @@ impl Emitter {
         }
         self.diagnostics.push(
             Diagnostic::error(
-                code::UNEXPECTED_TOKEN,
+                code::LOSSY_CONVERSION,
                 format!(
                     "a `{}` does not fit a `{}` for free; write `as {}` for the explicit conversion",
                     value.ty.name(),
@@ -1637,7 +1644,7 @@ impl Emitter {
         let Some(function) = self.functions.get(name.as_str()).copied() else {
             self.diagnostics.push(
                 Diagnostic::error(
-                    code::UNEXPECTED_TOKEN,
+                    code::UNDECLARED,
                     format!("`{name}` is not declared in this scope"),
                 )
                 .with_span(callee.span())
@@ -1655,7 +1662,7 @@ impl Emitter {
         if args.len() != params.len() {
             self.diagnostics.push(
                 Diagnostic::error(
-                    code::UNEXPECTED_TOKEN,
+                    code::WRONG_ARITY,
                     format!(
                         "`{name}` takes {} arguments, given {}",
                         params.len(),
