@@ -1,6 +1,8 @@
-use dux_ast::Program;
+use dux_ast::{Decl, Ident, Import, ModuleDecl, Program};
 use dux_codegen::{CompiledModule, OptLevel, Options};
 use dux_diag::{code, render, Diagnostic, Severity};
+use std::collections::HashSet;
+use std::path::{Path, PathBuf};
 use dux_parser::parse;
 use dux_source::FileId;
 
@@ -64,27 +66,141 @@ pub fn analyze(path: &std::path::Path) -> Result<Analyzed, Failure> {
     let lexed = dux_lexer::lex(&sources, file);
     let mut diagnostics = lexed.diagnostics;
     let parsed = parse(&sources, &lexed.tokens);
+    let mut program = parsed.program;
     diagnostics.extend(parsed.diagnostics);
+    // An import brings a file in beside the one that was named, and what it
+    // brings is a namespace: the declarations arrive under the name the import
+    // wrote, so `import "std/math"` makes `math.sqrt` mean something.
+    let mut imported = load_imports(path, &mut sources, &mut program, &mut diagnostics);
+    program.decls.append(&mut imported);
     let syntax_clean = diagnostics
         .iter()
         .all(|d| d.severity != Severity::Error || d.code == code::UNSUPPORTED_IN_BUILD);
     if syntax_clean {
-        let resolved = dux_hir::resolve(&parsed.program);
+        let resolved = dux_hir::resolve(&program);
         let names_clean = resolved
             .diagnostics
             .iter()
             .all(|d| d.severity != Severity::Error);
         diagnostics.extend(resolved.diagnostics);
         if names_clean {
-            diagnostics.extend(dux_hir::check(&parsed.program));
+            diagnostics.extend(dux_hir::check(&program));
         }
     }
     Ok(Analyzed {
         sources,
         file,
-        program: parsed.program,
+        program,
         diagnostics,
     })
+}
+
+/// Where `import "a/b"` looks: a module path is resolved against the module
+/// root — every directory above the file that was named, nearest first — and
+/// then against the standard library root, which `$DUX_STDLIB` names.
+pub fn module_roots(entry: &Path) -> Vec<PathBuf> {
+    let mut roots: Vec<PathBuf> = entry
+        .parent()
+        .map(|dir| dir.ancestors().map(|root| root.to_path_buf()).collect())
+        .unwrap_or_default();
+    if let Some(library) = std::env::var_os("DUX_STDLIB") {
+        roots.push(PathBuf::from(library));
+    }
+    roots
+}
+
+fn find_module(roots: &[PathBuf], path: &str) -> Option<PathBuf> {
+    roots
+        .iter()
+        .map(|root| root.join(path).with_extension("dux"))
+        .find(|candidate| candidate.is_file())
+}
+
+/// Every module the program imports, and every module those import, each one
+/// wrapped in the namespace it was asked for. A file two modules import is
+/// read once, which is also what stops a cycle.
+fn load_imports(
+    entry: &Path,
+    sources: &mut SourceMap,
+    program: &mut Program,
+    diagnostics: &mut Vec<Diagnostic>,
+) -> Vec<Decl> {
+    let roots = module_roots(entry);
+    let mut queue: Vec<(Import, usize)> = program
+        .imports
+        .iter()
+        .cloned()
+        .enumerate()
+        .map(|(depth, import)| (import, depth))
+        .collect();
+    let mut seen: HashSet<PathBuf> = HashSet::new();
+    let mut modules = Vec::new();
+    while let Some((import, depth)) = queue.pop() {
+        let Some(file) = find_module(&roots, &import.path) else {
+            let searched = roots
+                .iter()
+                .map(|root| root.join(&import.path).with_extension("dux"))
+                .map(|candidate| candidate.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ");
+            // A `std/..` path names this compiler's own standard library,
+            // which arrives a piece at a time: what is not here yet is a
+            // milestone gap, not a verdict on the program. Any other path is
+            // the program's own module root, and a miss there is its error.
+            let missing = format!("there is no module `{}`", import.path);
+            let diagnostic = if import.path.starts_with("std/") {
+                Diagnostic::error(
+                    code::UNSUPPORTED_IN_BUILD,
+                    format!("the standard library does not ship `{}` in this build yet", import.path),
+                )
+            } else {
+                Diagnostic::error(code::UNDECLARED, missing)
+            };
+            diagnostics.push(
+                diagnostic
+                    .with_span(import.span)
+                    .with_note(format!("looked for it at: {searched}")),
+            );
+            continue;
+        };
+        if !seen.insert(file.clone()) {
+            continue;
+        }
+        let Ok(text) = std::fs::read_to_string(&file) else {
+            diagnostics.push(Diagnostic::error(
+                code::SOURCE_IO,
+                format!("cannot read {}: {}", file.display(), import.path),
+            ));
+            continue;
+        };
+        let namespace = import.path.rsplit('/').next().unwrap_or(&import.path);
+        let id = sources.add(file.display().to_string(), text);
+        let lexed = dux_lexer::lex(sources, id);
+        diagnostics.extend(lexed.diagnostics);
+        let parsed = parse(sources, &lexed.tokens);
+        let mut imported = parsed.program;
+        diagnostics.extend(parsed.diagnostics);
+        if depth > 32 {
+            diagnostics.push(Diagnostic::error(
+                code::UNDECLARED,
+                format!("`{}` imports too deeply to resolve", import.path),
+            ));
+            continue;
+        }
+        for nested in &imported.imports {
+            queue.push((nested.clone(), depth + 1));
+        }
+        modules.push(Decl::Module(ModuleDecl {
+            attributes: Vec::new(),
+            name: Ident {
+                name: namespace.to_string(),
+                span: import.span,
+            },
+            decls: std::mem::take(&mut imported.decls),
+            span: import.span,
+        }));
+    }
+    modules
 }
 
 #[derive(Debug)]

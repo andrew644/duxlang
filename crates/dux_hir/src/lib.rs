@@ -101,7 +101,7 @@ impl<'a> Resolver<'a> {
         }
         for import in &self.program.imports {
             if let Some(namespace) = import.path.rsplit('/').next() {
-                self.declare(namespace, Item::Namespace);
+                self.namespace(namespace);
             }
         }
         for decl in &self.program.decls {
@@ -120,7 +120,7 @@ impl<'a> Resolver<'a> {
                 Decl::Struct(decl) => self.declare(&decl.name.name, Item::Namespace),
                 Decl::Enum(decl) => self.declare(&decl.name.name, Item::Namespace),
                 Decl::TypeAlias(decl) => self.declare(&decl.name.name, Item::Namespace),
-                Decl::Module(decl) => self.declare(&decl.name.name, Item::Namespace),
+                Decl::Module(decl) => self.namespace(&decl.name.name),
                 Decl::Const(decl) => {
                     self.declare(&decl.name.name, Item::Callable(Callable::Opaque))
                 }
@@ -130,6 +130,15 @@ impl<'a> Resolver<'a> {
                 Decl::Impl(_) | Decl::Error { .. } => {}
             }
         }
+    }
+
+    /// A namespace is one thing however often it is named: the import that
+    /// asked for it and the module that carries it are the same `mod`.
+    fn namespace(&mut self, name: &str) {
+        if matches!(self.top_level.get(name), Some(Item::Namespace)) {
+            return;
+        }
+        self.declare(name, Item::Namespace);
     }
 
     fn declare(&mut self, name: &str, item: Item) {
