@@ -264,7 +264,7 @@ fn every_example_dumps_its_ast_so_milestone_gaps_never_hide_the_tree() {
     let mut offenders = Vec::new();
     for entry in std::fs::read_dir(EXAMPLE_DIR).expect("example/ exists") {
         let path = entry.expect("readable entry").path();
-        if path.extension().is_some_and(|e| e != "dux") {
+        if path.extension().is_none_or(|e| e != "dux") {
             continue;
         }
         let output = Command::new(env!("CARGO_BIN_EXE_duxc"))
@@ -303,7 +303,7 @@ fn every_example_parses_so_the_review_samples_stay_the_target_surface() {
     let mut offenders = Vec::new();
     for entry in std::fs::read_dir(EXAMPLE_DIR).expect("example/ exists") {
         let path = entry.expect("readable entry").path();
-        if path.extension().is_some_and(|e| e != "dux") {
+        if path.extension().is_none_or(|e| e != "dux") {
             continue;
         }
         let run = duxc_check(&path);
@@ -370,7 +370,7 @@ fn the_generics_example_is_the_m5_proof_that_runs() {
 fn no_example_hangs_or_panics_the_compiler() {
     for entry in std::fs::read_dir(EXAMPLE_DIR).expect("example/ exists") {
         let path = entry.expect("readable entry").path();
-        if path.extension().is_some_and(|e| e != "dux") {
+        if path.extension().is_none_or(|e| e != "dux") {
             continue;
         }
         let output = Command::new("timeout")

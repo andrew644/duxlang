@@ -118,7 +118,7 @@ fn enums_carry_their_integer_type_and_values() {
 
 #[test]
 fn the_mapping_table_crosses_what_it_promises() {
-    let text = spell(&mini());
+    let text = spell("mini", &mini());
     assert!(
         text.contains("fn dux_add(a: c_int, b: c_int) -> c_int"),
         "{text}"
@@ -167,18 +167,18 @@ fn the_mapping_table_crosses_what_it_promises() {
 #[test]
 fn static_inline_reaches_the_module_through_a_wrapper() {
     let decls = mini();
-    let text = spell(&decls);
+    let text = spell("mini", &decls);
     assert!(
-        text.contains("#[c_name(\"__duxw_dux_twice\")] fn dux_twice(x: c_int) -> c_int"),
+        text.contains("#[c_name(\"__duxw_mini_dux_twice\")] fn dux_twice(x: c_int) -> c_int"),
         "the declaration binds to the doorway, not the private name:\n{text}"
     );
-    let source = dux_cinterop::c_source(&["mini.h".to_string()], &decls);
+    let source = dux_cinterop::c_source("mini", &["mini.h".to_string()], &decls);
     assert!(
-        source.contains("int __duxw_dux_twice(int __p0) { return (dux_twice)(__p0); }"),
+        source.contains("int __duxw_mini_dux_twice(int __p0) { return (dux_twice)(__p0); }"),
         "the wrapper is what clang compiles:\n{source}"
     );
     assert!(
-        !source.contains("__duxw_dux_add"),
+        !source.contains("__duxw_mini_dux_add"),
         "a function with a library behind it needs no doorway:\n{source}"
     );
 }
@@ -194,7 +194,7 @@ fn a_real_header_walks() {
     .decls;
     let time = function(&decls, "time");
     assert!(matches!(&time.params[0].1, CType::Pointer(_)));
-    let spelled = spell(&decls);
+    let spelled = spell("mini", &decls);
     assert!(
         spelled.contains("fn time("),
         "the declaration reads as Dux:\n{spelled}"
@@ -216,7 +216,7 @@ fn stdio_is_variadic_and_size_t_means_usize() {
     .decls;
     let printf = function(&decls, "printf");
     assert!(printf.variadic);
-    let spelled = spell(&decls);
+    let spelled = spell("mini", &decls);
     assert!(spelled.contains("fn printf("), "{spelled}");
     assert!(
         !spelled.contains("type size_t"),
@@ -231,7 +231,7 @@ fn stdio_is_variadic_and_size_t_means_usize() {
 #[test]
 fn nothing_that_did_not_cross_is_quietly_waiting() {
     let mut missed = seen().skipped;
-    missed.extend(spell_report(&mini()).1);
+    missed.extend(spell_report("mini", &mini()).1);
     let named = |needle: &str| -> bool { missed.iter().any(|skip| skip.name == needle) };
     assert!(named("score"), "the union is named as skipped: {missed:?}");
     assert!(
@@ -257,7 +257,7 @@ fn hostile(header: &str, flags: Vec<String>) -> (Vec<CDecl>, Vec<dux_cinterop::S
         include_paths: Vec::new(),
     })
     .unwrap_or_else(|failure| panic!("`{header}` must parse: {failure:?}"));
-    let (spelled, mut missed, crossed) = spell_report(&seen.decls);
+    let (spelled, mut missed, crossed) = spell_report("mini", &seen.decls);
     assert!(
         !crossed.is_empty(),
         "`{header}` must bring something across"

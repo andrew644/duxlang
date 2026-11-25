@@ -748,7 +748,9 @@ fn fill_c_modules(
                 Err(failure) => diagnostics.extend(failure),
             }
         }
-        let (text, unspellable, mut crossed) = dux_cinterop::spell_report(&declarations);
+        let namespace = module.name.name.as_str();
+        let (text, unspellable, mut crossed) =
+            dux_cinterop::spell_report(namespace, &declarations);
         missed.extend(unspellable);
         missed.sort_by(|one, other| one.name.cmp(&other.name));
         missed.dedup();
@@ -766,7 +768,7 @@ fn fill_c_modules(
         diagnostics.extend(parsed.diagnostics);
         module.decls = parsed.program.decls;
         units.push(CUnit {
-            source: dux_cinterop::c_source(&headers, &declarations),
+            source: dux_cinterop::c_source(namespace, &headers, &declarations),
             headers,
             flags,
             include_paths,

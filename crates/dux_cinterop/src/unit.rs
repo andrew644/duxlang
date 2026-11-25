@@ -13,18 +13,22 @@ use crate::{CDecl, CFunction, CType};
 /// at the boundary). An unwrappable function is not imported at all: a
 /// declaration whose definition can never arrive is a link error waiting
 /// to happen, and the table does not write those.
-pub fn wrapper_name(function: &CFunction) -> Option<String> {
+pub fn wrapper_name(namespace: &str, function: &CFunction) -> Option<String> {
     if function.variadic {
         return None;
     }
     if !wraps_record(function) && !function.header_definition {
         return None;
     }
+    // The namespace is part of the name: two headers can reach the same
+    // declaration through their own includes (`stb_image.h` reads
+    // `stdio.h` the way any library does), and two translation units
+    // that each hand out a doorway need two doors.
     c_spelling(&function.returns.clone().unwrap_or(CType::Void))?;
     for (_, ty) in &function.params {
         c_spelling(ty)?;
     }
-    Some(format!("__duxw_{}", function.name))
+    Some(format!("__duxw_{namespace}_{}", function.name))
 }
 
 /// Whether a C function hands back a record by value. LLVM and clang do
@@ -62,7 +66,7 @@ pub fn wraps_record(function: &CFunction) -> bool {
 /// the spelled declaration points at. A namespace built from several
 /// headers compiles as one translation unit, so a definition two headers
 /// both reach is wrapped exactly once.
-pub fn c_source(headers: &[String], decls: &[CDecl]) -> String {
+pub fn c_source(namespace: &str, headers: &[String], decls: &[CDecl]) -> String {
     let mut out = String::new();
     for header in headers {
         out.push_str(&format!("#include \"{header}\"\n"));
@@ -75,7 +79,7 @@ pub fn c_source(headers: &[String], decls: &[CDecl]) -> String {
         if !wraps_record(function) && !function.header_definition {
             continue;
         }
-        let Some(wrapper) = wrapper_name(function) else {
+        let Some(wrapper) = wrapper_name(namespace, function) else {
             continue;
         };
         let mut params = String::new();

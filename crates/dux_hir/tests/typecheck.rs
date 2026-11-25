@@ -615,7 +615,7 @@ fn the_normative_corpus_typechecks_without_a_single_diagnostic() {
     let mut offenders = Vec::new();
     for entry in std::fs::read_dir(EXAMPLE_DIR).expect("example/ exists") {
         let path = entry.expect("readable entry").path();
-        if path.extension().is_some_and(|e| e != "dux") {
+        if path.extension().is_none_or(|e| e != "dux") {
             continue;
         }
         let source = std::fs::read_to_string(&path).expect("example is readable");

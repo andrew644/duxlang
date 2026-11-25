@@ -11,5 +11,5 @@ fn main() {
     })
     .unwrap()
     .decls;
-    print!("{}", dux_cinterop::spell(&seen));
+    print!("{}", dux_cinterop::spell("c", &seen));
 }

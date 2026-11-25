@@ -8,21 +8,25 @@ use crate::{wrapper_name, CDecl, CEnum, CFunction, CStruct, CType, CTypedef, Mac
 /// Spell a namespace's worth of C declarations as Dux. A declaration the
 /// table cannot cross today is left out, silently for now and loudly for
 /// `dux cimports` later; nothing half-mapped sneaks through.
-pub fn spell(decls: &[CDecl]) -> String {
-    spell_report(decls).0
+pub fn spell(namespace: &str, decls: &[CDecl]) -> String {
+    spell_report(namespace, decls).0
 }
 
 /// Spell the namespace and name everything that did not cross. The names
 /// here are the whole point of `dux cimports`: a header is a negotiation,
 /// and the program deserves to know what it lost.
-pub fn spell_report(decls: &[CDecl]) -> (String, Vec<crate::Skipped>, Vec<String>) {
+pub fn spell_report(
+    namespace: &str,
+    decls: &[CDecl],
+) -> (String, Vec<crate::Skipped>, Vec<String>) {
     let mut missed: Vec<crate::Skipped> = Vec::new();
     let mut crossed: Vec<String> = Vec::new();
-    let text = spell_with(decls, &mut missed, &mut crossed);
+    let text = spell_with(namespace, decls, &mut missed, &mut crossed);
     (text, missed, crossed)
 }
 
 fn spell_with(
+    namespace: &str,
     decls: &[CDecl],
     missed: &mut Vec<crate::Skipped>,
     crossed: &mut Vec<String>,
@@ -125,7 +129,7 @@ fn spell_with(
             // records in through pointers.
             let needs_wrapper = function.header_definition || crate::wraps_record(function);
             let text = if needs_wrapper {
-                match wrapper_name(function) {
+                match wrapper_name(namespace, function) {
                     Some(wrapper) => format!("#[c_name(\"{wrapper}\")] {text}"),
                     None => {
                         missed.push(crate::Skipped {
