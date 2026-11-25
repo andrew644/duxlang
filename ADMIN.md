@@ -65,9 +65,11 @@ crosses `#[c_include]` with nothing written by hand — including records by val
 stay self-contained), so nothing verifies it on this box yet:
 
 ```
-sudo dnf install raylib-devel        # raylib.h, libraylib.so, pkg-config raylib
+sudo dnf install raylib-devel        # DONE, thank you — raylib 5.5.0 verified
 ```
 
-After that, `duxc run example/raylib/hello.dux` should open a window; a mouse
-draws a maroon circle and the title says `dux on raylib`. If the pkg-config name
-differs here, the example needs one attribute edited, nothing else.
+Verified on this box (2026-11-25): `duxc build example/raylib/hello.dux`
+compiles and links against `libraylib.so.550` with zero unresolved symbols,
+and the binary runs into raylib's own platform init. This machine is headless,
+so opening the actual window — a maroon circle following the mouse under the
+text `move the mouse` — needs a desktop:
