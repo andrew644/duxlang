@@ -12,7 +12,7 @@ each remaining gap is waiting for. A gap is a milestone, never a verdict.
 | `pointers.dux` | compiles, runs; `Option<*Node>` is one word and the list walk is a pattern condition | — |
 | `memory.dux` | parses | `Vec<string>` on a call path | generics (M5), `mem.Arena` |
 | `strings.dux` | checks clean; runs until `.bytes()` | `string` methods (`.bytes()`, `.runes()`) | the standard library (M5) |
-| `sum_types.dux` | compiles, runs; variants, payloads, guards, or-patterns, ranges and exhaustiveness all reach machine code | — |
+| `sum_types.dux` | compiles, runs; variants, payloads, guards, or-patterns, ranges and exhaustiveness all reach machine code, and the dispatch is the `switch` on the tag | — |
 | `option_result.dux` | checks until `fs.read_to_string`; the predeclared `Option`/`Result` lower and match today | `std/fs`, `.bytes()`, `.trim()`, and the `Option` methods (`unwrap`, `unwrap_or`), which are prelude code | the standard library (M5) |
 | `generics.dux` | parses | monomorphisation (M5) |
 | `c_interop.dux` | parses | libclang importer (M6) |
@@ -42,6 +42,12 @@ each remaining gap is waiting for. A gap is a milestone, never a verdict.
 - **The tag is a `u16`, always.** `#[repr(u8)]` and `#[repr(i32)]` are how DESIGN
   says to override it, and an attribute argument that is not a literal does not
   parse yet, so neither the narrower tag nor its 256-variant error exists.
+- **The jump table is for the plain shape.** A `match` whose arms each name one
+  variant, and ask for nothing below it but names, becomes one `switch` on the
+  tag. A guard, a literal, a range, an or-pattern, a variant written twice or a
+  variant taken apart beyond its names is a chain of tests in the order written
+  — correct, and one jump slower. Nested `match` lowers the same way, one switch
+  per level where a switch can say it.
 - **A record is matched whole.** `P { x }` names a variant, not a record: a
   `match` on a record takes a binder, a `_`, or an `else`, and destructuring a
   record through patterns is not in the design.
