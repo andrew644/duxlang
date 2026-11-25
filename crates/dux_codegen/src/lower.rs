@@ -2078,7 +2078,7 @@ impl Emitter {
         }
         let return_ty = match &function.return_ty {
             None => None,
-            Some(ty) => match self.type_of(ty).filter(|ty| ty.array_info().is_none()) {
+            Some(ty) => match self.type_of(ty) {
                 Some(ty) => Some(ty),
                 None => {
                     self.skipped.insert(key.clone());
@@ -3339,13 +3339,12 @@ impl Emitter {
                 if let Some(value) = self.coerce_implicit(module, value, ty, span) {
                     match (ty.array_info(), value.core) {
                         (Some(info), Core::Ptr(source)) => self.copy_array(slot, source, info),
-                        (None, _) => match value.basic() {
+                        _ => match value.basic() {
                             Some(basic) => {
                                 let _ = self.builder.build_store(slot, basic);
                             }
                             None => self.unsupported(span, "storing this value"),
                         },
-                        (Some(_), _) => self.unsupported(span, "storing this array value"),
                     }
                 }
             }
@@ -3524,7 +3523,7 @@ impl Emitter {
                     return;
                 };
                 match self.coerce_implicit(module, value, ty, span) {
-                    Some(value) => match value.basic() {
+                    Some(value) => match self.returnable(value, ty) {
                         Some(basic) => {
                             let _ = self.builder.build_return(Some(&basic));
                         }
@@ -4862,6 +4861,30 @@ impl Emitter {
         Some(Typed::pointer(at, self.pointer_to(target)))
     }
 
+    /// `&` of something that is not a place: the value is built standing in a
+    /// slot of its own, and that slot is what the view or the pointer aims at.
+    fn borrowed_temporary(&mut self, module: &Module<'static>, operand: &Expr) -> Option<Typed> {
+        let value = self.expr(module, operand, None)?;
+        if value.ty == DuxType::Error {
+            return Some(Typed::error());
+        }
+        if value.ty.array_info().is_some() {
+            return self.view_of_array(value);
+        }
+        if value.ty.slice_element().is_some() {
+            return Some(value);
+        }
+        let at = match value.core {
+            Core::Ptr(at) => at,
+            _ => {
+                let slot = self.alloca(value.ty, "tmp");
+                let _ = self.builder.build_store(slot, value.basic()?);
+                slot
+            }
+        };
+        Some(Typed::pointer(at, self.pointer_to(value.ty)))
+    }
+
     /// One bound of a `[a..b]`, evaluated as the position it names.
     fn view_bound(&mut self, module: &Module<'static>, bound: &Expr) -> Option<Typed> {
         let value = self.expr(module, bound, Some(DuxType::I64))?;
@@ -5634,7 +5657,10 @@ impl Emitter {
                     None
                 }
             }
-            UnaryOp::AddressOf => match self.borrowed(module, operand, span) {
+            UnaryOp::AddressOf => match self
+                .borrowed(module, operand, span)
+                .or_else(|| self.borrowed_temporary(module, operand))
+            {
                 Some(view) => Some(view),
                 None => {
                     self.diagnostics.push(
@@ -6755,17 +6781,27 @@ impl Emitter {
         return_ty: Option<DuxType>,
     ) -> Option<Typed> {
         let call = self.builder.build_call(function, &arguments, "call").ok()?;
-        let core = match call.try_as_basic_value() {
+        let answer = call.try_as_basic_value();
+        let ty = return_ty?;
+        // A fixed array that comes back from a call comes back whole; a fixed
+        // array everywhere else lives at an address. The slot is where the two
+        // ways of holding one meet.
+        if ty.array_info().is_some() {
+            let ValueKind::Basic(whole) = answer else {
+                return Some(Typed::error());
+            };
+            let slot = self.alloca(ty, "retarr");
+            let _ = self.builder.build_store(slot, whole);
+            return Some(Typed::pointer(slot, ty));
+        }
+        let core = match answer {
             ValueKind::Basic(BasicValueEnum::IntValue(value)) => Core::Int(value),
             ValueKind::Basic(BasicValueEnum::FloatValue(value)) => Core::Float(value),
             ValueKind::Basic(BasicValueEnum::PointerValue(value)) => Core::Ptr(value),
             ValueKind::Basic(BasicValueEnum::StructValue(value)) => Core::Aggregate(value),
             _ => return Some(Typed::error()),
         };
-        Some(Typed {
-            core,
-            ty: return_ty?,
-        })
+        Some(Typed { core, ty })
     }
 
     fn write_builtin(
@@ -7229,6 +7265,22 @@ impl Emitter {
 }
 
 impl Emitter {
+    /// What a `return` hands the caller. A fixed array lives at an address but
+    /// crosses the boundary whole, so the array is read out of wherever it was
+    /// standing.
+    fn returnable(&mut self, value: Typed, ty: DuxType) -> Option<BasicValueEnum<'static>> {
+        if ty.array_info().is_some() {
+            let Core::Ptr(at) = value.core else {
+                return None;
+            };
+            return self
+                .builder
+                .build_load(ty.llvm(self.context), at, "retarr")
+                .ok();
+        }
+        value.basic()
+    }
+
     fn load(&mut self, ty: DuxType, slot: PointerValue<'static>) -> Option<Typed> {
         if ty.array_info().is_some() {
             return Some(Typed::pointer(slot, ty));

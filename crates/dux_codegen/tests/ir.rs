@@ -609,20 +609,46 @@ fn main() {
 }
 
 #[test]
-fn the_address_of_a_temporary_is_refused() {
-    let errors = build(
+fn the_address_of_a_temporary_stands_where_the_value_was_built() {
+    let ir = build(
         "package main
 fn one() -> i32 {
     return 1
 }
+fn sum(xs: []i32) -> i32 {
+    total: i32 = 0
+    for v in xs {
+        total += v
+    }
+    return total
+}
 fn main() {
+    println($\"{}\", sum(&[1, 2, 3]))
     p := &one()
     println($\"{}\", *p)
 }",
     )
-    .unwrap_err();
-    assert_eq!(errors[0].code, dux_diag::code::TYPE_MISMATCH, "{errors:?}");
-    assert!(errors[0].message.contains("address"), "{errors:?}");
+    .expect("a temporary is built standing in a slot, and that slot has an address")
+    .ir_text();
+    assert!(ir.contains("[3 x i32]"), "{ir}");
+    assert!(ir.contains("call i32 @sum"), "{ir}");
+}
+
+#[test]
+fn a_fixed_array_comes_back_from_a_call_whole() {
+    let ir = build(
+        "package main
+fn pair() -> [i32; 2] {
+    return [3, 4]
+}
+fn main() {
+    p := pair()
+    println($\"{}\", p[1])
+}",
+    )
+    .expect("a fixed array crosses a call boundary by value")
+    .ir_text();
+    assert!(ir.contains("define [2 x i32] @pair"), "{ir}");
 }
 
 #[test]
