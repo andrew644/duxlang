@@ -1,0 +1,13 @@
+//@expect-error E0133
+package main
+
+fn depth(o: Option<Option<i32>>) -> i32 {
+    return match o {
+        Some(Some(x)) => x,
+        None => 0,
+    }
+}
+
+fn main() {
+    println($"{depth(None)}")
+}

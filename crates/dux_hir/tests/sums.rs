@@ -796,3 +796,131 @@ fn lookup() -> Option<i32> {
         vec![dux_diag::code::TYPE_MISMATCH]
     );
 }
+
+#[test]
+fn an_arm_reaches_no_further_than_its_own_pattern() {
+    assert_eq!(
+        sums(
+            "fn depth(o: Option<Option<i32>>) -> i32 {
+    match o {
+        Some(Some(x)) => { x },
+        None => { 0 },
+    }
+}"
+        ),
+        vec![dux_diag::code::NON_EXHAUSTIVE]
+    );
+}
+
+#[test]
+fn a_hole_inside_a_variant_is_spelled_the_way_a_pattern_spells_it() {
+    let found = diagnose(&completed(
+        "fn depth(o: Option<Option<i32>>) -> i32 {
+    match o {
+        Some(Some(x)) => { x },
+        None => { 0 },
+    }
+}",
+    ));
+    assert_eq!(codes_of(&found), vec![dux_diag::code::NON_EXHAUSTIVE]);
+    assert!(
+        found[0].message.contains("`Some(None)`"),
+        "{}",
+        found[0].message
+    );
+}
+
+#[test]
+fn every_arm_of_a_nested_pair_is_exhaustive() {
+    assert_eq!(
+        sums(
+            "fn depth(o: Option<Option<i32>>) -> i32 {
+    match o {
+        Some(Some(x)) => { x },
+        Some(None) => { 0 },
+        None => { -1 },
+    }
+}"
+        ),
+        CLEAN
+    );
+}
+
+#[test]
+fn a_wildcard_inside_a_variant_closes_it() {
+    assert_eq!(
+        sums(
+            "fn depth(o: Option<Option<i32>>) -> i32 {
+    match o {
+        Some(_) => { 1 },
+        None => { 0 },
+    }
+}"
+        ),
+        CLEAN
+    );
+    assert_eq!(
+        sums(
+            "fn depth(o: Option<Option<i32>>) -> i32 {
+    match o {
+        Some(x) => { 1 },
+        None => { 0 },
+    }
+}"
+        ),
+        CLEAN
+    );
+}
+
+#[test]
+fn the_result_of_a_result_is_two_trees_deep() {
+    assert_eq!(
+        sums(
+            "fn score(o: Result<Result<i32, i32>, i32>) -> i32 {
+    match o {
+        Ok(Ok(n)) => { n },
+        Err(e) => { e },
+    }
+}"
+        ),
+        vec![dux_diag::code::NON_EXHAUSTIVE]
+    );
+    assert_eq!(
+        sums(
+            "fn score(o: Result<Result<i32, i32>, i32>) -> i32 {
+    match o {
+        Ok(Ok(n)) => { n },
+        Ok(Err(e)) => { e },
+        Err(e) => { e },
+    }
+}"
+        ),
+        CLEAN
+    );
+}
+
+#[test]
+fn or_patterns_and_binders_close_what_a_single_arm_leaves_open() {
+    assert_eq!(
+        sums(
+            "fn depth(o: Option<Option<i32>>) -> i32 {
+    match o {
+        Some(Some(x)) | Some(None) => { 1 },
+        None => { 0 },
+    }
+}"
+        ),
+        CLEAN
+    );
+    assert_eq!(
+        sums(
+            "fn score(o: Result<Result<i32, i32>, i32>) -> i32 {
+    match o {
+        Ok(_) => { 1 },
+        Err(_) => { 0 },
+    }
+}"
+        ),
+        CLEAN
+    );
+}

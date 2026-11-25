@@ -235,28 +235,102 @@ fn payload_arity(payload: &Payload) -> usize {
     }
 }
 
+/// How far one arm's pattern reaches into a value. A variant is reached by
+/// naming it, and reaches no further than its own payload patterns go, which
+/// is what makes `Some(None)` one arm's worth of evidence about `Option<Option<T>>`
+/// rather than two.
+#[derive(Clone)]
+enum Cover {
+    /// Nothing at all. The starting point, and the identity of a union.
+    Nothing,
+    /// Every value of the type: a binder, a wildcard, an `else`.
+    Whole,
+    /// These variants, each as far as the pattern written for it reaches.
+    Parts(Vec<(String, Cover)>),
+}
+
+impl Cover {
+    fn one(variant: &str, payload: Cover) -> Cover {
+        Cover::Parts(vec![(variant_of_name(variant).to_string(), payload)])
+    }
+
+    /// What two patterns reach between them.
+    fn joined(self, other: Cover) -> Cover {
+        match (self, other) {
+            (Cover::Whole, _) | (_, Cover::Whole) => Cover::Whole,
+            (Cover::Nothing, other) => other,
+            (other, Cover::Nothing) => other,
+            (Cover::Parts(mut mine), Cover::Parts(theirs)) => {
+                for (variant, payload) in theirs {
+                    match mine.iter_mut().find(|(name, _)| *name == variant) {
+                        Some((_, known)) => *known = known.clone().joined(payload),
+                        None => mine.push((variant, payload)),
+                    }
+                }
+                Cover::Parts(mine)
+            }
+        }
+    }
+
+    /// The variants this reaches, however far, which is all a type with named
+    /// values and no tree — a `bool` — needs to hear.
+    fn names(&self) -> Vec<String> {
+        match self {
+            Cover::Parts(list) => list.iter().map(|(name, _)| name.clone()).collect(),
+            Cover::Whole => Vec::new(),
+            Cover::Nothing => Vec::new(),
+        }
+    }
+}
+
 /// What the arms of a `match` reach. An arm with a guard proves nothing about
 /// the rest of the type, so a guarded arm marks nothing here.
+#[derive(Clone)]
 struct Coverage {
     /// Is there anything to prove? A value the checker cannot name has no
     /// variants to enumerate.
     check: bool,
+    /// A sum type has a tree to walk; a `bool` has two values and no enum to
+    /// say so, and anything else has nothing to enumerate at all.
     enum_name: Option<String>,
-    variants: Vec<(String, bool)>,
+    args: Vec<Ty>,
+    reach: Cover,
+    declared: Vec<(String, bool)>,
     catch_all: bool,
     guarded: bool,
 }
 
 impl Coverage {
+    /// A subject with no variants of its own.
+    fn plain(check: bool) -> Coverage {
+        Coverage {
+            check,
+            enum_name: None,
+            args: Vec::new(),
+            reach: Cover::Nothing,
+            declared: Vec::new(),
+            catch_all: false,
+            guarded: false,
+        }
+    }
+
     /// Say what no arm reaches (E0133). A guarded arm is not evidence, which is
     /// why `Some(x) if x > 0 =>` leaves `Some` unhandled.
     fn finish(self, checker: &mut Checker, subject: &Ty, span: Span) {
         if !self.check || self.catch_all {
             return;
         }
-        let missing = self.missing();
+        let missing = match &self.enum_name {
+            Some(owner) => checker.holes(owner, &self.args, &self.reach, true),
+            None => self
+                .declared
+                .iter()
+                .filter(|(_, covered)| !*covered)
+                .map(|(name, _)| name.clone())
+                .collect(),
+        };
         if missing.is_empty() {
-            if !self.variants.is_empty() {
+            if !self.declared.is_empty() || matches!(self.reach, Cover::Parts(_)) {
                 return;
             }
             checker.report(
@@ -271,10 +345,7 @@ impl Coverage {
         }
         let which = missing
             .iter()
-            .map(|variant| match &self.enum_name {
-                Some(owner) => format!("`{owner}::{variant}`"),
-                None => format!("`{variant}`"),
-            })
+            .map(|variant| format!("`{variant}`"))
             .collect::<Vec<_>>()
             .join(", ");
         let (word, verb) = if missing.len() == 1 {
@@ -292,44 +363,39 @@ impl Coverage {
         );
     }
 
-    fn for_subject(shape: Option<&Shape>, check: bool) -> Coverage {
-        Coverage {
-            check,
-            enum_name: shape.map(|shape| shape.name.clone()),
-            variants: shape
-                .map(|shape| {
-                    shape
-                        .variants
-                        .iter()
-                        .map(|(name, _)| (name.clone(), false))
-                        .collect()
-                })
-                .unwrap_or_default(),
-            catch_all: false,
-            guarded: false,
-        }
-    }
-
-    fn mark(&mut self, variant: &str) {
+    /// Record how far one arm reaches. A `bool` is counted by the literals that
+    /// name its two values; a sum type is counted by walking its tree.
+    fn mark(&mut self, reach: &Cover) {
         if self.guarded {
             return;
         }
-        if let Some((_, covered)) = self.variants.iter_mut().find(|(name, _)| name == variant) {
-            *covered = true;
+        if matches!(reach, Cover::Whole) {
+            self.catch_all = true;
+            return;
         }
-    }
-
-    fn missing(&self) -> Vec<String> {
-        self.variants
-            .iter()
-            .filter(|(_, covered)| !*covered)
-            .map(|(name, _)| name.clone())
-            .collect()
+        if self.enum_name.is_none() {
+            for name in reach.names() {
+                if let Some((_, covered)) =
+                    self.declared.iter_mut().find(|(known, _)| *known == name)
+                {
+                    *covered = true;
+                }
+            }
+            return;
+        }
+        self.reach = self.reach.clone().joined(reach.clone());
     }
 }
 
 /// The variant half of a `Shape::Rect` spelling, or the name itself when the
 /// enum was left out.
+fn payload_is_empty(shape: &Shape, variant: &str) -> bool {
+    shape
+        .variant(variant)
+        .map(|(_, payload)| payload.is_empty())
+        .unwrap_or(true)
+}
+
 fn variant_of_name(name: &str) -> &str {
     name.rsplit("::").next().unwrap_or(name)
 }
@@ -1398,31 +1464,128 @@ impl<'a> Checker<'a> {
     /// What the arms of a `match` on this type have to cover.
     fn coverage(&self, subject: &Ty) -> Coverage {
         match subject {
-            Ty::Opaque => Coverage::for_subject(None, false),
+            Ty::Opaque => Coverage::plain(false),
             Ty::Bool => Coverage {
-                check: true,
-                enum_name: None,
-                variants: vec![("true".to_string(), false), ("false".to_string(), false)],
-                catch_all: false,
-                guarded: false,
+                declared: vec![("true".to_string(), false), ("false".to_string(), false)],
+                ..Coverage::plain(true)
             },
-            Ty::Enum { name, .. } => Coverage::for_subject(self.enums.get(name), true),
-            _ => Coverage::for_subject(None, true),
+            Ty::Enum { name, args } if self.enums.contains_key(name) => Coverage {
+                enum_name: Some(name.clone()),
+                args: args.clone(),
+                ..Coverage::plain(true)
+            },
+            _ => Coverage::plain(true),
+        }
+    }
+
+    /// The values of `owner<args>` that `reach` does not touch, spelled the way
+    /// a pattern spells them: `Shape::Rect` at the top, `Some(None)` one level
+    /// in. A level the checker cannot name has no holes to report, and neither
+    /// has one that every arm reaches.
+    fn holes(&self, owner: &str, args: &[Ty], reach: &Cover, outer: bool) -> Vec<String> {
+        let Cover::Parts(list) = reach else {
+            return Vec::new();
+        };
+        let Some(shape) = self.enums.get(owner) else {
+            return Vec::new();
+        };
+        let subject = Ty::Enum {
+            name: owner.to_string(),
+            args: args.to_vec(),
+        };
+        let mut holes = Vec::new();
+        for (variant, _) in &shape.variants {
+            let Some((_, inside)) = list.iter().find(|(name, _)| name == variant) else {
+                holes.push(if outer {
+                    format!("{owner}::{variant}")
+                } else if payload_is_empty(shape, variant) {
+                    variant.clone()
+                } else {
+                    format!("{variant}(..)")
+                });
+                continue;
+            };
+            let Some(Ty::Enum { name, args }) = self.payload_tree(&subject, variant) else {
+                continue;
+            };
+            for hole in self.holes(&name, &args, inside, false) {
+                holes.push(format!("{variant}({hole})"));
+            }
+        }
+        holes
+    }
+
+    /// The one thing a variant carries, when it carries exactly one. That is
+    /// where coverage has somewhere to go: a variant that carries nothing, or
+    /// two things, or one thing that is not a sum type, is reached whole by the
+    /// pattern that names it.
+    fn payload_tree(&self, subject: &Ty, variant: &str) -> Option<Ty> {
+        let (owner, args) = self.sum_of(subject)?;
+        let shape = self.enums.get(owner)?;
+        let (_, payload) = shape.variant(variant_of_name(variant))?;
+        let mut fields = self.payload_of(shape, args, payload);
+        if fields.len() == 1 {
+            fields.pop()
+        } else {
+            None
+        }
+    }
+
+    /// How far one arm's pattern reaches, which is the one question exhaustive
+    /// checking asks of a pattern. Nothing here reports: a pattern that is not
+    /// a variant — a binder, a literal, a range — is evidence about nothing the
+    /// checker can enumerate, and coverage never claims more than it is given.
+    fn cover_of(&self, pattern: &Pattern, subject: &Ty) -> Cover {
+        match pattern {
+            Pattern::Literal { value, .. } => match &**value {
+                Expr::Bool { value, .. } => {
+                    Cover::one(if *value { "true" } else { "false" }, Cover::Whole)
+                }
+                _ => Cover::Nothing,
+            },
+            Pattern::Range { .. } => Cover::Nothing,
+            Pattern::Or { alternatives, .. } => alternatives
+                .iter()
+                .map(|one| self.cover_of(one, subject))
+                .fold(Cover::Nothing, Cover::joined),
+            Pattern::Wildcard { .. } | Pattern::Else { .. } | Pattern::Error { .. } => Cover::Whole,
+            Pattern::Name { name, .. } => match self.enum_variant_of(subject, &name.name) {
+                Some(_) => Cover::one(&name.name, Cover::Whole),
+                None => Cover::Whole,
+            },
+            Pattern::Path { name, .. } => Cover::one(name, Cover::Whole),
+            Pattern::Tuple {
+                name, elements, ..
+            } => {
+                let inside = match (self.payload_tree(subject, name), elements.as_slice()) {
+                    (Some(payload), [one]) => self.cover_of(one, &payload),
+                    _ => Cover::Whole,
+                };
+                Cover::one(name, inside)
+            }
+            Pattern::Struct {
+                name, fields, rest, ..
+            } => {
+                let inside = match (self.payload_tree(subject, name), fields.as_slice()) {
+                    (Some(payload), [FieldPattern::Nested { pattern, .. }]) if !*rest => {
+                        self.cover_of(pattern, &payload)
+                    }
+                    _ => Cover::Whole,
+                };
+                Cover::one(name, inside)
+            }
         }
     }
 
     /// Check a pattern against the value it will be matched against, binding
     /// the names it introduces. The answer says whether the pattern refutes
     /// nothing: a wildcard, an `else`, a name that binds the whole value.
-    fn pattern(&mut self, pattern: &Pattern, subject: &Ty, coverage: &mut Coverage) -> bool {
+    fn pattern(&mut self, pattern: &Pattern, subject: &Ty) -> bool {
         match pattern {
             Pattern::Wildcard { .. } | Pattern::Else { .. } | Pattern::Error { .. } => true,
             Pattern::Literal { value, span } => {
                 let spelled = self.infer(value);
                 self.coerce(spelled, subject, *span);
-                if let Expr::Bool { value, .. } = &**value {
-                    coverage.mark(if *value { "true" } else { "false" });
-                }
                 false
             }
             Pattern::Range { start, end, .. } => {
@@ -1433,7 +1596,7 @@ impl<'a> Checker<'a> {
                             self.coerce(spelled, subject, *span);
                         }
                         other => {
-                            let _ = self.pattern(other, subject, coverage);
+                            let _ = self.pattern(other, subject);
                         }
                     }
                 }
@@ -1442,16 +1605,13 @@ impl<'a> Checker<'a> {
             Pattern::Or { alternatives, .. } => {
                 let mut covers = false;
                 for alternative in alternatives {
-                    covers |= self.pattern(alternative, subject, coverage);
+                    covers |= self.pattern(alternative, subject);
                 }
                 covers
             }
             Pattern::Name { name, span } => {
                 match self.enum_variant_of(subject, &name.name) {
-                    Some(true) => {
-                        coverage.mark(&name.name);
-                        false
-                    }
+                    Some(true) => false,
                     Some(false) => {
                         self.error(
                             code::TYPE_MISMATCH,
@@ -1475,7 +1635,6 @@ impl<'a> Checker<'a> {
                 else {
                     return false;
                 };
-                coverage.mark(name);
                 if !payload.is_empty() {
                     self.error(
                         code::TYPE_MISMATCH,
@@ -1495,10 +1654,7 @@ impl<'a> Checker<'a> {
             } => {
                 let resolved = self.variant_of_pattern(qualifier.as_deref(), name, subject, *span);
                 let want = match &resolved {
-                    Some((shape, args, payload)) => {
-                        coverage.mark(name);
-                        self.payload_of(shape, args, payload)
-                    }
+                    Some((shape, args, payload)) => self.payload_of(shape, args, payload),
                     None => elements.iter().map(|_| Ty::Opaque).collect(),
                 };
                 if resolved.is_some() && want.len() != elements.len() {
@@ -1513,7 +1669,7 @@ impl<'a> Checker<'a> {
                     );
                 }
                 for (element, want) in elements.iter().zip(want) {
-                    let _ = self.pattern(element, &want, coverage);
+                    let _ = self.pattern(element, &want);
                 }
                 false
             }
@@ -1527,7 +1683,6 @@ impl<'a> Checker<'a> {
                 let resolved = self.variant_of_pattern(qualifier.as_deref(), name, subject, *span);
                 let declared = match &resolved {
                     Some((shape, args, payload)) => {
-                        coverage.mark(name);
                         if matches!(payload, Payload::Tuple(_)) && !payload.is_empty() {
                             self.error(
                                 code::TYPE_MISMATCH,
@@ -1575,7 +1730,7 @@ impl<'a> Checker<'a> {
                                     field.span,
                                 );
                             }
-                            let _ = self.pattern(pattern, &want, coverage);
+                            let _ = self.pattern(pattern, &want);
                         }
                     }
                 }
@@ -1881,7 +2036,7 @@ impl<'a> Checker<'a> {
             Expr::CondBinding { pattern, value, .. } => {
                 let subject = self.infer(value);
                 self.scopes.push(Vec::new());
-                let _ = self.pattern(pattern, &subject, &mut Coverage::for_subject(None, false));
+                let _ = self.pattern(pattern, &subject);
                 self.scopes.pop();
                 Ty::Bool
             }
@@ -2284,9 +2439,12 @@ impl<'a> Checker<'a> {
         for arm in arms {
             self.scopes.push(Vec::new());
             coverage.guarded = arm.guard.is_some();
-            let covers = self.pattern(&arm.pattern, subject, &mut coverage);
-            if covers && !coverage.guarded {
-                coverage.catch_all = true;
+            let reach = self.cover_of(&arm.pattern, subject);
+            let covers = self.pattern(&arm.pattern, subject);
+            if covers {
+                coverage.mark(&Cover::Whole);
+            } else {
+                coverage.mark(&reach);
             }
             if let Some(guard) = &arm.guard {
                 let ty = self.infer(guard);
@@ -2356,7 +2514,7 @@ impl<'a> Checker<'a> {
         if let Expr::CondBinding { pattern, value, .. } = cond {
             let subject = self.infer(value);
             self.scopes.push(Vec::new());
-            let _ = self.pattern(pattern, &subject, &mut Coverage::for_subject(None, false));
+            let _ = self.pattern(pattern, &subject);
             return true;
         }
         let ty = self.infer(cond);

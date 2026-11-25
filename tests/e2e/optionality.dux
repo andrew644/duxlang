@@ -31,6 +31,14 @@ fn word(o: Option<i32>) -> string {
     }
 }
 
+fn depth(o: Option<Option<i32>>) -> i32 {
+    return match o {
+        Some(Some(x)) => x,
+        Some(None) => 0 - 1,
+        None => 0 - 2,
+    }
+}
+
 fn verdict(r: Result<i32, string>) -> string {
     match r {
         Ok(v) if v > 0 => { return "plus" }
@@ -47,6 +55,8 @@ fn main() {
     println($"{total(None)}")
     println($"{first(Some(9))} {first(None)}")
     println($"{word(Some(1))} {word(None)}")
+    deep: Option<Option<i32>> = Some(None)
+    println($"{depth(Some(Some(7)))} {depth(deep)} {depth(None)}")
     yes := verdict(Ok(4))
     no := verdict(Ok(0))
     bad := verdict(Err("no good"))
