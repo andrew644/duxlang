@@ -1,0 +1,19 @@
+package main
+
+// `hash` is the builtin the tables of the prelude are written against: one
+// word of a value through a mixer, and the bytes of a `string` through FNV.
+
+fn main() {
+    same := hash("dux")
+    again := hash("dux")
+    println($"stable={} differs={}", same == again, same == hash("lang"))
+    println($"int={} {} {}", hash(42) == hash(42), hash(1) == hash(2), hash(0) != hash(1))
+    small: u8 = 7
+    big: i64 = 7
+    println($"widened={}", hash(small) == hash(big))
+    ratio: f64 = 2.5
+    println($"float={}", hash(ratio) == hash(2.5))
+    println($"flag={}", hash(true) == hash(true))
+    where := hash("hp") % 8
+    println($"slot={} {}", where < 8, where >= 0)
+}

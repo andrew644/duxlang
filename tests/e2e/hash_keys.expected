@@ -1,0 +1,6 @@
+stable=true differs=false
+int=true false true
+widened=true
+float=true
+flag=true
+slot=true true

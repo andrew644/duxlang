@@ -8,7 +8,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use crate::runtime::Runtime;
+use crate::runtime::{HashRuntime, Runtime};
 use dux_ast::{
     BinaryOp, Block, ConstDecl, Decl, Expr, FnDecl, ForKind, GlobalDecl, InterpolationPart, Program,
     Stmt, Type, UnaryOp,
@@ -741,6 +741,8 @@ pub(crate) struct Emitter {
     /// The allocator runtime, emitted when some function in the program
     /// allocates.
     runtime: Option<Runtime>,
+    /// The hashing runtime, emitted when the program first asks for a `hash`.
+    hash: Option<HashRuntime>,
     /// Head allocations with bookkeeping and report leaks at exit.
     pub(crate) debug_allocator: bool,
     /// Functions that carry the hidden `context` parameter: the ones that
@@ -805,6 +807,7 @@ impl Emitter {
             loops: Vec::new(),
             defers: Vec::new(),
             runtime: None,
+            hash: None,
             debug_allocator: true,
             allocating: HashSet::new(),
             context_slot: None,
@@ -1820,6 +1823,114 @@ impl Emitter {
         let function = declared(module, name, fn_type);
         self.c_functions.insert(name.to_string(), function);
         function
+    }
+
+    /// `hash(key)`: the bits of a value, scattered. A builtin because a
+    /// generic key is the one place bits are wanted before any type an `impl`
+    /// can name exists; what is hashable is decided per concrete type here.
+    fn hash_builtin(
+        &mut self,
+        module: &Module<'static>,
+        args: &[Expr],
+        span: Span,
+    ) -> Option<Typed> {
+        if args.len() != 1 {
+            self.diagnostics.push(
+                Diagnostic::error(
+                    code::WRONG_ARITY,
+                    format!("`hash` takes one argument, given {}", args.len()),
+                )
+                .with_span(span),
+            );
+            return None;
+        }
+        let value = self.expr(module, args.first()?, None)?;
+        if value.ty == DuxType::Error {
+            return None;
+        }
+        if matches!(
+            value.ty,
+            DuxType::Array(..)
+                | DuxType::Slice(_)
+                | DuxType::Struct(..)
+                | DuxType::Enum(_)
+        ) {
+            self.unsupported(span, &format!("hashing a `{}`", value.ty.name()));
+            return None;
+        }
+        let hash = self.hash_runtime(module);
+        if value.ty == DuxType::Str {
+            let (data, len) = self.slice_parts(value)?;
+            let mixed = self
+                .builder
+                .build_call(hash.bytes, &[data.into(), len.into()], "hash")
+                .ok()?
+                .try_as_basic_value()
+                .basic()?
+                .into_int_value();
+            return Some(Typed {
+                core: Core::Int(mixed),
+                ty: DuxType::U64,
+            });
+        }
+        let i64_type = self.context.i64_type();
+        let word = match value.core {
+            Core::Int(at) => {
+                if at.get_type().get_bit_width() >= 64 {
+                    at
+                } else if matches!(value.ty, DuxType::I8 | DuxType::I16 | DuxType::I32) {
+                    self.builder
+                        .build_int_s_extend(at, i64_type, "whole")
+                        .ok()?
+                } else {
+                    self.builder.build_int_z_extend(at, i64_type, "whole").ok()?
+                }
+            }
+            Core::Float(at) => {
+                let bits: inkwell::types::BasicTypeEnum<'static> = if value.ty == DuxType::F32 {
+                    self.context.i32_type().into()
+                } else {
+                    i64_type.into()
+                };
+                let cast = self.builder.build_bit_cast(at, bits, "bits").ok()?;
+                let as_int = cast.into_int_value();
+                if as_int.get_type().get_bit_width() < 64 {
+                    self.builder
+                        .build_int_z_extend(as_int, i64_type, "whole")
+                        .ok()?
+                } else {
+                    as_int
+                }
+            }
+            Core::Ptr(at) => self.builder.build_ptr_to_int(at, i64_type, "bits").ok()?,
+            _ => {
+                self.unsupported(
+                    span,
+                    &format!("hashing a `{}`", value.ty.name()),
+                );
+                return None;
+            }
+        };
+        let mixed = self
+            .builder
+            .build_call(hash.mix, &[word.into()], "hash")
+            .ok()?
+            .try_as_basic_value()
+            .basic()?
+            .into_int_value();
+        Some(Typed {
+            core: Core::Int(mixed),
+            ty: DuxType::U64,
+        })
+    }
+
+    fn hash_runtime(&mut self, module: &Module<'static>) -> HashRuntime {
+        if let Some(hash) = self.hash {
+            return hash;
+        }
+        let hash = HashRuntime::emit(self.context, module);
+        self.hash = Some(hash);
+        hash
     }
 
     /// `new`, `make`, `free` and `del` reach the allocator through the hidden
@@ -6540,6 +6651,9 @@ impl Emitter {
         // declares its own `make` wins.
         if matches!(name, "new" | "make" | "free" | "del") && !self.functions.contains_key(name) {
             return self.memory_builtin(module, name, args, span);
+        }
+        if name == "hash" && !self.functions.contains_key(name) {
+            return self.hash_builtin(module, args, span);
         }
         if self.generic_fns.contains_key(name) {
             return self.generic_call(module, name, &[], args, span);

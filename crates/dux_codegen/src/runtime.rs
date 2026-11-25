@@ -126,6 +126,140 @@ impl Runtime {
     }
 }
 
+/// The generated program's hashing support. `hash` is a builtin because a
+/// generic key is the one place a value's bits are wanted before any type an
+/// `impl` can name exists; the tables that use it are ordinary code written
+/// against these two.
+#[derive(Clone, Copy)]
+pub struct HashRuntime {
+    /// `i64 @dux.runtime.hash_mix(i64 word)` — one word through a
+    /// splitmix64 finalizer, so neighbouring words and small integers land
+    /// far apart.
+    pub mix: FunctionValue<'static>,
+    /// `i64 @dux.runtime.hash_bytes(ptr data, i64 len)` — FNV-1a over the
+    /// bytes of a `string` or a byte view.
+    pub bytes: FunctionValue<'static>,
+}
+
+const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+const FNV_PRIME: u64 = 0x100_0000_01b3;
+
+impl HashRuntime {
+    /// Emit the hashing runtime. `lower` calls this the first time a program
+    /// asks for a hash, the same way the allocator arrives only when
+    /// something allocates.
+    pub fn emit(context: &'static Context, module: &Module<'static>) -> Self {
+        let builder = context.create_builder();
+        let i64_type = context.i64_type();
+        let ptr = context.ptr_type(AddressSpace::default());
+
+        let mix = module.add_function(
+            "dux.runtime.hash_mix",
+            i64_type.fn_type(&[i64_type.into()], false),
+            None,
+        );
+        mix.set_linkage(Linkage::Internal);
+        let entry = context.append_basic_block(mix, "entry");
+        builder.position_at_end(entry);
+        let word = mix.get_nth_param(0).unwrap().into_int_value();
+        let golden = i64_type.const_int(0x9E37_79B9_7F4A_7C15, false);
+        let mut state = builder
+            .build_int_add(word, golden, "state")
+            .expect("golden");
+        for (shift, factor) in [
+            (30u64, 0xBF58_476D_1CE4_E5B9u64),
+            (27, 0x94D0_49BB_1331_11EB),
+        ] {
+            let moved = builder
+                .build_right_shift(state, i64_type.const_int(shift, false), false, "apart")
+                .expect("shift");
+            state = builder.build_xor(state, moved, "fold").expect("xor");
+            state = builder
+                .build_int_mul(state, i64_type.const_int(factor, false), "spread")
+                .expect("spread");
+        }
+        let tail = builder
+            .build_right_shift(state, i64_type.const_int(31, false), false, "tail")
+            .expect("tail");
+        let mixed = builder.build_xor(state, tail, "mixed").expect("xor");
+        builder.build_return(Some(&mixed)).expect("return");
+
+        let bytes = module.add_function(
+            "dux.runtime.hash_bytes",
+            i64_type.fn_type(&[ptr.into(), i64_type.into()], false),
+            None,
+        );
+        bytes.set_linkage(Linkage::Internal);
+        let entry = context.append_basic_block(bytes, "entry");
+        let head = context.append_basic_block(bytes, "head");
+        let body = context.append_basic_block(bytes, "body");
+        let done = context.append_basic_block(bytes, "done");
+        builder.position_at_end(entry);
+        let data = bytes.get_nth_param(0).unwrap().into_pointer_value();
+        let len = bytes.get_nth_param(1).unwrap().into_int_value();
+        let _ = builder.build_unconditional_branch(head);
+
+        builder.position_at_end(head);
+        let hash = builder.build_phi(i64_type, "hash").expect("hash");
+        let walked = builder.build_phi(i64_type, "walked").expect("walked");
+        let at = builder.build_phi(ptr, "at").expect("at");
+        hash.add_incoming(&[(&i64_type.const_int(FNV_OFFSET, false), entry)]);
+        walked.add_incoming(&[(&i64_type.const_zero(), entry)]);
+        at.add_incoming(&[(&data, entry)]);
+        let more = builder
+            .build_int_compare(IntPredicate::ULT, walked.as_basic_value().into_int_value(), len, "more")
+            .expect("more");
+        let _ = builder.build_conditional_branch(more, body, done);
+
+        builder.position_at_end(body);
+        let byte = builder
+            .build_load(
+                context.i8_type(),
+                at.as_basic_value().into_pointer_value(),
+                "byte",
+            )
+            .expect("byte")
+            .into_int_value();
+        let wide = builder
+            .build_int_z_extend(byte, i64_type, "wide")
+            .expect("wide");
+        let folded = builder
+            .build_xor(hash.as_basic_value().into_int_value(), wide, "fold")
+            .expect("fold");
+        let spread = builder
+            .build_int_mul(folded, i64_type.const_int(FNV_PRIME, false), "spread")
+            .expect("spread");
+        let next = builder
+            .build_int_add(
+                walked.as_basic_value().into_int_value(),
+                i64_type.const_int(1, false),
+                "next",
+            )
+            .expect("next");
+        let ahead = unsafe {
+            builder
+                .build_gep(
+                    context.i8_type(),
+                    at.as_basic_value().into_pointer_value(),
+                    &[i64_type.const_int(1, false)],
+                    "ahead",
+                )
+                .expect("ahead")
+        };
+        hash.add_incoming(&[(&spread, body)]);
+        walked.add_incoming(&[(&next, body)]);
+        at.add_incoming(&[(&ahead, body)]);
+        let _ = builder.build_unconditional_branch(head);
+
+        builder.position_at_end(done);
+        builder
+            .build_return(Some(&hash.as_basic_value().into_int_value()))
+            .expect("return");
+
+        HashRuntime { mix, bytes }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn emit_alloc(
     context: &'static Context,

@@ -447,6 +447,10 @@ fn builtin_result(name: &str) -> Option<Ty> {
         "new" => Some(Ty::Ptr),
         "make" => Some(Ty::Opaque),
         "free" | "del" => Some(Ty::Unit),
+        // `hash` reads a value's bits, which is what a generic key needs
+        // before any type an `impl` can name exists. What counts as hashable
+        // is the lowering's question, per concrete type.
+        "hash" => Some(Ty::U64),
         _ => None,
     }
 }

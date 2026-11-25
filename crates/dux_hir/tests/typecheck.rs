@@ -1222,3 +1222,28 @@ fn main() {
         vec![dux_diag::code::TYPE_MISMATCH]
     );
 }
+
+#[test]
+fn hash_answers_an_integer_and_nothing_else_adopts_it_for_free() {
+    assert_eq!(
+        codes(
+            "fn main() {
+    slot := hash(\"hp\")
+    where: usize = slot % 8
+    println($\"{}\", where)
+}
+"
+        ),
+        Vec::<&'static str>::new()
+    );
+    assert_eq!(
+        codes(
+            "fn main() {
+    small: i8 = hash(\"hp\")
+    println($\"{}\", small)
+}
+"
+        ),
+        vec![dux_diag::code::LOSSY_CONVERSION]
+    );
+}
