@@ -415,6 +415,15 @@ impl Typed {
     }
 }
 
+/// Where the arms of a `match` meet: the block they branch to, the type they
+/// agreed on, and the values that arrive there.
+struct Join<'a> {
+    block: BasicBlock<'a>,
+    agreed: Option<DuxType>,
+    carried: Vec<(Typed, BasicBlock<'static>)>,
+    broken: bool,
+}
+
 struct Loop {
     continuation: BasicBlock<'static>,
     exit: BasicBlock<'static>,
@@ -2081,10 +2090,12 @@ impl Emitter {
         let place = self.alloca(ty, "match");
         self.put_in(place, held, span)?;
 
-        let join = self.new_block("match.end");
-        let mut results: Vec<(Typed, BasicBlock<'static>)> = Vec::new();
-        let mut joined = expected;
-        let mut broken = false;
+        let mut join = Join {
+            block: self.new_block("match.end"),
+            agreed: expected,
+            carried: Vec::new(),
+            broken: false,
+        };
         let mut rest = self.new_block("match.test");
         self.br(rest);
         for arm in arms {
@@ -2111,38 +2122,7 @@ impl Emitter {
                 self.builder.position_at_end(body);
                 self.dead = false;
             }
-            let outcome = self.match_body(module, &arm.body, joined);
-            let ended = self.builder.get_insert_block();
-            self.scopes.pop();
-            let Some(one) = outcome else {
-                if value && !self.dead {
-                    self.unsupported(
-                        arm.span,
-                        "an arm of a value `match` that produces no value",
-                    );
-                    broken = true;
-                } else if !self.dead {
-                    self.br(join);
-                }
-                rest = next;
-                continue;
-            };
-            if !self.dead && one.ty != DuxType::Error {
-                if joined.is_none() {
-                    joined = Some(one.ty);
-                }
-                let common = joined.expect("the first arm gives the `match` its type");
-                match (self.convert(one, common), ended) {
-                    (Some(carried), Some(ended)) => {
-                        results.push((carried, ended));
-                        self.br(join);
-                    }
-                    _ => broken = true,
-                }
-            } else if !self.dead {
-                broken = true;
-                self.br(join);
-            }
+            self.arm_arrives(module, arm, value, &mut join);
             rest = next;
         }
 
@@ -2153,9 +2133,9 @@ impl Emitter {
         self.dead = false;
         self.trap(module, "dux: no `match` arm matched\n");
 
-        self.builder.position_at_end(join);
+        self.builder.position_at_end(join.block);
         self.dead = false;
-        if join.get_first_use().is_none() {
+        if join.block.get_first_use().is_none() {
             // Every arm left, so nothing reaches here.
             let _ = self.builder.build_unreachable();
             self.dead = true;
@@ -2164,19 +2144,19 @@ impl Emitter {
         if !value {
             return None;
         }
-        if broken || results.is_empty() {
+        if join.broken || join.carried.is_empty() {
             let _ = self.builder.build_unreachable();
             self.dead = true;
             return Some(Typed::error());
         }
-        let common = joined.expect("an arm gave the `match` its type");
+        let common = join.agreed.expect("an arm gave the `match` its type");
         let phi = self
             .builder
             .build_phi(common.llvm(self.context), "matchtmp")
             .ok()?;
         let mut incoming: Vec<(inkwell::values::BasicValueEnum<'static>, BasicBlock<'static>)> =
             Vec::new();
-        for (one, ended) in &results {
+        for (one, ended) in &join.carried {
             let Some(basic) = one.basic() else {
                 let _ = self.builder.build_unreachable();
                 self.dead = true;
@@ -2191,6 +2171,49 @@ impl Emitter {
                 .collect::<Vec<_>>(),
         );
         Some(typed_of(phi.as_basic_value(), common))
+    }
+
+    /// Run the arm that matched, and bring whatever it produces to the place
+    /// where the arms meet. The arm's scope is pushed and its names bound
+    /// before this runs; an arm that leaves by `return` brings nothing.
+    fn arm_arrives(
+        &mut self,
+        module: &Module<'static>,
+        arm: &dux_ast::MatchArm,
+        value: bool,
+        join: &mut Join<'static>,
+    ) {
+        let outcome = self.match_body(module, &arm.body, join.agreed);
+        let ended = self.builder.get_insert_block();
+        self.scopes.pop();
+        let Some(one) = outcome else {
+            if value && !self.dead {
+                self.unsupported(arm.span, "an arm of a value `match` that produces no value");
+                join.broken = true;
+            } else if !self.dead {
+                self.br(join.block);
+            }
+            return;
+        };
+        if self.dead {
+            return;
+        }
+        if one.ty == DuxType::Error {
+            join.broken = true;
+            self.br(join.block);
+            return;
+        }
+        if join.agreed.is_none() {
+            join.agreed = Some(one.ty);
+        }
+        let common = join.agreed.expect("the first arm gives the `match` its type");
+        match (self.convert(one, common), ended) {
+            (Some(carried), Some(ended)) => {
+                join.carried.push((carried, ended));
+                self.br(join.block);
+            }
+            _ => join.broken = true,
+        }
     }
 
     /// What an arm does. `None` says it produces no value, which a `match` used
