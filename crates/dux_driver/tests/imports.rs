@@ -143,3 +143,35 @@ fn a_module_is_searched_for_nearest_first() {
         "the directory of the file that was named answers first: {roots:?}"
     );
 }
+
+#[test]
+fn the_prelude_arrives_bare_in_every_program() {
+    let prelude = "fn shipped() -> i32 {\n    return 6\n}\n";
+    let main = "package main\n\nfn main() {\n    println(shipped())\n}\n";
+    let scratch = Scratch::new(&[("std/prelude.dux", prelude), ("main.dux", main)]);
+    let analyzed = analyze(&scratch.entry("main.dux")).expect("the program reads");
+    assert_eq!(errors(&analyzed.diagnostics), Vec::<String>::new());
+    assert!(
+        analyzed
+            .program
+            .functions()
+            .any(|function| function.name.name == "shipped"),
+        "the prelude's declarations arrive as the program's own, not under a name"
+    );
+    assert!(
+        !modules(&analyzed.program)
+            .iter()
+            .any(|(name, _)| name == "prelude"),
+        "the prelude is not a namespace"
+    );
+
+    let without = Scratch::new(&[("main.dux", main)]);
+    let missed = analyze(&without.entry("main.dux")).expect("the program reads");
+    assert!(
+        errors(&missed.diagnostics)
+            .iter()
+            .any(|message| message.contains("`shipped`")),
+        "without a prelude the name is the program's to declare: {:?}",
+        errors(&missed.diagnostics)
+    );
+}

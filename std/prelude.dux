@@ -1,0 +1,28 @@
+// The prelude: ordinary Dux, read into every program (DESIGN 3.1). `Option`
+// and `Result` are the two predeclared enums; everything else the language
+// uses through them is written here, in the language.
+
+impl Option<T> {
+    // `unwrap` stops the program when there is nothing to take, which waits on
+    // the runtime that says why. `unwrap_or` can answer today.
+    fn unwrap_or(self, fallback: T) -> T {
+        match self {
+            Some(v) => return v,
+            None => return fallback,
+        }
+    }
+
+    fn is_some(self) -> bool {
+        match self {
+            Some(_) => return true,
+            None => return false,
+        }
+    }
+
+    fn is_none(self) -> bool {
+        match self {
+            Some(_) => return false,
+            None => return true,
+        }
+    }
+}

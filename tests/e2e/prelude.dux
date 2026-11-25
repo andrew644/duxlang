@@ -1,0 +1,9 @@
+package main
+
+// `std/prelude` is read into every program, so the methods `Option` is used
+// through are ordinary Dux written in the standard library, not builtins.
+fn main() {
+    missing: Option<i32> = None
+    here: Option<i32> = Some(6)
+    println($"{} {} {}", missing.unwrap_or(4), here.unwrap_or(0), here.is_some())
+}

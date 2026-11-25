@@ -13,7 +13,7 @@ each remaining gap is waiting for. A gap is a milestone, never a verdict.
 | `memory.dux` | parses | `Vec<string>` on a call path | generics (M5), `mem.Arena` |
 | `strings.dux` | checks clean; runs until `.bytes()` | `string` methods (`.bytes()`, `.runes()`) | the standard library (M5) |
 | `sum_types.dux` | compiles, runs; variants, payloads, guards, or-patterns, ranges and exhaustiveness all reach machine code, and the dispatch is the `switch` on the tag | — |
-| `option_result.dux` | checks until `fs.read_to_string`; the predeclared `Option`/`Result` lower and match today | `std/fs`, `.bytes()`, `.trim()`, and the `Option` methods (`unwrap`, `unwrap_or`), which are prelude code | the standard library (M5) |
+| `option_result.dux` | the predeclared `Option`/`Result` lower and match today, and `std/prelude` now hands every program `unwrap_or`, `is_some` and `is_none` | `std/fs` (file reading over `extern`), `.bytes()`, `.trim()`, and `unwrap`, which stops the program (the panic runtime) |
 | `generics.dux` | checks clean; `max<i32>`, `max<f64>`, `max<i64>`, `Pair<i32, string>`, `Either<string, i32>` matched, `zeros<4>()` returning `[i32; 4]` and `sum(&[1, 2, 3])` all reach machine code | `HashMap<K, V>` and `bag.get("hp").unwrap_or(0)`, which are standard-library code (M5) |
 | `c_interop.dux` | parses | libclang importer (M6) |
 
@@ -51,11 +51,14 @@ each remaining gap is waiting for. A gap is a milestone, never a verdict.
 - **A record is matched whole.** `P { x }` names a variant, not a record: a
   `match` on a record takes a binder, a `_`, or an `else`, and destructuring a
   record through patterns is not in the design.
-- **`Option` has no methods yet, though it can have them.** `unwrap`,
-  `unwrap_or`, `map` and the rest are prelude code (DESIGN 4.5): an
-  `impl Option<T>` now checks and lowers, so what is missing is someone
-  writing it, which is the standard library's job. A call asking for a method
-  the sum type does not have stays silent for that reason.
+- **The standard library is a directory, not a build.** `std/prelude` is read
+  into every program that lives under a tree carrying one — its declarations
+  arrive bare, not under a namespace — and `$DUX_STDLIB` names the root for
+  programs elsewhere. `Option::unwrap_or`, `is_some` and `is_none` are written
+  there, in Dux, and they are the first pieces of a library that will grow a
+  piece at a time: `unwrap` stops the program, which waits on the runtime that
+  says why, and a call asking for a method a sum type does not have stays
+  silent for that reason.
 - **A module is a place names live in.** `mod gfx { … }` carries its
   declarations, `import "gfx/shapes"` reads the file beside the one that asked
   (or below it, or in `$DUX_STDLIB`), and what it declares is known as

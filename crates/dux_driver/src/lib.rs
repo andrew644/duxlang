@@ -68,6 +68,11 @@ pub fn analyze(path: &std::path::Path) -> Result<Analyzed, Failure> {
     let parsed = parse(&sources, &lexed.tokens);
     let mut program = parsed.program;
     diagnostics.extend(parsed.diagnostics);
+    // `std/prelude` is read into every program (DESIGN 3.1). Its declarations
+    // arrive bare, not under a namespace: the prelude is not a place names
+    // live in, it is the set of names every program starts with. Where it is
+    // not there, the universe scope is what the program has, as it was.
+    read_prelude(path, &mut sources, &mut program, &mut diagnostics);
     // An import brings a file in beside the one that was named, and what it
     // brings is a namespace: the declarations arrive under the name the import
     // wrote, so `import "std/math"` makes `math.sqrt` mean something.
@@ -95,6 +100,34 @@ pub fn analyze(path: &std::path::Path) -> Result<Analyzed, Failure> {
     })
 }
 
+/// `std/prelude`, spliced in as though it were written above every program's
+/// own declarations. A program outside a tree that carries a standard library
+/// simply has no prelude, which is what it had before there was one.
+fn read_prelude(
+    entry: &Path,
+    sources: &mut SourceMap,
+    program: &mut Program,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    let Some(file) = find_module(&module_roots(entry), PRELUDE) else {
+        return;
+    };
+    let Ok(text) = std::fs::read_to_string(&file) else {
+        diagnostics.push(Diagnostic::error(
+            code::SOURCE_IO,
+            format!("cannot read {}: {}", file.display(), PRELUDE),
+        ));
+        return;
+    };
+    let id = sources.add(file.display().to_string(), text);
+    let lexed = dux_lexer::lex(sources, id);
+    diagnostics.extend(lexed.diagnostics);
+    let parsed = parse(sources, &lexed.tokens);
+    diagnostics.extend(parsed.diagnostics);
+    program.imports.extend(parsed.program.imports);
+    program.decls.extend(parsed.program.decls);
+}
+
 /// Where `import "a/b"` looks: a module path is resolved against the module
 /// root — every directory above the file that was named, nearest first — and
 /// then against the standard library root, which `$DUX_STDLIB` names.
@@ -108,6 +141,9 @@ pub fn module_roots(entry: &Path) -> Vec<PathBuf> {
     }
     roots
 }
+
+/// The module every program is read on top of.
+const PRELUDE: &str = "std/prelude";
 
 fn find_module(roots: &[PathBuf], path: &str) -> Option<PathBuf> {
     roots
