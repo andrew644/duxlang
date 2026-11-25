@@ -1,8 +1,12 @@
-use dux_cinterop::{spell, CDecl, CType, Import as CImport};
+use dux_cinterop::{spell, spell_report, CDecl, CType, Import as CImport};
 
 const FIXTURES: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures");
 
 fn mini() -> Vec<CDecl> {
+    seen().decls
+}
+
+fn seen() -> dux_cinterop::Seen {
     dux_cinterop::import(&CImport {
         header: "mini.h".to_string(),
         flags: Vec::new(),
@@ -168,7 +172,7 @@ fn static_inline_reaches_the_module_through_a_wrapper() {
         text.contains("#[c_name(\"__duxw_dux_twice\")] fn dux_twice(x: c_int) -> c_int"),
         "the declaration binds to the doorway, not the private name:\n{text}"
     );
-    let source = dux_cinterop::c_source("mini.h", &decls);
+    let source = dux_cinterop::c_source(&["mini.h".to_string()], &decls);
     assert!(
         source.contains("int __duxw_dux_twice(int __p0) { return (dux_twice)(__p0); }"),
         "the wrapper is what clang compiles:\n{source}"
@@ -186,7 +190,8 @@ fn a_real_header_walks() {
         flags: Vec::new(),
         include_paths: Vec::new(),
     })
-    .expect("`time.h` parses");
+    .expect("`time.h` parses")
+    .decls;
     let time = function(&decls, "time");
     assert!(matches!(&time.params[0].1, CType::Pointer(_)));
     let spelled = spell(&decls);
@@ -207,7 +212,8 @@ fn stdio_is_variadic_and_size_t_means_usize() {
         flags: Vec::new(),
         include_paths: Vec::new(),
     })
-    .expect("`stdio.h` parses");
+    .expect("`stdio.h` parses")
+    .decls;
     let printf = function(&decls, "printf");
     assert!(printf.variadic);
     let spelled = spell(&decls);
@@ -220,4 +226,65 @@ fn stdio_is_variadic_and_size_t_means_usize() {
         !spelled.contains("struct _IO_FILE"),
         "FILE stays opaque:\n{spelled}"
     );
+}
+
+#[test]
+fn nothing_that_did_not_cross_is_quietly_waiting() {
+    let mut missed = seen().skipped;
+    missed.extend(spell_report(&mini()).1);
+    let named = |needle: &str| -> bool { missed.iter().any(|skip| skip.name == needle) };
+    assert!(named("score"), "the union is named as skipped: {missed:?}");
+    assert!(
+        missed
+            .iter()
+            .any(|skip| skip.name == "score" && skip.reason.contains("union")),
+        "and it says why: {missed:?}"
+    );
+    assert!(
+        named("DUX_DOUBLED"),
+        "a function-like macro is named, not hidden: {missed:?}"
+    );
+    assert!(
+        named("dux_counter"),
+        "a global variable is named, not hidden: {missed:?}"
+    );
+}
+
+fn hostile(header: &str, flags: Vec<String>) -> (Vec<CDecl>, Vec<dux_cinterop::Skipped>) {
+    let seen = dux_cinterop::import(&CImport {
+        header: header.to_string(),
+        flags,
+        include_paths: Vec::new(),
+    })
+    .unwrap_or_else(|failure| panic!("`{header}` must parse: {failure:?}"));
+    let (spelled, mut missed, crossed) = spell_report(&seen.decls);
+    assert!(
+        !crossed.is_empty(),
+        "`{header}` must bring something across"
+    );
+    assert!(
+        !spelled.contains("long double"),
+        "`long double` never sneaks through pretending to be `c_double`:\n{spelled}"
+    );
+    missed.extend(seen.skipped);
+    (seen.decls, missed)
+}
+
+#[test]
+fn the_hostile_headers_cross_what_they_can_and_say_what_they_cannot() {
+    for header in ["pthread.h", "time.h", "sqlite3.h", "SDL2/SDL.h", "GL/gl.h"] {
+        let (decls, missed) = hostile(header, Vec::new());
+        assert!(
+            !decls.is_empty(),
+            "`{header}` yielded no declarations at all"
+        );
+        for skip in &missed {
+            assert!(!skip.name.is_empty(), "`{header}` skipped an unnamed name");
+            assert!(
+                !skip.reason.is_empty(),
+                "`{}` was skipped without a reason",
+                skip.name
+            );
+        }
+    }
 }

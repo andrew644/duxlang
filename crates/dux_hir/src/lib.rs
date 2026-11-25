@@ -9,9 +9,7 @@
 //! annotation. Silence is the contract: no normative example may gain a
 //! diagnostic here, because `--emit=ast` and `check` run on the whole corpus.
 
-use dux_ast::{
-    Block, Decl, Expr, FnDecl, ForKind, InterpolationPart, Program, Scoped, Stmt, Type,
-};
+use dux_ast::{Block, Decl, Expr, FnDecl, ForKind, InterpolationPart, Program, Scoped, Stmt, Type};
 use dux_diag::{code, Diagnostic};
 use dux_source::Span;
 use std::collections::HashMap;
@@ -48,8 +46,8 @@ const UNIVERSE: &[&str] = &[
 ];
 
 const PRIMITIVES: &[&str] = &[
-    "bool", "byte", "i8", "i16", "i32", "i64", "isize", "u8", "u16", "u32", "u64", "usize",
-    "f32", "f64", "int", "uint", "long", "float", "rune", "char", "string", "rawptr",
+    "bool", "byte", "i8", "i16", "i32", "i64", "isize", "u8", "u16", "u32", "u64", "usize", "f32",
+    "f64", "int", "uint", "long", "float", "rune", "char", "string", "rawptr",
 ];
 
 struct Resolver<'a> {
@@ -131,7 +129,10 @@ impl<'a> Resolver<'a> {
                 ),
                 Decl::Extern(block) => {
                     for function in &block.functions {
-                        self.declare(&named(&function.name.name), Item::Callable(Callable::Opaque));
+                        self.declare(
+                            &named(&function.name.name),
+                            Item::Callable(Callable::Opaque),
+                        );
                     }
                 }
                 Decl::Struct(decl) => self.declare(&named(&decl.name.name), Item::Namespace),
@@ -188,7 +189,8 @@ impl<'a> Resolver<'a> {
             );
         }
         if let Some(return_ty) = &main.return_ty {
-            let ok = matches!(return_ty, Type::Named { name, .. } if name == "i32" || name == "i64");
+            let ok =
+                matches!(return_ty, Type::Named { name, .. } if name == "i32" || name == "i64");
             if !ok {
                 self.diagnostics.push(
                     Diagnostic::error(
@@ -268,7 +270,7 @@ impl<'a> Resolver<'a> {
             Stmt::While { cond, body, .. } => {
                 self.scopes.push(Vec::new());
                 let binders = self.condition_uses(cond);
-                    self.bind_all(binders);
+                self.bind_all(binders);
                 self.block(body);
                 self.scopes.pop();
             }
@@ -309,7 +311,7 @@ impl<'a> Resolver<'a> {
     fn condition(&mut self, cond: &Expr, then_branch: &Block) {
         self.scopes.push(Vec::new());
         let binders = self.condition_uses(cond);
-                    self.bind_all(binders);
+        self.bind_all(binders);
         for stmt in &then_branch.stmts {
             self.stmt(stmt);
         }
@@ -320,7 +322,11 @@ impl<'a> Resolver<'a> {
         match cond {
             Expr::CondBinding { pattern, value, .. } => {
                 self.expr(value);
-                pattern.binders().into_iter().map(|name| name.name).collect()
+                pattern
+                    .binders()
+                    .into_iter()
+                    .map(|name| name.name)
+                    .collect()
             }
             other => {
                 self.expr(other);
@@ -333,7 +339,13 @@ impl<'a> Resolver<'a> {
     fn arms(&mut self, arms: &[dux_ast::MatchArm]) {
         for arm in arms {
             self.scopes.push(Vec::new());
-            self.bind_all(arm.pattern.binders().into_iter().map(|name| name.name).collect());
+            self.bind_all(
+                arm.pattern
+                    .binders()
+                    .into_iter()
+                    .map(|name| name.name)
+                    .collect(),
+            );
             if let Some(guard) = &arm.guard {
                 self.expr(guard);
             }
@@ -440,7 +452,7 @@ impl<'a> Resolver<'a> {
             } => {
                 self.scopes.push(Vec::new());
                 let binders = self.condition_uses(cond);
-                    self.bind_all(binders);
+                self.bind_all(binders);
                 self.expr(then_arm);
                 self.scopes.pop();
                 if let Some(else_arm) = else_arm {
@@ -530,4 +542,3 @@ fn callee_name(callee: &Expr) -> String {
         _ => "this expression".to_string(),
     }
 }
-

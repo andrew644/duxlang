@@ -22,10 +22,7 @@ fn diagnose(source: &str) -> Vec<Diagnostic> {
 }
 
 fn codes(source: &str) -> Vec<&'static str> {
-    diagnose(source)
-        .iter()
-        .map(|d| d.code)
-        .collect()
+    diagnose(source).iter().map(|d| d.code).collect()
 }
 
 #[test]
@@ -82,7 +79,9 @@ fn a_call_that_supplies_the_wrong_number_of_arguments_is_e0112() {
         vec!["E0112"]
     );
     assert_eq!(
-        codes(&format!("{declares_add}fn main() {{\n    add(1, 2, 3)\n}}\n")),
+        codes(&format!(
+            "{declares_add}fn main() {{\n    add(1, 2, 3)\n}}\n"
+        )),
         vec!["E0112"]
     );
     assert_eq!(

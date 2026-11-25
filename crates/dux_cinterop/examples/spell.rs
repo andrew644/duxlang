@@ -1,5 +1,5 @@
 fn main() {
-    let decls = dux_cinterop::import(&dux_cinterop::Import {
+    let seen = dux_cinterop::import(&dux_cinterop::Import {
         header: std::env::args()
             .nth(1)
             .unwrap_or_else(|| "mini.h".to_string()),
@@ -9,6 +9,7 @@ fn main() {
             std::env::var("CARGO_MANIFEST_DIR").unwrap()
         )],
     })
-    .unwrap();
-    print!("{}", dux_cinterop::spell(&decls));
+    .unwrap()
+    .decls;
+    print!("{}", dux_cinterop::spell(&seen));
 }

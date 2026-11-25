@@ -13,10 +13,10 @@ use std::ffi::{c_char, c_int, c_ulong, CStr, CString};
 
 use crate::{
     CDecl, CEnum, CField, CFunction, CMacro, CStruct, CType, CTypedef, CVariable, Import,
-    MacroValue,
+    MacroValue, Seen, Skipped,
 };
 
-pub fn import(what: &Import) -> Result<Vec<CDecl>, Vec<Diagnostic>> {
+pub fn import(what: &Import) -> Result<Seen, Vec<Diagnostic>> {
     let source = format!("#include \"{header}\"\n", header = what.header);
     let main = b"dux_cinterop.c";
     let resource = resource_include();
@@ -89,15 +89,20 @@ pub fn import(what: &Import) -> Result<Vec<CDecl>, Vec<Diagnostic>> {
         let main_file = clang::clang_getFile(unit, owned[1].as_ptr());
         let root = clang::clang_getTranslationUnitCursor(unit);
         let mut seen: Vec<CDecl> = Vec::new();
+        let mut missed: Vec<Skipped> = Vec::new();
         let mut carry = Carry {
             unit,
             main_file,
             seen: &mut seen,
+            missed: &mut missed,
         };
         clang::clang_visitChildren(root, visit, &mut carry as *mut Carry as CXClientData);
         clang::clang_disposeTranslationUnit(unit);
         clang::clang_disposeIndex(index);
-        Ok(dedup(carry.seen.split_off(0)))
+        Ok(Seen {
+            decls: dedup(carry.seen.split_off(0)),
+            skipped: carry.missed.split_off(0),
+        })
     }
 }
 
@@ -105,6 +110,7 @@ struct Carry<'a> {
     unit: CXTranslationUnit,
     main_file: CXFile,
     seen: &'a mut Vec<CDecl>,
+    missed: &'a mut Vec<Skipped>,
 }
 
 extern "C" fn visit(cursor: CXCursor, _parent: CXCursor, data: CXClientData) -> CXChildVisitResult {
@@ -131,8 +137,23 @@ extern "C" fn visit(cursor: CXCursor, _parent: CXCursor, data: CXClientData) -> 
             name: named,
             ty: from_type(unsafe { clang::clang_getCursorType(cursor) }),
         })),
-        k if k == clang::CXCursor_MacroDefinition => macro_value(carry.unit, cursor, &named)
-            .map(|value| CDecl::Macro(CMacro { name: named, value })),
+        k if k == clang::CXCursor_MacroDefinition => {
+            match macro_value(carry.unit, cursor, &named) {
+                Some(value) => Some(CDecl::Macro(CMacro { name: named, value })),
+                None => {
+                    let why = if unsafe { clang::clang_Cursor_isMacroFunctionLike(cursor) } != 0 {
+                        "function-like macros are still waiting"
+                    } else {
+                        "the macro does not fold to a constant"
+                    };
+                    carry.missed.push(Skipped {
+                        name: named,
+                        reason: why.to_string(),
+                    });
+                    None
+                }
+            }
+        }
         _ => None,
     };
     if let Some(decl) = found {
@@ -538,6 +559,40 @@ fn from_type(ty: CXType) -> CType {
             from_type(unsafe { clang::clang_Type_getNamedType(ty) })
         }
         _ => {
+            // Newer clang reports some built-in and macro-made types under
+            // kind codes this binding has never heard of (glibc's `size_t`
+            // arrives as clang 19's "predefined sugar"). A canonical type
+            // asks the same question in a vocabulary everyone shares; if
+            // that answers with a different kind, read the answer.
+            let canonical = unsafe { clang::clang_getCanonicalType(ty) };
+            if canonical.kind != ty.kind {
+                let inner = from_type(canonical);
+                // The sugar had a name (`size_t` arrives this way from
+                // glibc and the compiler's own predefinitions). Keep it:
+                // the mapping table reads `size_t` and answers `usize`,
+                // and that answer is only reachable through the name.
+                let spelled = string(unsafe { clang::clang_getTypeSpelling(ty) });
+                let plain = !spelled.is_empty()
+                    && spelled
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || c == '_');
+                return if plain
+                    && spelled != string(unsafe { clang::clang_getTypeSpelling(canonical) })
+                {
+                    CType::Typedef(spelled, Box::new(inner))
+                } else {
+                    inner
+                };
+            }
+            // A typedef clang would not name through the type still has a
+            // declaration if it has one at all.
+            let decl = unsafe { clang::clang_getTypeDeclaration(ty) };
+            if unsafe { clang::clang_getCursorKind(decl) } == clang::CXCursor_TypedefDecl {
+                let name = string(unsafe { clang::clang_getCursorSpelling(decl) });
+                let underlying =
+                    from_type(unsafe { clang::clang_getTypedefDeclUnderlyingType(decl) });
+                return CType::Typedef(name, Box::new(underlying));
+            }
             let spelling = string(unsafe { clang::clang_getTypeSpelling(ty) });
             if spelling == "void" {
                 return CType::Void;

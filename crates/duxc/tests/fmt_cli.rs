@@ -48,7 +48,11 @@ fn fmt_rewrites_files_in_place_and_is_quiet_once_clean() {
 
     let run = duxc(&["fmt", "--check", file.to_str().unwrap()]);
     assert_eq!(run.code, 0, "{}", run.stderr);
-    assert!(run.stdout.contains("all 1 file(s) formatted"), "{}", run.stdout);
+    assert!(
+        run.stdout.contains("all 1 file(s) formatted"),
+        "{}",
+        run.stdout
+    );
 }
 
 #[test]
@@ -77,7 +81,10 @@ fn fmt_recurses_into_subdirectories_and_skips_foreign_files() {
         std::fs::read_to_string(nested.join("app.dux")).unwrap(),
         CANONICAL
     );
-    assert_eq!(std::fs::read_to_string(nested.join("notes.txt")).unwrap(), "  not dux  ");
+    assert_eq!(
+        std::fs::read_to_string(nested.join("notes.txt")).unwrap(),
+        "  not dux  "
+    );
 }
 
 #[test]
@@ -89,7 +96,10 @@ fn a_broken_file_fails_fmt_and_stays_untouched() {
     let run = duxc(&["fmt", file.to_str().unwrap()]);
     assert_eq!(run.code, 1);
     assert!(run.stderr.contains("E0005"), "{}", run.stderr);
-    assert_eq!(std::fs::read_to_string(&file).unwrap(), "fn main() { x := }");
+    assert_eq!(
+        std::fs::read_to_string(&file).unwrap(),
+        "fn main() { x := }"
+    );
 }
 
 #[test]

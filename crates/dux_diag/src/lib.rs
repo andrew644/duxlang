@@ -25,7 +25,6 @@ pub mod code {
     pub const CODEGEN_FAILED: &str = "E0902";
 }
 
-
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 pub enum Severity {
     Error,
@@ -129,9 +128,7 @@ pub fn render(sources: &SourceMap, diagnostic: &Diagnostic) -> String {
 }
 
 pub fn has_errors(diagnostics: &[Diagnostic]) -> bool {
-    diagnostics
-        .iter()
-        .any(|d| d.severity == Severity::Error)
+    diagnostics.iter().any(|d| d.severity == Severity::Error)
 }
 
 #[cfg(test)]
@@ -143,10 +140,13 @@ mod tests {
     fn renders_location_snippet_and_caret() {
         let mut sources = SourceMap::new();
         let file = sources.add("app.dux", "fn main() { nope }");
-        let diagnostic = Diagnostic::error("E0001", "unexpected token")
-            .with_span(Span::new(file, 12, 4));
+        let diagnostic =
+            Diagnostic::error("E0001", "unexpected token").with_span(Span::new(file, 12, 4));
         let rendered = render(&sources, &diagnostic);
-        assert!(rendered.starts_with("app.dux:1:13: error[E0001]: unexpected token"), "{rendered}");
+        assert!(
+            rendered.starts_with("app.dux:1:13: error[E0001]: unexpected token"),
+            "{rendered}"
+        );
         assert!(rendered.contains("fn main() { nope }"), "{rendered}");
         assert!(rendered.contains("^^^^"), "{rendered}");
     }
@@ -154,9 +154,13 @@ mod tests {
     #[test]
     fn renders_spanless_diagnostic() {
         let sources = SourceMap::new();
-        let diagnostic = Diagnostic::error("E0100", "no main function").with_note("expected `fn main()`");
+        let diagnostic =
+            Diagnostic::error("E0100", "no main function").with_note("expected `fn main()`");
         let rendered = render(&sources, &diagnostic);
-        assert_eq!(rendered, "error[E0100]: no main function\n  = expected `fn main()`");
+        assert_eq!(
+            rendered,
+            "error[E0100]: no main function\n  = expected `fn main()`"
+        );
     }
 
     #[test]

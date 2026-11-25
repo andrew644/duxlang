@@ -9,6 +9,24 @@ use crate::{wrapper_name, CDecl, CEnum, CFunction, CStruct, CType, CTypedef, Mac
 /// table cannot cross today is left out, silently for now and loudly for
 /// `dux cimports` later; nothing half-mapped sneaks through.
 pub fn spell(decls: &[CDecl]) -> String {
+    spell_report(decls).0
+}
+
+/// Spell the namespace and name everything that did not cross. The names
+/// here are the whole point of `dux cimports`: a header is a negotiation,
+/// and the program deserves to know what it lost.
+pub fn spell_report(decls: &[CDecl]) -> (String, Vec<crate::Skipped>, Vec<String>) {
+    let mut missed: Vec<crate::Skipped> = Vec::new();
+    let mut crossed: Vec<String> = Vec::new();
+    let text = spell_with(decls, &mut missed, &mut crossed);
+    (text, missed, crossed)
+}
+
+fn spell_with(
+    decls: &[CDecl],
+    missed: &mut Vec<crate::Skipped>,
+    crossed: &mut Vec<String>,
+) -> String {
     let mut out = String::new();
     let mut externals: Vec<&CFunction> = Vec::new();
     let mut types: Vec<(String, String)> = Vec::new();
@@ -22,13 +40,38 @@ pub fn spell(decls: &[CDecl]) -> String {
                 emitted.insert(function.name.clone());
             }
             CDecl::Struct(record) => {
+                if ctx.opaque.contains(&record.name) {
+                    missed.push(crate::Skipped {
+                        name: record.name.clone(),
+                        reason: "record body stays behind: a field does not cross".to_string(),
+                    });
+                } else if record.union {
+                    missed.push(crate::Skipped {
+                        name: record.name.clone(),
+                        reason: "unions are still waiting".to_string(),
+                    });
+                }
                 if let Some(text) = spell_struct(&ctx, record) {
                     keep(&mut emitted, &mut types, record.name.clone(), text);
+                } else if !record.union && !ctx.opaque.contains(&record.name) {
+                    missed.push(crate::Skipped {
+                        name: record.name.clone(),
+                        reason: if is_plain_name(&record.name) {
+                            "a field cannot be spelled".to_string()
+                        } else {
+                            "anonymous records stay unnamed".to_string()
+                        },
+                    });
                 }
             }
             CDecl::Typedef(definition) => {
                 if let Some(text) = spell_typedef(&ctx, definition) {
                     keep(&mut emitted, &mut types, safe(&definition.name), text);
+                } else if !is_exact_width(&definition.name) {
+                    missed.push(crate::Skipped {
+                        name: definition.name.clone(),
+                        reason: "the typedef's target has no Dux shape".to_string(),
+                    });
                 }
             }
             CDecl::Enum(enumeration) => {
@@ -44,7 +87,12 @@ pub fn spell(decls: &[CDecl]) -> String {
                     );
                 }
             }
-            CDecl::Variable(_) => {}
+            CDecl::Variable(global) => {
+                missed.push(crate::Skipped {
+                    name: global.name.clone(),
+                    reason: "global variables are still waiting".to_string(),
+                });
+            }
             CDecl::Macro(macro_value) => {
                 if let Some(text) = spell_macro(macro_value) {
                     keep(&mut emitted, &mut constants, macro_value.name.clone(), text);
@@ -52,7 +100,8 @@ pub fn spell(decls: &[CDecl]) -> String {
             }
         }
     }
-    for (_, text) in types {
+    for (name, text) in types {
+        crossed.push(name);
         out.push_str(&text);
         out.push('\n');
     }
@@ -60,6 +109,10 @@ pub fn spell(decls: &[CDecl]) -> String {
         out.push_str("extern \"C\" {\n");
         for function in externals {
             let Some(text) = spell_function(&ctx, function) else {
+                missed.push(crate::Skipped {
+                    name: function.name.clone(),
+                    reason: "the signature has no Dux spelling".to_string(),
+                });
                 continue;
             };
             // A `static inline` definition is called through the wrapper
@@ -68,18 +121,30 @@ pub fn spell(decls: &[CDecl]) -> String {
             let text = if function.header_definition {
                 match wrapper_name(function) {
                     Some(wrapper) => format!("#[c_name(\"{wrapper}\")] {text}"),
-                    None => continue,
+                    None => {
+                        missed.push(crate::Skipped {
+                            name: function.name.clone(),
+                            reason: if function.variadic {
+                                "a variadic `static inline` cannot be wrapped".to_string()
+                            } else {
+                                "a header definition's types cannot cross".to_string()
+                            },
+                        });
+                        continue;
+                    }
                 }
             } else {
                 text
             };
+            crossed.push(function.name.clone());
             out.push_str("    ");
             out.push_str(&text);
             out.push('\n');
         }
         out.push_str("}\n\n");
     }
-    for (_, text) in constants {
+    for (name, text) in constants {
+        crossed.push(name);
         out.push_str(&text);
         out.push('\n');
     }
@@ -117,6 +182,8 @@ fn is_exact_width(name: &str) -> bool {
             | "uint64_t"
             | "size_t"
             | "ssize_t"
+            | "__size_t"
+            | "__ssize_t"
             | "ptrdiff_t"
             | "intptr_t"
             | "uintptr_t"
@@ -133,8 +200,8 @@ fn exact_width(name: &str) -> Option<&'static str> {
         "uint16_t" => "u16",
         "uint32_t" => "u32",
         "uint64_t" => "u64",
-        "size_t" | "uintptr_t" => "usize",
-        "ssize_t" | "ptrdiff_t" | "intptr_t" => "isize",
+        "size_t" | "uintptr_t" | "__size_t" => "usize",
+        "ssize_t" | "ptrdiff_t" | "intptr_t" | "__ssize_t" => "isize",
         _ => return None,
     })
 }

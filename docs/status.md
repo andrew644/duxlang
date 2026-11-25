@@ -15,7 +15,7 @@ each remaining gap is waiting for. A gap is a milestone, never a verdict.
 | `sum_types.dux` | compiles, runs; variants, payloads, guards, or-patterns, ranges and exhaustiveness all reach machine code, and the dispatch is the `switch` on the tag | — |
 | `option_result.dux` | the predeclared `Option`/`Result` lower and match today, and `std/prelude` now hands every program `unwrap_or`, `is_some` and `is_none` | `std/fs` (file reading over `extern`), `.bytes()`, `.trim()`, and `unwrap`, which stops the program (the panic runtime) |
 | `generics.dux` | compiles, runs — `max<i32>`, `Pair<i32, string>`, `Either<string, i32>` matched, `zeros<4>()`, `sum(&[1, 2, 3])`, and `HashMap<string, i32>` with `insert`, `get(..).unwrap_or(..)` and `len`, the table and the method being prelude Dux | — |
-| `c_interop.dux` | parses and checks today — the hand-written half runs (`extern "C"`, distinct `c_long` and `c_int`, `#[c_name]`, varargs, `std/c`), and `#[c_include]` now really reads: `stdio.h`, `time.h` and `stb_image.h` fill their namespaces through libclang, `#[c_link]` and `#[c_pkgconfig]` reach the linker | the translation unit compiled with clang (`static inline` and header-only definitions, M6), `c_long_double` |
+| `c_interop.dux` | compiles and runs, every line of it: `stdio.h`, `string.h`, `stdlib.h`, `time.h` and a header-only `stb_image.h` fill their namespaces through libclang, the `time.h` namespace is a second `mod` with its own `tm` record, the compiled translation unit carries the definitions `static inline` headers promise, `#[c_link]` and `#[c_pkgconfig]` reach the link line, and the hand-written `#[c_name]` extern finds its symbol in a header the program named | `c_long_double`, the owned-copy `to_cstr`, function-like macros and global variables (all reported by `duxc cimports`, none silent) |
 
 ## Deliberate runtime gaps today
 
@@ -78,13 +78,31 @@ each remaining gap is waiting for. A gap is a milestone, never a verdict.
   C `T *` arrives as "maybe nothing" with no wrapping tax.
   `#[c_name("symbol")]` fixes a link name in place, two declarations of one
   symbol share one function, and `std/c` turns C text into a `string` with
-  `to_string` and `to_string_lossy`. The importer (`#[c_include]`), the
-  owned-copy `to_cstr`, and `c_long_double` are still M6 ahead.
+  `to_string` and `to_string_lossy`. What waits: the owned-copy `to_cstr`,
+  and `c_long_double`, which is a different size on every ABI and wants the
+  importer's own target table.
+- **A header is a module of the program.** `#[c_include("time.h")] mod
+  ctime;` hands the name to libclang, walks the declarations in the order the
+  preprocessed header presents them, and spells them as Dux text — which the
+  normal parser then parses, so the importer's output is ordinary source and
+  the checker knows nothing special about it. `typedef` chains resolve to
+  exact widths (`size_t` is `usize` because the mapping table says so, not
+  because the platform agrees today), C enums arrive with the integer type
+  clang assigned them, and a record whose fields cannot all cross — a union
+  member, a function pointer, a bitfield — keeps its name and promises only
+  pointers, which is exactly what an opaque forward declaration promised.
+  Named headers are also *compiled*: clang lowers each one to bitcode at its
+  optimization level and the module links into the program, so `static
+  inline` definitions and header-only libraries need nothing but the include.
+  `duxc cimports file.dux [--json]` answers what crossed and names everything
+  the header kept back — function-like macros, global variables, nonconstant
+  macros — with a reason each. What waits on later passes: `c_long_double`,
+  function-like macro calls, and the `std/fs`-style conveniences built on top.
 - **A library is named by the declaration that needs it.** `#[link(name = "m")]
   extern "C" { fn sqrtf(x: f32) -> f32 }` is how `std/math` says where its
   symbol lives, and the link line carries `-l m` because of it. A name a C
   header owns and a namespace wants for something else (`sqrt` for `f64` and
-  `f32` both) waits on `#[c_name]` (M6).
+  `f32` both) is what `#[c_name("sqrtf")]` was built for.
 - **A module is a place names live in.** `mod gfx { … }` carries its
   declarations, `import "gfx/shapes"` reads the file beside the one that asked
   (or below it, or in `$DUX_STDLIB`), and what it declares is known as

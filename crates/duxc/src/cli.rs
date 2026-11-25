@@ -13,6 +13,7 @@ COMMANDS:
     build <file>      compile and link an executable
     run <file>        compile, link and execute, forwarding program arguments
     fmt [paths]       rewrite .dux files in their canonical form (drops comments)
+    cimports <file>   report what the C importer saw, and everything it left out
 
 OPTIONS:
     -o <path>         write the result to <path>
@@ -23,6 +24,7 @@ OPTIONS:
     --emit=obj        keep the object file
     --emit=exe        link an executable (default)
     --check           with fmt: report unformatted files, change nothing
+    --json            with cimports: machine-readable report
     --help            show this message
 ";
 
@@ -38,7 +40,9 @@ pub enum Emit {
 pub enum Command {
     Version,
     Help,
-    Check { file: PathBuf },
+    Check {
+        file: PathBuf,
+    },
     Build {
         file: PathBuf,
         out: Option<PathBuf>,
@@ -55,6 +59,10 @@ pub enum Command {
     Fmt {
         paths: Vec<PathBuf>,
         check: bool,
+    },
+    Cimports {
+        file: PathBuf,
+        json: bool,
     },
 }
 
@@ -188,6 +196,24 @@ pub fn parse<I: IntoIterator<Item = OsString>>(argv: I) -> Result<Command, Usage
             }
             Ok(Command::Fmt { paths, check })
         }
+        "cimports" => {
+            let mut file = None;
+            let mut json = false;
+            for arg in rest {
+                match arg.as_str() {
+                    "--json" => json = true,
+                    "--help" | "-h" => return Ok(Command::Help),
+                    other if other.starts_with('-') && other.len() > 1 => {
+                        return Err(UsageError::ExpectedOption(other.to_string()))
+                    }
+                    other => file = Some(PathBuf::from(other)),
+                }
+            }
+            Ok(Command::Cimports {
+                file: file.ok_or(UsageError::MissingFile("cimports"))?,
+                json,
+            })
+        }
         other => Err(UsageError::UnknownCommand(other.to_string())),
     }
 }
@@ -199,7 +225,10 @@ fn file_arg(rest: &[String]) -> Result<PathBuf, UsageError> {
 }
 
 fn value(rest: &[String], index: &mut usize, option: &str) -> Result<String, UsageError> {
-    let taken = rest.get(*index).cloned().ok_or(UsageError::MissingValue(option.to_string()))?;
+    let taken = rest
+        .get(*index)
+        .cloned()
+        .ok_or(UsageError::MissingValue(option.to_string()))?;
     *index += 1;
     Ok(taken)
 }
@@ -253,7 +282,14 @@ mod tests {
     #[test]
     fn build_options_are_parsed_in_any_order() {
         assert_eq!(
-            parse(argv(&["build", "app.dux", "--release", "-o", "out/app", "--emit=obj"])),
+            parse(argv(&[
+                "build",
+                "app.dux",
+                "--release",
+                "-o",
+                "out/app",
+                "--emit=obj"
+            ])),
             Ok(Command::Build {
                 file: PathBuf::from("app.dux"),
                 out: Some(PathBuf::from("out/app")),
@@ -276,7 +312,9 @@ mod tests {
                 emit: Emit::Exe,
             }
         );
-        let Command::Build { out_dir, .. } = parse(argv(&["build", "a.dux", "--out-dir", "tmp"])).unwrap() else {
+        let Command::Build { out_dir, .. } =
+            parse(argv(&["build", "a.dux", "--out-dir", "tmp"])).unwrap()
+        else {
             panic!("expected build");
         };
         assert_eq!(out_dir, PathBuf::from("tmp"));
@@ -290,6 +328,28 @@ mod tests {
         };
         assert_eq!(file, PathBuf::from("app.dux"));
         assert_eq!(args, vec!["-x", "--release", "tail"]);
+    }
+
+    #[test]
+    fn cimports_takes_a_file_and_an_offering_of_json() {
+        assert_eq!(
+            parse(argv(&["cimports", "app.dux"])),
+            Ok(Command::Cimports {
+                file: PathBuf::from("app.dux"),
+                json: false,
+            })
+        );
+        assert_eq!(
+            parse(argv(&["cimports", "app.dux", "--json"])),
+            Ok(Command::Cimports {
+                file: PathBuf::from("app.dux"),
+                json: true,
+            })
+        );
+        assert_eq!(
+            parse(argv(&["cimports"])),
+            Err(UsageError::MissingFile("cimports"))
+        );
     }
 
     #[test]

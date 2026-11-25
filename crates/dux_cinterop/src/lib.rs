@@ -15,9 +15,24 @@ mod spell;
 mod unit;
 mod walk;
 
-pub use spell::spell;
+pub use spell::{spell, spell_report};
 pub use unit::{c_source, wrapper_name};
 pub use walk::import;
+
+/// A name the boundary could not carry, and why. This is what
+/// `dux cimports` reads out: nothing is quietly waiting.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Skipped {
+    pub name: String,
+    pub reason: String,
+}
+
+/// What a header left behind: the declarations that crossed and the names
+/// that did not, each skip with the reason it did not.
+pub struct Seen {
+    pub decls: Vec<CDecl>,
+    pub skipped: Vec<Skipped>,
+}
 
 /// A C type, as clang saw it. `Typedef` keeps the name the program will use
 /// and the type underneath, because the mapping table treats `int32_t` and

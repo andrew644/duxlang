@@ -63,7 +63,9 @@ impl Runtime {
         alloc.set_linkage(Linkage::Internal);
         let free = module.add_function(
             "dux.runtime.free",
-            context.void_type().fn_type(&[ptr.into(), ptr.into()], false),
+            context
+                .void_type()
+                .fn_type(&[ptr.into(), ptr.into()], false),
             None,
         );
         free.set_linkage(Linkage::Internal);
@@ -72,11 +74,7 @@ impl Runtime {
         // should not carry globals it never touches.
         let live = debug.then(|| counter(context, module, "dux.runtime.live"));
         let bytes = debug.then(|| counter(context, module, "dux.runtime.bytes"));
-        let malloc = declare(
-            module,
-            "malloc",
-            ptr.fn_type(&[i64_type.into()], false),
-        );
+        let malloc = declare(module, "malloc", ptr.fn_type(&[i64_type.into()], false));
         let libc_free = declare(
             module,
             "free",
@@ -203,7 +201,12 @@ impl HashRuntime {
         walked.add_incoming(&[(&i64_type.const_zero(), entry)]);
         at.add_incoming(&[(&data, entry)]);
         let more = builder
-            .build_int_compare(IntPredicate::ULT, walked.as_basic_value().into_int_value(), len, "more")
+            .build_int_compare(
+                IntPredicate::ULT,
+                walked.as_basic_value().into_int_value(),
+                len,
+                "more",
+            )
             .expect("more");
         let _ = builder.build_conditional_branch(more, body, done);
 
@@ -572,14 +575,14 @@ fn write_stderr(
         .expect("message")
         .as_pointer_value();
     let stderr = stream(context, module, builder, "stderr");
-    let _ = builder.build_call(fputs(context, module), &[text.into(), stderr.into()], "report");
+    let _ = builder.build_call(
+        fputs(context, module),
+        &[text.into(), stderr.into()],
+        "report",
+    );
 }
 
-fn abort(
-    context: &'static Context,
-    module: &Module<'static>,
-    builder: &Builder<'static>,
-) {
+fn abort(context: &'static Context, module: &Module<'static>, builder: &Builder<'static>) {
     let code = context.i32_type().const_int(2, false);
     let _ = builder.build_call(exit_fn(context, module), &[code.into()], "abort");
     let _ = builder.build_unreachable();
@@ -645,10 +648,7 @@ fn fputs(context: &'static Context, module: &Module<'static>) -> FunctionValue<'
     )
 }
 
-fn fprintf(
-    context: &'static Context,
-    module: &Module<'static>,
-) -> FunctionValue<'static> {
+fn fprintf(context: &'static Context, module: &Module<'static>) -> FunctionValue<'static> {
     let ptr = context.ptr_type(AddressSpace::default());
     declare(
         module,
@@ -657,13 +657,12 @@ fn fprintf(
     )
 }
 
-fn exit_fn(
-    context: &'static Context,
-    module: &Module<'static>,
-) -> FunctionValue<'static> {
+fn exit_fn(context: &'static Context, module: &Module<'static>) -> FunctionValue<'static> {
     declare(
         module,
         "exit",
-        context.void_type().fn_type(&[context.i32_type().into()], false),
+        context
+            .void_type()
+            .fn_type(&[context.i32_type().into()], false),
     )
 }

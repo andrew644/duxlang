@@ -19,6 +19,19 @@ pub struct Analyzed {
     pub diagnostics: Vec<Diagnostic>,
     /// The C translation units the program asked for, ready to compile.
     pub c_units: Vec<CUnit>,
+    /// What each `#[c_include]` namespace became: the names that crossed
+    /// and the names that did not, with the reason each one did not.
+    pub c_namespaces: Vec<CNamespace>,
+}
+
+/// One `#[c_include]` namespace, as the reader saw it. This is what
+/// `dux cimports` reads out.
+#[derive(Debug)]
+pub struct CNamespace {
+    pub namespace: String,
+    pub header: String,
+    pub crossed: Vec<String>,
+    pub skipped: Vec<dux_cinterop::Skipped>,
 }
 
 /// One `#[c_include]` namespace's translation unit: the source (include
@@ -26,7 +39,7 @@ pub struct Analyzed {
 /// everything the compiler needs to make bitcode of it.
 #[derive(Clone, Debug)]
 pub struct CUnit {
-    pub header: String,
+    pub headers: Vec<String>,
     pub source: String,
     pub flags: Vec<String>,
     pub include_paths: Vec<String>,
@@ -95,7 +108,14 @@ pub fn analyze(path: &std::path::Path) -> Result<Analyzed, Failure> {
     // header is read here, once, and the namespace fills with the Dux
     // declarations the mapping table writes. From this point the importer's
     // output travels the same road as any other module body, because it is.
-    let c_units = fill_c_modules(path, &mut sources, &mut program, &mut diagnostics);
+    let mut c_namespaces = Vec::new();
+    let c_units = fill_c_modules(
+        path,
+        &mut sources,
+        &mut program,
+        &mut diagnostics,
+        &mut c_namespaces,
+    );
     let syntax_clean = diagnostics
         .iter()
         .all(|d| d.severity != Severity::Error || d.code == code::UNSUPPORTED_IN_BUILD);
@@ -116,7 +136,14 @@ pub fn analyze(path: &std::path::Path) -> Result<Analyzed, Failure> {
         program,
         diagnostics,
         c_units,
+        c_namespaces,
     })
+}
+
+/// What the program's C imports saw, without compiling anything. The road
+/// runs the same analysis the build runs; only the report differs.
+pub fn cimports(path: &Path) -> Result<Vec<CNamespace>, Failure> {
+    Ok(analyze(path)?.c_namespaces)
 }
 
 /// `std/prelude`, spliced in as though it were written above every program's
@@ -483,19 +510,22 @@ fn build_c_bitcode(units: &[CUnit], out_dir: &Path) -> Result<Vec<PathBuf>, Fail
             }
         };
         mix(unit.source.as_bytes());
+        for header in &unit.headers {
+            mix(header.as_bytes());
+        }
         mix(version.as_bytes());
-        mix(unit.header.as_bytes());
         for part in unit.flags.iter().chain(unit.include_paths.iter()) {
             mix(part.as_bytes());
         }
-        // The header the source names, if it is a file on disk: an edit to
-        // a project header misses the cache; a system header is the
+        // Every header the source names, if it is a file on disk: an edit
+        // to a project header misses the cache; a system header is the
         // toolchain's own business (and its version is in the hash).
         for dir in &unit.include_paths {
-            let file = PathBuf::from(dir).join(&unit.header);
-            if let Ok(text) = std::fs::read(&file) {
-                mix(&text);
-                break;
+            for header in &unit.headers {
+                let file = PathBuf::from(dir).join(header);
+                if let Ok(text) = std::fs::read(&file) {
+                    mix(&text);
+                }
             }
         }
         let bitcode = cache.join(format!("{hash:016x}.bc"));
@@ -519,7 +549,10 @@ fn build_c_bitcode(units: &[CUnit], out_dir: &Path) -> Result<Vec<PathBuf>, Fail
             .map_err(|e| {
                 Failure::bare(vec![Diagnostic::error(
                     code::LINK_FAILED,
-                    format!("cannot run `{compiler}` for `{}`: {e}", unit.header),
+                    format!(
+                        "cannot run `{compiler}` for `{}`: {e}",
+                        unit.headers.join(", ")
+                    ),
                 )])
             })?;
         if !output.status.success() {
@@ -527,7 +560,7 @@ fn build_c_bitcode(units: &[CUnit], out_dir: &Path) -> Result<Vec<PathBuf>, Fail
                 code::LINK_FAILED,
                 format!(
                     "`{compiler}` could not compile `{}`: {}",
-                    unit.header,
+                    unit.headers.join(", "),
                     String::from_utf8_lossy(&output.stderr).trim()
                 ),
             )]));
@@ -632,14 +665,17 @@ fn pkg_config(package: &str, mode: &str) -> Result<Vec<String>, Diagnostic> {
 
 /// Every `#[c_include]` namespace in the program, filled with the Dux the
 /// C mapping table writes for its header.
+#[allow(clippy::too_many_arguments)]
 fn fill_c_modules(
     entry: &Path,
     sources: &mut SourceMap,
     program: &mut Program,
     diagnostics: &mut Vec<Diagnostic>,
+    namespaces: &mut Vec<CNamespace>,
 ) -> Vec<CUnit> {
     let home = entry
         .parent()
+        .filter(|dir| !dir.as_os_str().is_empty())
         .map(|dir| dir.to_path_buf())
         .unwrap_or_else(|| PathBuf::from("."));
     let mut units: Vec<CUnit> = Vec::new();
@@ -647,15 +683,16 @@ fn fill_c_modules(
         let Decl::Module(module) = decl else {
             continue;
         };
-        let header = module
+        let headers: Vec<String> = module
             .attributes
             .iter()
-            .find(|attribute| attribute.name == "c_include")
-            .and_then(|attribute| attribute.string_argument())
-            .map(|header| header.to_string());
-        let Some(header) = header else {
+            .filter(|attribute| attribute.name == "c_include")
+            .filter_map(|attribute| attribute.string_argument())
+            .map(|header| header.to_string())
+            .collect();
+        if headers.is_empty() {
             continue;
-        };
+        }
         let mut flags: Vec<String> = module
             .attributes
             .iter()
@@ -683,29 +720,57 @@ fn fill_c_modules(
                 Err(diagnostic) => diagnostics.push(diagnostic),
             }
         }
-        let request = dux_cinterop::Import {
-            header: header.clone(),
+        // Each header is read on its own, but the namespace speaks with
+        // one voice: declarations that two headers both declare are kept
+        // once, the whole namespace is spelled once, and the translation
+        // unit that carries the definitions includes all of them.
+        let mut declarations: Vec<dux_cinterop::CDecl> = Vec::new();
+        let mut missed: Vec<dux_cinterop::Skipped> = Vec::new();
+        for header in &headers {
+            let request = dux_cinterop::Import {
+                header: header.clone(),
+                flags: flags.clone(),
+                include_paths: include_paths.clone(),
+            };
+            match dux_cinterop::import(&request) {
+                Ok(seen) => {
+                    for declaration in seen.decls {
+                        let clash = declarations.iter().any(|other| {
+                            std::mem::discriminant(other) == std::mem::discriminant(&declaration)
+                                && other.name() == declaration.name()
+                        });
+                        if !clash {
+                            declarations.push(declaration);
+                        }
+                    }
+                    missed.extend(seen.skipped);
+                }
+                Err(failure) => diagnostics.extend(failure),
+            }
+        }
+        let (text, unspellable, mut crossed) = dux_cinterop::spell_report(&declarations);
+        missed.extend(unspellable);
+        missed.sort_by(|one, other| one.name.cmp(&other.name));
+        missed.dedup();
+        crossed.sort();
+        namespaces.push(CNamespace {
+            namespace: module.name.name.clone(),
+            header: headers.join(", "),
+            crossed,
+            skipped: missed,
+        });
+        let id = sources.add(format!("<c_import {}>", headers.join(", ")), text);
+        let lexed = dux_lexer::lex(sources, id);
+        diagnostics.extend(lexed.diagnostics);
+        let parsed = parse(sources, &lexed.tokens);
+        diagnostics.extend(parsed.diagnostics);
+        module.decls = parsed.program.decls;
+        units.push(CUnit {
+            source: dux_cinterop::c_source(&headers, &declarations),
+            headers,
             flags,
             include_paths,
-        };
-        match dux_cinterop::import(&request) {
-            Ok(declarations) => {
-                let text = dux_cinterop::spell(&declarations);
-                let id = sources.add(format!("<c_import {header}>"), text);
-                let lexed = dux_lexer::lex(sources, id);
-                diagnostics.extend(lexed.diagnostics);
-                let parsed = parse(sources, &lexed.tokens);
-                diagnostics.extend(parsed.diagnostics);
-                module.decls = parsed.program.decls;
-                units.push(CUnit {
-                    source: dux_cinterop::c_source(&header, &declarations),
-                    header: request.header,
-                    flags: request.flags,
-                    include_paths: request.include_paths,
-                });
-            }
-            Err(failure) => diagnostics.extend(failure),
-        }
+        });
     }
     units
 }

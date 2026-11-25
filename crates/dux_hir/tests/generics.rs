@@ -51,10 +51,7 @@ fn reported(source: &str) -> Vec<Diagnostic> {
 }
 
 fn codes(source: &str) -> Vec<&'static str> {
-    diagnose(source)
-        .iter()
-        .map(|d| d.code)
-        .collect::<Vec<_>>()
+    diagnose(source).iter().map(|d| d.code).collect::<Vec<_>>()
 }
 
 fn said(source: &str) -> Vec<String> {
@@ -74,9 +71,7 @@ fn a_generic_function_reads_its_arguments_to_know_what_it_returns() {
         "`max(3, 7)` is `max<i32>`, and the body's `>` works on `i32`"
     );
     assert_eq!(
-        codes(&format!(
-            "{MAX}fn main() {{ narrow: i16 = max(3, 7) }}"
-        )),
+        codes(&format!("{MAX}fn main() {{ narrow: i16 = max(3, 7) }}")),
         vec![dux_diag::code::LOSSY_CONVERSION],
         "the answer is an `i32`, which is what the call said and not what the binding asks"
     );
@@ -90,9 +85,7 @@ fn a_type_argument_written_out_stands_over_the_arguments() {
         )),
         Vec::<&str>::new()
     );
-    let said = said(&format!(
-        "{MAX}fn main() {{ max<string>(\"a\", \"b\") }}"
-    ));
+    let said = said(&format!("{MAX}fn main() {{ max<string>(\"a\", \"b\") }}"));
     assert_eq!(
         said.len(),
         1,
@@ -358,4 +351,3 @@ fn a_method_of_a_generic_sum_type_sees_what_its_receiver_said() {
         "the receiver says `T` is `string`, and the argument has to fit that: {wrong:?}"
     );
 }
-

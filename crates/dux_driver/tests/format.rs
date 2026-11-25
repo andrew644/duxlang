@@ -70,7 +70,10 @@ fn every_formatable_example_survives_a_format_round_trip() {
         "sum_types.dux",
         "generics.dux",
     ] {
-        assert!(formatted.contains(&must_format.to_string()), "{must_format} must format");
+        assert!(
+            formatted.contains(&must_format.to_string()),
+            "{must_format} must format"
+        );
     }
     assert!(
         rejected.contains(&"types.dux".to_string()),

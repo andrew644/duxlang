@@ -143,10 +143,7 @@ fn main() {
         message.contains("not exhaustive") && message.contains("`Shape::Rect`"),
         "{message}"
     );
-    let at = found[0]
-        .span
-        .expect("the fault carries a span")
-        .start as usize;
+    let at = found[0].span.expect("the fault carries a span").start as usize;
     assert_eq!(
         &source[at..at + 5],
         "match",
@@ -329,9 +326,8 @@ fn main() {
         CLEAN
     );
     assert_eq!(
-        names_and_types(
-            &with_sums(
-                "fn area(shape: Shape) -> f32 {
+        names_and_types(&with_sums(
+            "fn area(shape: Shape) -> f32 {
     match shape {
         Shape::Circle(r) => { r * r },
         Shape::Rect { w, h } => { w * h },
@@ -342,8 +338,7 @@ fn main() {
 fn main() {
     println($\"{}\", area(Shape::Empty))
 }"
-            )
-        ),
+        )),
         vec![dux_diag::code::UNDECLARED]
     );
     assert_eq!(

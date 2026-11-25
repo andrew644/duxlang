@@ -8,11 +8,19 @@ import "std/c"
 // functions and header-only libraries are usable, not skipped.
 
 #[c_include("stdio.h")]
+#[c_include("string.h")]
+#[c_include("stdlib.h")]
 #[c_link("c")]
 mod cs;
 
 #[c_include("time.h")]
 mod ctime;
+
+// The header behind the hand-written `glm_vec3_scale` declaration below:
+// a plain C definition the compiled translation unit carries into the
+// program. One `#include`, no library.
+#[c_include("glite.h")]
+mod gl;
 
 // Header-only library: the define selects the one translation unit that emits
 // the definitions, exactly as it does in C.
@@ -49,7 +57,7 @@ fn main() {
     f: Option<*cs.FILE> = cs.fopen(c"slot.txt", c"w")
     match f {
         Some(h) => {
-            cs.fprintf(h, c"saved at {} seconds\n", secs)     // varargs, callable directly
+            cs.fprintf(h, c"saved at %ld seconds\n", secs)     // varargs, callable directly
             closed := cs.fclose(h)
             println($"slot saved, close said {}", closed)
         }

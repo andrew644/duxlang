@@ -41,10 +41,13 @@ fn codes(source: &str) -> Vec<&'static str> {
 
 #[test]
 fn a_declaration_is_known_by_where_its_module_says() {
-    let program = format!(
-        "{MATH}fn main() {{\n    println($\"{{}}\", math.square(3))\n}}"
+    let program = format!("{MATH}fn main() {{\n    println($\"{{}}\", math.square(3))\n}}");
+    assert_eq!(
+        codes(&program),
+        Vec::<&str>::new(),
+        "one call through the module it lives in: {:?}",
+        reported(&program)
     );
-    assert_eq!(codes(&program), Vec::<&str>::new(), "one call through the module it lives in: {:?}", reported(&program));
 }
 
 #[test]
@@ -100,9 +103,17 @@ fn main() {
     s := shape.Size { w: 3 }
     println($\"{}\", shape.area(s))
 }";
-    assert_eq!(codes(program), Vec::<&str>::new(), "{:?}", reported(program));
+    assert_eq!(
+        codes(program),
+        Vec::<&str>::new(),
+        "{:?}",
+        reported(program)
+    );
 
-    let wrong = program.replace("println($\"{}\", shape.area(s))", "println($\"{}\", shape.area(shape.Size { w: \"three\" }))");
+    let wrong = program.replace(
+        "println($\"{}\", shape.area(s))",
+        "println($\"{}\", shape.area(shape.Size { w: \"three\" }))",
+    );
     assert_eq!(
         codes(&wrong),
         vec![dux_diag::code::TYPE_MISMATCH],
@@ -122,8 +133,16 @@ fn a_generic_function_lives_where_it_was_written() {
 fn main() {
     println($\"{}\", picks.bigger(3, 9))
 }";
-    assert_eq!(codes(program), Vec::<&str>::new(), "{:?}", reported(program));
+    assert_eq!(
+        codes(program),
+        Vec::<&str>::new(),
+        "{:?}",
+        reported(program)
+    );
 
     let wrong = program.replace("picks.bigger(3, 9)", "picks.bigger(3, \"nine\")");
-    assert!(!codes(&wrong).is_empty(), "the arguments of one instantiation still have to agree");
+    assert!(
+        !codes(&wrong).is_empty(),
+        "the arguments of one instantiation still have to agree"
+    );
 }

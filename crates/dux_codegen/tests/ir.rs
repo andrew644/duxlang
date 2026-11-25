@@ -5,10 +5,7 @@ fn build(source: &str) -> Result<CompiledModule, Vec<dux_diag::Diagnostic>> {
     build_with(source, Options::default())
 }
 
-fn build_with(
-    source: &str,
-    options: Options,
-) -> Result<CompiledModule, Vec<dux_diag::Diagnostic>> {
+fn build_with(source: &str, options: Options) -> Result<CompiledModule, Vec<dux_diag::Diagnostic>> {
     let mut sources = SourceMap::new();
     let file = sources.add("t.dux", source.to_string());
     let lexed = dux_lexer::lex(&sources, file);
@@ -56,10 +53,7 @@ fn print_writes_the_bytes_and_no_newline() {
         .ir_text();
     assert!(ir.contains("call i64 @fwrite"), "{ir}");
     assert!(ir.contains("@stdout"), "the stream is an argument:\n{ir}");
-    assert!(
-        !ir.contains("@fputc"),
-        "print adds no newline:\n{ir}"
-    );
+    assert!(!ir.contains("@fputc"), "print adds no newline:\n{ir}");
 }
 
 #[test]
@@ -86,17 +80,16 @@ fn release_runs_the_new_pass_manager_without_losing_the_program() {
     let debug = CompiledModule::build(&parsed.program, Options::default())
         .expect("debug builds")
         .ir_text();
-    let release =
-        CompiledModule::build(
-            &parsed.program,
-            Options {
-                opt_level: OptLevel::Balanced,
-                debug_allocator: true,
-                ..Options::default()
-            },
-        )
-            .expect("release builds")
-            .ir_text();
+    let release = CompiledModule::build(
+        &parsed.program,
+        Options {
+            opt_level: OptLevel::Balanced,
+            debug_allocator: true,
+            ..Options::default()
+        },
+    )
+    .expect("release builds")
+    .ir_text();
     assert!(debug.contains("@fwrite") && release.contains("@fwrite"));
     assert!(
         release.contains("i32 @main()"),
@@ -118,7 +111,10 @@ fn unlowered_code_reports_the_milestone_code_with_a_span() {
         dux_diag::code::UNSUPPORTED_IN_BUILD,
         "{errors:?}"
     );
-    assert!(errors[0].span.is_some(), "the diagnostic must point at the code");
+    assert!(
+        errors[0].span.is_some(),
+        "the diagnostic must point at the code"
+    );
 }
 
 #[test]
@@ -145,16 +141,18 @@ fn bindings_default_integers_to_i32_and_keep_every_alloca_in_the_entry_block() {
         entry.contains("%count = alloca i32"),
         "allocas belong in the entry block:\n{ir}"
     );
-    assert!(ir.contains("add i32"), "the compound assign keeps i32:\n{ir}");
+    assert!(
+        ir.contains("add i32"),
+        "the compound assign keeps i32:\n{ir}"
+    );
 }
 
 #[test]
 fn a_value_if_meets_at_a_phi() {
-    let ir = build(
-        "package main\nfn main() -> i32 { c := true; x := if c { 1 } else { 2 }; return x }",
-    )
-    .expect("builds")
-    .ir_text();
+    let ir =
+        build("package main\nfn main() -> i32 { c := true; x := if c { 1 } else { 2 }; return x }")
+            .expect("builds")
+            .ir_text();
     assert!(ir.contains("phi i32"), "the arms meet at a phi:\n{ir}");
     assert!(ir.contains("br i1"), "the condition branches:\n{ir}");
 
@@ -174,12 +172,13 @@ fn every_statement_carries_its_source_line() {
     let source = "package main\n\nfn pick(n: i32) -> i32 {\n    if n > 0 {\n        return n\n    }\n    return 0\n}\n\nfn main() {\n    pick(3)\n}\n";
     let ir = build(source).expect("builds").ir_text();
     assert!(
-        ir.contains(r#"!DISubprogram(name: "pick""#) && ir.contains(r#"!DISubprogram(name: "main""#),
+        ir.contains(r#"!DISubprogram(name: "pick""#)
+            && ir.contains(r#"!DISubprogram(name: "main""#),
         "each function gets a subprogram:\n{ir}"
     );
     assert!(
         ir.contains(r#"DILocation(line: 3, column: 4"#),
-            "`fn pick` names itself at line 3:\n{ir}"
+        "`fn pick` names itself at line 3:\n{ir}"
     );
     assert!(
         ir.contains(r#"DILocation(line: 5, column: 9"#),
@@ -343,8 +342,14 @@ fn fixed_arrays_live_in_slots_and_iterate_with_a_counter() {
     )
     .expect("builds")
     .ir_text();
-    assert!(ir.contains("alloca [3 x i32]"), "the literal backs a slot:\n{ir}");
-    assert!(ir.contains("getelementptr"), "elements are addressed by GEP:\n{ir}");
+    assert!(
+        ir.contains("alloca [3 x i32]"),
+        "the literal backs a slot:\n{ir}"
+    );
+    assert!(
+        ir.contains("getelementptr"),
+        "elements are addressed by GEP:\n{ir}"
+    );
     assert!(ir.contains("ult"), "the counter walks the length:\n{ir}");
 
     let ir = build(
@@ -352,22 +357,27 @@ fn fixed_arrays_live_in_slots_and_iterate_with_a_counter() {
     )
     .expect("builds")
     .ir_text();
-    assert!(ir.contains("alloca [4 x i32]"), "repeats back a slot:\n{ir}");
-    assert!(ir.contains("slt"), "the range compares against its limit:\n{ir}");
+    assert!(
+        ir.contains("alloca [4 x i32]"),
+        "repeats back a slot:\n{ir}"
+    );
+    assert!(
+        ir.contains("slt"),
+        "the range compares against its limit:\n{ir}"
+    );
 }
 
 #[test]
 fn implicit_conversion_widens_exactly_when_the_destination_is_lossless() {
-    let ir = build(
-        "package main\nfn main() { wider: i64 = 0; narrow := 1; wider = wider + narrow }",
-    )
-    .expect("builds")
-    .ir_text();
+    let ir =
+        build("package main\nfn main() { wider: i64 = 0; narrow := 1; wider = wider + narrow }")
+            .expect("builds")
+            .ir_text();
     assert!(ir.contains("sext i32"), "i32 widens into i64 free:\n{ir}");
     assert!(ir.contains("add i64"), "{ir}");
 
-    let errors = build("package main\nfn main() { narrow: i8 = 0; wide := 1; narrow = wide }")
-        .unwrap_err();
+    let errors =
+        build("package main\nfn main() { narrow: i8 = 0; wide := 1; narrow = wide }").unwrap_err();
     assert_eq!(errors[0].code, dux_diag::code::LOSSY_CONVERSION);
     assert!(
         errors[0].message.contains("as i8"),
@@ -396,7 +406,10 @@ fn three_clause_for_lowers_to_cond_body_step_exit() {
         assert!(ir.contains(label), "missing the `{label}` block:\n{ir}");
     }
     assert!(ir.contains("icmp slt i32"), "{ir}");
-    assert!(ir.contains("br label %for.cond"), "the step loops back:\n{ir}");
+    assert!(
+        ir.contains("br label %for.cond"),
+        "the step loops back:\n{ir}"
+    );
 }
 
 #[test]
@@ -407,7 +420,10 @@ fn while_and_loop_bind_break_and_continue() {
     .expect("builds")
     .ir_text();
     assert!(ir.contains("br label %while.cond"), "{ir}");
-    assert!(ir.contains("br label %while.end"), "break exits the loop:\n{ir}");
+    assert!(
+        ir.contains("br label %while.end"),
+        "break exits the loop:\n{ir}"
+    );
     assert!(
         ir.contains("br i1") && ir.contains("label %while.body, label %while.end"),
         "continue goes back to the condition through the body block:\n{ir}"
@@ -423,7 +439,10 @@ fn and_or_short_circuit_with_a_phi_over_two_blocks() {
     .ir_text();
     assert!(ir.contains("phi i1"), "{ir}");
     assert!(ir.contains("sc.rhs"), "{ir}");
-    assert!(!ir.contains("and i1"), "`&&` must branch, not bitwise-and:\n{ir}");
+    assert!(
+        !ir.contains("and i1"),
+        "`&&` must branch, not bitwise-and:\n{ir}"
+    );
 }
 
 #[test]
@@ -508,11 +527,9 @@ fn milestone_gaps_report_e0007_with_the_milestone_in_the_message() {
 
 #[test]
 fn constants_fold_adopt_the_annotated_type_and_refuse_to_be_assigned() {
-    let ir = build(
-        "package main\nconst KI: usize = 1024\nfn main() { page: usize = KI + 1 }",
-    )
-    .expect("builds")
-    .ir_text();
+    let ir = build("package main\nconst KI: usize = 1024\nfn main() { page: usize = KI + 1 }")
+        .expect("builds")
+        .ir_text();
     assert!(
         ir.contains("store i64 1025, ptr %page"),
         "the constant adopts usize and folds:\n{ir}"
@@ -520,7 +537,10 @@ fn constants_fold_adopt_the_annotated_type_and_refuse_to_be_assigned() {
 
     let errors = build("package main\nconst K: i32 = 1\nfn main() { K = 2 }").unwrap_err();
     assert_eq!(errors[0].code, dux_diag::code::ASSIGN_TO_CONST);
-    assert!(errors[0].message.contains("cannot be assigned"), "{errors:?}");
+    assert!(
+        errors[0].message.contains("cannot be assigned"),
+        "{errors:?}"
+    );
 
     let errors = build("package main\nconst K: i8 = 300\nfn main() { }").unwrap_err();
     assert_eq!(errors[0].code, dux_diag::code::LITERAL_OUT_OF_RANGE);
@@ -529,11 +549,10 @@ fn constants_fold_adopt_the_annotated_type_and_refuse_to_be_assigned() {
 
 #[test]
 fn globals_are_module_storage_and_update_in_place() {
-    let ir = build(
-        "package main\nglobal hits: i32 = 0\nfn bump() { hits += 1 }\nfn main() { bump() }",
-    )
-    .expect("builds")
-    .ir_text();
+    let ir =
+        build("package main\nglobal hits: i32 = 0\nfn bump() { hits += 1 }\nfn main() { bump() }")
+            .expect("builds")
+            .ir_text();
     assert!(ir.contains("@hits = global i32 0"), "{ir}");
     assert!(ir.contains("load i32, ptr @hits"), "{ir}");
     assert!(ir.contains("store i32"), "{ir}");
@@ -614,7 +633,11 @@ fn main() {
 }",
     )
     .unwrap_err();
-    assert_eq!(errors[0].code, dux_diag::code::ASSIGN_TO_CONST, "{errors:?}");
+    assert_eq!(
+        errors[0].code,
+        dux_diag::code::ASSIGN_TO_CONST,
+        "{errors:?}"
+    );
 }
 
 #[test]
@@ -839,8 +862,17 @@ fn main() {
     )
     .unwrap_err();
     assert_eq!(errors[0].code, dux_diag::code::UNDECLARED, "{errors:?}");
-    assert!(errors[0].message.contains("`Vec3` has no method `nope`"), "{errors:?}");
-    assert!(errors[0].note.as_deref().is_some_and(|n| n.contains("impl Vec3")), "{errors:?}");
+    assert!(
+        errors[0].message.contains("`Vec3` has no method `nope`"),
+        "{errors:?}"
+    );
+    assert!(
+        errors[0]
+            .note
+            .as_deref()
+            .is_some_and(|n| n.contains("impl Vec3")),
+        "{errors:?}"
+    );
 }
 
 #[test]
@@ -928,8 +960,7 @@ fn main() {
         "a view is sixteen bytes of slot:\n{ir}"
     );
     assert!(
-        ir.contains("insertvalue { ptr, i64 } undef, ptr %dims, 0")
-            && ir.contains("i64 4, 1"),
+        ir.contains("insertvalue { ptr, i64 } undef, ptr %dims, 0") && ir.contains("i64 4, 1"),
         "the array's own length becomes the view's count:\n{ir}"
     );
     assert!(
@@ -1633,10 +1664,7 @@ fn main() {
     )
     .expect("builds")
     .ir_text();
-    assert!(
-        ir.contains("define i64 @dux.fact.i64(i64 %"),
-        "{ir}"
-    );
+    assert!(ir.contains("define i64 @dux.fact.i64(i64 %"), "{ir}");
     assert!(
         ir.contains("call i64 @dux.fact.i64(i64 %"),
         "the body's own call is to the instantiation it is part of, and to no \

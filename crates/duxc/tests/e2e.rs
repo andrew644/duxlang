@@ -54,7 +54,9 @@ impl Spec {
                     spec.expect_error = Some(
                         words
                             .next()
-                            .unwrap_or_else(|| panic!("{}: `//@expect-error` needs a code", spec.name))
+                            .unwrap_or_else(|| {
+                                panic!("{}: `//@expect-error` needs a code", spec.name)
+                            })
                             .to_string(),
                     );
                 }
@@ -160,7 +162,10 @@ fn evaluate(spec: &Spec) -> Result<(), String> {
                 ));
             }
             if spec.require_clean_stderr && !run.stderr.is_empty() {
-                return Err(format!("{}: stderr is not empty:\n{}", spec.name, run.stderr));
+                return Err(format!(
+                    "{}: stderr is not empty:\n{}",
+                    spec.name, run.stderr
+                ));
             }
             if let Some(needle) = &spec.expected_stderr {
                 if !run.stderr.contains(needle) {
@@ -189,7 +194,10 @@ fn the_normative_hello_example_compiles_runs_and_prints_exactly_hello_world() {
         .expect("duxc is runnable");
     let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
     let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
-    assert_eq!(stderr, "", "the normative hello example must compile cleanly");
+    assert_eq!(
+        stderr, "",
+        "the normative hello example must compile cleanly"
+    );
     assert_eq!(output.status.code(), Some(0), "stdout: {stdout}");
     assert_eq!(stdout, "Hello, world!\n");
 }
@@ -267,7 +275,11 @@ fn every_example_dumps_its_ast_so_milestone_gaps_never_hide_the_tree() {
             .arg(&scratch)
             .output()
             .expect("duxc is runnable");
-        let stem = path.file_stem().expect("stem").to_string_lossy().to_string();
+        let stem = path
+            .file_stem()
+            .expect("stem")
+            .to_string_lossy()
+            .to_string();
         let dump = scratch.join(format!("{stem}.ast"));
         if output.status.code() != Some(0) || !dump.exists() {
             offenders.push(format!(
@@ -393,7 +405,10 @@ fn the_corpus_is_not_empty() {
 
 #[test]
 fn every_fixture_compiles_runs_and_matches_its_expected_stdout() {
-    let failures: Vec<String> = specs().iter().filter_map(|spec| evaluate(spec).err()).collect();
+    let failures: Vec<String> = specs()
+        .iter()
+        .filter_map(|spec| evaluate(spec).err())
+        .collect();
     assert!(
         failures.is_empty(),
         "{} e2e fixture(s) failed:\n\n{}",
@@ -448,11 +463,41 @@ fn the_normative_pointers_example_walks_a_list_with_no_null_in_it() {
 #[test]
 fn the_normative_control_flow_example_runs_every_loop_and_a_match() {
     let run = run_example("control_flow");
-    assert_eq!(run.stderr, "", "the control-flow example must compile cleanly");
+    assert_eq!(
+        run.stderr, "",
+        "the control-flow example must compile cleanly"
+    );
     assert_eq!(run.code, 0, "stdout: {}", run.stdout);
     assert_eq!(
         run.stdout,
         "i=1\ni=2\ni=3\n10 20 30 \n[0]=10 [1]=20 [2]=30 \ntick tick tick \ntock tock tock \n\
          x=5\nodd medium\nbody\nruns first\nruns second\n"
+    );
+}
+
+#[test]
+fn cimports_names_what_crossed_and_what_the_header_kept_back() {
+    let report = Path::new(FIXTURE_DIR).join("c_header_lib.dux");
+    let text = Command::new(env!("CARGO_BIN_EXE_duxc"))
+        .args(["cimports", report.to_str().expect("utf-8 path")])
+        .output()
+        .expect("the compiler runs");
+    let said = String::from_utf8_lossy(&text.stdout);
+    assert!(
+        said.contains("edge (cedge.h)") && said.contains("3 declaration(s) crossed"),
+        "the namespace reports itself:\n{said}"
+    );
+    assert!(
+        said.contains("cedge_visits - global variables are still waiting"),
+        "a name that did not cross says why:\n{said}"
+    );
+    let json = Command::new(env!("CARGO_BIN_EXE_duxc"))
+        .args(["cimports", "--json", report.to_str().expect("utf-8 path")])
+        .output()
+        .expect("the compiler runs");
+    let said = String::from_utf8_lossy(&json.stdout);
+    assert!(
+        said.starts_with("[{\"namespace\":\"edge\"") && said.contains("\"skipped\":["),
+        "the same report, machine-readable:\n{said}"
     );
 }

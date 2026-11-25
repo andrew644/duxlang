@@ -27,10 +27,7 @@ fn diagnose(source: &str) -> Vec<Diagnostic> {
 }
 
 fn codes(source: &str) -> Vec<&'static str> {
-    diagnose(source)
-        .iter()
-        .map(|d| d.code)
-        .collect()
+    diagnose(source).iter().map(|d| d.code).collect()
 }
 
 #[test]
@@ -1279,7 +1276,11 @@ fn main() {
     take(7)
     byte(255)
 }";
-    assert!(codes(adopting).is_empty(), "in-range literals fit: {:?}", codes(adopting));
+    assert!(
+        codes(adopting).is_empty(),
+        "in-range literals fit: {:?}",
+        codes(adopting)
+    );
 
     let beyond = "package main
 extern \"C\" {
@@ -1319,7 +1320,11 @@ extern \"C\" {
     fn strlen(s: *c_char) -> usize
 }
 fn main() { text := \"dux\"; strlen(text) }";
-    assert!(codes(to_c).is_empty(), "a `string` crosses as its bytes: {:?}", codes(to_c));
+    assert!(
+        codes(to_c).is_empty(),
+        "a `string` crosses as its bytes: {:?}",
+        codes(to_c)
+    );
 
     let to_dux = "package main
 fn takes(p: *c_char) { }

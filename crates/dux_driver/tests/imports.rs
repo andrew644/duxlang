@@ -129,8 +129,15 @@ fn a_module_the_standard_library_does_not_ship_yet_is_a_milestone_gap() {
         .filter(|d| d.severity == Severity::Error && d.code != dux_diag::code::UNSUPPORTED_IN_BUILD)
         .map(|d| d.message.clone())
         .collect();
-    assert_eq!(blocking, Vec::<String>::new(), "an unwritten piece of `std` is a gap in this build, not a verdict: {blocking:?}");
-    assert!(analyzed.diagnostics.iter().any(|d| d.message.contains("std/fs")));
+    assert_eq!(
+        blocking,
+        Vec::<String>::new(),
+        "an unwritten piece of `std` is a gap in this build, not a verdict: {blocking:?}"
+    );
+    assert!(analyzed
+        .diagnostics
+        .iter()
+        .any(|d| d.message.contains("std/fs")));
 }
 
 #[test]

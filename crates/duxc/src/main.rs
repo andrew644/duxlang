@@ -59,7 +59,92 @@ fn main() -> ExitCode {
             }
         }
         Command::Fmt { paths, check } => fmt(&paths, check, &mut err),
+        Command::Cimports { file, json } => cimports(&file, json, &mut err),
     }
+}
+
+fn cimports(file: &Path, json: bool, err: &mut impl Write) -> ExitCode {
+    match dux_driver::cimports(file) {
+        Ok(namespaces) => {
+            if json {
+                let _ = writeln!(std::io::stdout(), "{}", namespaces_json(&namespaces));
+                return ExitCode::SUCCESS;
+            }
+            if namespaces.is_empty() {
+                let _ = writeln!(std::io::stdout(), "{} imports no C headers", file.display());
+                return ExitCode::SUCCESS;
+            }
+            for namespace in &namespaces {
+                let _ = writeln!(
+                    std::io::stdout(),
+                    "{} ({}) - {} declaration(s) crossed, {} skipped",
+                    namespace.namespace,
+                    namespace.header,
+                    namespace.crossed.len(),
+                    namespace.skipped.len()
+                );
+                for skip in &namespace.skipped {
+                    let _ = writeln!(
+                        std::io::stdout(),
+                        "  skipped: {} - {}",
+                        skip.name,
+                        skip.reason
+                    );
+                }
+            }
+            ExitCode::SUCCESS
+        }
+        Err(failure) => {
+            failure.report(err);
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn namespaces_json(namespaces: &[dux_driver::CNamespace]) -> String {
+    let mut out = String::from("[");
+    for (at, namespace) in namespaces.iter().enumerate() {
+        if at > 0 {
+            out.push(',');
+        }
+        out.push_str(&format!(
+            r#"{{"namespace":"{}","header":"{}","crossed":[{}],"skipped":[{}]}}"#,
+            escape(&namespace.namespace),
+            escape(&namespace.header),
+            namespace
+                .crossed
+                .iter()
+                .map(|name| format!(r#""{}""#, escape(name)))
+                .collect::<Vec<_>>()
+                .join(","),
+            namespace
+                .skipped
+                .iter()
+                .map(|skip| {
+                    format!(
+                        r#"{{"name":"{}","reason":"{}"}}"#,
+                        escape(&skip.name),
+                        escape(&skip.reason)
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(","),
+        ));
+    }
+    out.push(']');
+    out
+}
+
+fn escape(text: &str) -> String {
+    let mut out = String::new();
+    for letter in text.chars() {
+        match letter {
+            '\\' => out.push_str(r"\\"),
+            '"' => out.push_str(r#"\""#),
+            other => out.push(other),
+        }
+    }
+    out
 }
 
 fn fmt(paths: &[PathBuf], check: bool, err: &mut impl Write) -> ExitCode {
@@ -114,11 +199,7 @@ fn fmt(paths: &[PathBuf], check: bool, err: &mut impl Write) -> ExitCode {
             }
             return ExitCode::FAILURE;
         }
-        let _ = writeln!(
-            std::io::stdout(),
-            "all {} file(s) formatted",
-            files.len()
-        );
+        let _ = writeln!(std::io::stdout(), "all {} file(s) formatted", files.len());
     }
     ExitCode::SUCCESS
 }

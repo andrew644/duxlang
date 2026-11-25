@@ -24,11 +24,16 @@ pub fn wrapper_name(function: &CFunction) -> Option<String> {
     Some(format!("__duxw_{}", function.name))
 }
 
-/// The C source: the include the reader was given, and one wrapper per
-/// wrappable definition. The wrappers are what `#[c_name]` on the spelled
-/// declaration points at.
-pub fn c_source(header: &str, decls: &[CDecl]) -> String {
-    let mut out = format!("#include \"{header}\"\n");
+/// The C source: one include per header the reader was given, and one
+/// wrapper per wrappable definition. The wrappers are what `#[c_name]` on
+/// the spelled declaration points at. A namespace built from several
+/// headers compiles as one translation unit, so a definition two headers
+/// both reach is wrapped exactly once.
+pub fn c_source(headers: &[String], decls: &[CDecl]) -> String {
+    let mut out = String::new();
+    for header in headers {
+        out.push_str(&format!("#include \"{header}\"\n"));
+    }
     for decl in decls {
         let CDecl::Function(function) = decl else {
             continue;

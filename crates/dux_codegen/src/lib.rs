@@ -5,7 +5,7 @@ use inkwell::module::Module;
 use inkwell::targets::{
     CodeModel, FileType, InitializationConfig, RelocMode, Target, TargetMachine,
 };
-use inkwell::{OptimizationLevel};
+use inkwell::OptimizationLevel;
 use std::path::Path;
 
 mod lower;
@@ -173,7 +173,10 @@ fn target_machine(opt_level: OptLevel) -> Result<TargetMachine, Vec<Diagnostic>>
     let target = Target::from_triple(&triple).map_err(|e| {
         vec![Diagnostic::error(
             code::CODEGEN_FAILED,
-            format!("no backend for `{}`: {e}", triple.as_str().to_string_lossy()),
+            format!(
+                "no backend for `{}`: {e}",
+                triple.as_str().to_string_lossy()
+            ),
         )]
     })?;
     target
@@ -232,7 +235,9 @@ fn select_main(program: &Program) -> Result<&FnDecl, Vec<Diagnostic>> {
             code::NO_MAIN,
             "no `fn main()` in this program",
         )
-        .with_note("the entry point is `fn main()` in the package named `main`")]);
+        .with_note(
+            "the entry point is `fn main()` in the package named `main`",
+        )]);
     };
     if !main.params.is_empty() {
         return Err(vec![Diagnostic::error(

@@ -428,7 +428,11 @@ impl<'a> Lexer<'a> {
         loop {
             match self.peek() {
                 None => {
-                    self.diagnostic(CODE_UNTERMINATED_STRING, "unterminated string literal", start);
+                    self.diagnostic(
+                        CODE_UNTERMINATED_STRING,
+                        "unterminated string literal",
+                        start,
+                    );
                     break;
                 }
                 Some(b'"') => {
@@ -465,7 +469,11 @@ impl<'a> Lexer<'a> {
                             );
                         }
                         None => {
-                            self.diagnostic(CODE_UNTERMINATED_STRING, "unterminated string literal", start);
+                            self.diagnostic(
+                                CODE_UNTERMINATED_STRING,
+                                "unterminated string literal",
+                                start,
+                            );
                             break;
                         }
                     }
@@ -481,7 +489,11 @@ impl<'a> Lexer<'a> {
         loop {
             match self.peek() {
                 None => {
-                    self.diagnostic(CODE_UNTERMINATED_STRING, "unterminated interpolated string", start);
+                    self.diagnostic(
+                        CODE_UNTERMINATED_STRING,
+                        "unterminated interpolated string",
+                        start,
+                    );
                     break;
                 }
                 Some(b'"') => {
@@ -559,7 +571,11 @@ impl<'a> Lexer<'a> {
         if self.peek() == Some(b'\'') {
             self.cursor += 1;
         } else {
-            self.diagnostic(CODE_UNTERMINATED_STRING, "unterminated character literal", start);
+            self.diagnostic(
+                CODE_UNTERMINATED_STRING,
+                "unterminated character literal",
+                start,
+            );
         }
         self.push(TokenKind::Char, start, Some(Literal::Char(value)));
     }
@@ -721,14 +737,12 @@ impl<'a> Lexer<'a> {
     }
 
     fn diagnostic(&mut self, code: &'static str, message: impl Into<String>, start: usize) {
-        self.diagnostics.push(
-            Diagnostic::error(code, message)
-                .with_span(Span::new(
-                    self.file,
-                    self.base + start as u32,
-                    (self.cursor - start) as u32,
-                )),
-        );
+        self.diagnostics
+            .push(Diagnostic::error(code, message).with_span(Span::new(
+                self.file,
+                self.base + start as u32,
+                (self.cursor - start) as u32,
+            )));
     }
 
     fn next_utf8(&mut self) -> &'a str {

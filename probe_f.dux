@@ -1,0 +1,13 @@
+package main
+#[c_include("stdio.h")]
+mod cs;
+fn main() {
+    f := cs.fopen(c"slot.txt", c"w")
+    match f {
+        Some(h) => {
+            closed := cs.fclose(h)
+            println($"closed={}", closed)
+        }
+        None => println("no")
+    }
+}
