@@ -56,3 +56,18 @@ fails. `index.crates.io` (sparse index) and `static.crates.io` both work, so `ca
 (`https://index.crates.io/ll/vm/llvm-sys`) instead of the API.
 
 E2E tests are designed to be self-contained: no network, no `$HOME` writes.
+
+## 5. raylib, so the window example can run (not needed by any test)
+
+`example/raylib/hello.dux` is the shown-to-humans proof that a real game library
+crosses `#[c_include]` with nothing written by hand — including records by value
+(`Color` in, `Vector2` back). It is excluded from the test corpus (the suite must
+stay self-contained), so nothing verifies it on this box yet:
+
+```
+sudo dnf install raylib-devel        # raylib.h, libraylib.so, pkg-config raylib
+```
+
+After that, `duxc run example/raylib/hello.dux` should open a window; a mouse
+draws a maroon circle and the title says `dux on raylib`. If the pkg-config name
+differs here, the example needs one attribute edited, nothing else.

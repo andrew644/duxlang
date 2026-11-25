@@ -1,0 +1,33 @@
+package main
+
+// The classic raylib starting screen, with no binding layer in between.
+// `#[c_include]` reads raylib.h through libclang and `#[c_pkgconfig]`
+// asks pkg-config what it takes to link (on Fedora: `dnf install
+// raylib-devel raylib-devel-static pkgconfig(wayland-client)` or the
+// X11 build — whatever this box has). Records cross by value — `Color`
+// in, `Vector2` back — through the wrappers the compiler writes and
+// compiles with the header, which is why the call below that receives
+// a `Vector2` from `GetMousePosition` is ordinary Dux.
+
+#[c_include("raylib.h")]
+#[c_pkgconfig("raylib")]
+mod rl;
+
+fn main() {
+    rl.InitWindow(800, 450, c"dux on raylib")
+    rl.SetTargetFPS(60)
+
+    white := rl.Color { r: 0.92, g: 0.92, b: 0.93, a: 1.0 }
+    maroon := rl.Color { r: 0.62, g: 0.11, b: 0.17, a: 1.0 }
+
+    while !rl.WindowShouldClose() {
+        mouse := rl.GetMousePosition()
+        rl.BeginDrawing()
+        rl.ClearBackground(white)
+        rl.DrawText("move the mouse", 190, 200, 20, maroon)
+        rl.DrawCircleV(mouse, 25.0, maroon)
+        rl.EndDrawing()
+    }
+
+    rl.CloseWindow()
+}
