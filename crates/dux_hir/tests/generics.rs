@@ -314,3 +314,48 @@ fn a_method_body_that_does_not_fit_a_receiver_is_said_at_the_call() {
         "the complaint says which filling it was read in: {note}"
     );
 }
+
+const MAYBE: &str = "enum Maybe<T> {
+    Some(T),
+    Nothing,
+}
+
+impl Maybe<T> {
+    fn shown(self, fallback: T) -> T {
+        match self {
+            Maybe::Some(v) => return v,
+            Maybe::Nothing => return fallback,
+        }
+    }
+}
+";
+
+#[test]
+fn a_method_of_a_generic_sum_type_sees_what_its_receiver_said() {
+    let clean = said(&format!(
+        r#"{MAYBE}fn main() {{
+    a: Maybe<i32> = Maybe::Some(7)
+    b: Maybe<string> = Maybe::Nothing
+    println(a.shown(0))
+    println(b.shown("d"))
+}}"#
+    ));
+    assert_eq!(
+        clean,
+        Vec::<&str>::new(),
+        "one method, two receivers, each in its own types: {clean:?}"
+    );
+
+    let wrong = codes(&format!(
+        r#"{MAYBE}fn main() {{
+    b: Maybe<string> = Maybe::Nothing
+    b.shown(0)
+}}"#
+    ));
+    assert_eq!(
+        wrong,
+        vec![dux_diag::code::TYPE_MISMATCH],
+        "the receiver says `T` is `string`, and the argument has to fit that: {wrong:?}"
+    );
+}
+

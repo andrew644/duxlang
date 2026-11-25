@@ -78,6 +78,17 @@ impl Pair<A, B> {
     }
 }
 
+// A sum type is a type an `impl` extends too. `Option` is an ordinary enum,
+// so its methods are ordinary code a program may write.
+impl Option<T> {
+    fn shown(self, fallback: T) -> T {
+        match self {
+            Some(v) => return v,
+            None => return fallback,
+        }
+    }
+}
+
 fn main() {
     println($"max={} {} {}", max(3, 7), max(2.5, 1.5), max<i64>(9, 4))
     println($"fact={}", fact<i64>(5))
@@ -104,4 +115,7 @@ fn main() {
     println($"hops={}", hops)
     grid := zeros<4>()
     println($"grid={} view={}", grid[2], total(&[1, 2, 3]))
+    missing: Option<i32> = None
+    here: Option<i32> = Some(6)
+    println($"shown={} {}", missing.shown(4), here.shown(0))
 }

@@ -540,6 +540,15 @@ enum Stood {
     Const(u64),
 }
 
+/// What a call says the code it names is made of, and where that code lives:
+/// a generic `fn` has no owner and no receiver; a method of a generic `impl`
+/// has the type it extends and the receiver that completed it.
+struct Asking<'a> {
+    decl: &'a FnDecl,
+    owner: Option<&'static str>,
+    receiver: Option<DuxType>,
+}
+
 /// A generic `fn` one call asked for, waiting for its body: the code is the
 /// declaration's, the types are the call's.
 #[derive(Clone)]
@@ -548,6 +557,9 @@ struct Instance {
     symbol: String,
     /// The record a method of a generic `impl` belongs to.
     owner: Option<&'static str>,
+    /// The receiver as the call says it, so a method that writes `self`
+    /// without a type still knows what stands there.
+    receiver: Option<DuxType>,
     decl: &'static FnDecl,
     bound: Vec<(String, Stood)>,
 }
@@ -576,6 +588,8 @@ struct Unit<'a> {
     /// This unit is one instantiation of a generic `fn`, not the generic `fn`
     /// as written: its types are already known and it reaches the module.
     instantiated: bool,
+    /// The receiver of a method of a generic `impl`, as its receiver said it.
+    receiver: Option<DuxType>,
     decl: &'a FnDecl,
 }
 
@@ -587,6 +601,7 @@ impl<'a> Unit<'a> {
             owner: None,
             external: false,
             instantiated: false,
+            receiver: None,
             decl,
         }
     }
@@ -605,6 +620,7 @@ impl<'a> Unit<'a> {
             owner: Some(owner),
             external: false,
             instantiated: false,
+            receiver: None,
             decl,
         }
     }
@@ -2142,6 +2158,17 @@ impl Emitter {
         param: &dux_ast::Param,
         first: bool,
     ) -> Option<DuxType> {
+        if first {
+            if let Some(receiver) = unit.receiver {
+                // A method of a generic `impl` reads its receiver as whatever
+                // stood there and said the types: `self` with no type written
+                // is that, and a `self: *T` borrows it.
+                return Some(match &param.ty {
+                    Type::Pointer { .. } => self.pointer_to(receiver),
+                    _ => receiver,
+                });
+            }
+        }
         let Some(owner) = unit.owner else {
             return self.type_of(&param.ty);
         };
@@ -6593,31 +6620,54 @@ impl Emitter {
                 return Some(len);
             }
         }
-        let Some(record) = self.record_of(base_ty) else {
-            self.diagnostics.push(
-                Diagnostic::error(
-                    code::UNDECLARED,
-                    format!(
-                        "there are no methods on a `{}`",
-                        if base_ty == DuxType::Error {
-                            "value of an unknown type".to_string()
-                        } else {
-                            base_ty.name()
-                        }
-                    ),
-                )
-                .with_span(base.span()),
-            );
-            return None;
+        // A receiver is a record or a sum type, and either may be the one an
+        // `impl` extends.
+        let owner = match (self.record_of(base_ty), self.enum_of(base_ty)) {
+            (Some(record), _) => Owner {
+                name: record.name,
+                spelled: record.spelled.clone(),
+                args: record.args.clone(),
+                as_ty: DuxType::Struct(record),
+            },
+            (None, Some(shape)) => Owner {
+                name: shape.name,
+                spelled: shape.spelled.clone(),
+                args: shape.args.clone(),
+                as_ty: DuxType::Enum(shape),
+            },
+            _ => {
+                self.diagnostics.push(
+                    Diagnostic::error(
+                        code::UNDECLARED,
+                        format!(
+                            "there are no methods on a `{}`",
+                            if base_ty == DuxType::Error {
+                                "value of an unknown type".to_string()
+                            } else {
+                                base_ty.name()
+                            }
+                        ),
+                    )
+                    .with_span(base.span()),
+                );
+                return None;
+            }
         };
-        let key = format!("{}.{}", record.name, name.name);
+        let key = format!("{}.{}", owner.name, name.name);
         // A method of a generic `impl` is code that means something once a
         // receiver says what its parameters are. The call has that, so this is
         // where the method becomes a function.
-        let key = if record.args.is_empty() {
+        let key = if owner.args.is_empty() {
             key
         } else {
-            match self.instantiate_method(module, record, &name.name) {
+            match self.instantiate_method(
+                module,
+                owner.name,
+                owner.as_ty,
+                &owner.spelled,
+                &owner.args,
+                &name.name,
+            ) {
                 Some(key) => key,
                 None => return Some(Typed::error()),
             }
@@ -6629,10 +6679,10 @@ impl Emitter {
             self.diagnostics.push(
                 Diagnostic::error(
                     code::UNDECLARED,
-                    format!("`{}` has no method `{}`", record.name, name.name),
+                    format!("`{}` has no method `{}`", owner.name, name.name),
                 )
                 .with_span(name.span)
-                .with_note(format!("methods are declared in an `impl {}` block", record.name)),
+                .with_note(format!("methods are declared in an `impl {}` block", owner.name)),
             );
             return None;
         };
@@ -6643,7 +6693,7 @@ impl Emitter {
         let params = signature.params.clone();
         let return_ty = signature.return_ty;
         let hidden_context = signature.hidden_context;
-        let want = signature.receiver.unwrap_or(DuxType::Struct(record));
+        let want = signature.receiver.unwrap_or(owner.as_ty);
         let receiver = self.receiver(module, base_ty, base_at, want, name, base.span())?;
         if args.len() != params.len() {
             self.diagnostics.push(
@@ -6651,7 +6701,7 @@ impl Emitter {
                     code::WRONG_ARITY,
                     format!(
                         "`{}.{}` takes {} arguments, given {}",
-                        record.name,
+                        owner.name,
                         name.name,
                         params.len(),
                         args.len()
@@ -8408,7 +8458,17 @@ impl Emitter {
             None => None,
             Some(bound) => {
                 self.substituting = bound.clone();
-                self.declare_instance(module, decl, None, name, spelled(name, &bound), bound)
+                self.declare_instance(
+                    module,
+                    Asking {
+                        decl,
+                        owner: None,
+                        receiver: None,
+                    },
+                    name,
+                    spelled(name, &bound),
+                    bound,
+                )
             }
         };
         self.substituting = saved;
@@ -8589,8 +8649,7 @@ impl Emitter {
     fn declare_instance(
         &mut self,
         module: &Module<'static>,
-        decl: &'static FnDecl,
-        owner: Option<&'static str>,
+        asking: Asking<'static>,
         name: &str,
         spelled: String,
         bound: Vec<(String, Stood)>,
@@ -8601,11 +8660,13 @@ impl Emitter {
         if self.skipped.contains(&spelled) {
             return None;
         }
+        let key = spelled;
         let instance = Instance {
-            symbol: symbol_of(&spelled),
-            key: spelled,
-            owner,
-            decl,
+            symbol: symbol_of(&key),
+            key,
+            owner: asking.owner,
+            receiver: asking.receiver,
+            decl: asking.decl,
             bound,
         };
         if self.functions.contains_key(&instance.key) {
@@ -8627,30 +8688,36 @@ impl Emitter {
     fn instantiate_method(
         &mut self,
         module: &Module<'static>,
-        record: &'static StructInfo,
+        owner: &'static str,
+        as_ty: DuxType,
+        spelled: &str,
+        args: &[DuxType],
         method: &str,
     ) -> Option<String> {
-        let plain = format!("{}.{}", record.name, method);
+        let plain = format!("{owner}.{method}");
         let decl = self.generic_methods.get(&plain).copied()?;
-        let params = self.impl_params.get(record.name)?.clone();
-        if params.len() != record.args.len() {
+        let params = self.impl_params.get(owner)?.clone();
+        if params.len() != args.len() {
             self.unsupported(
                 decl.name.span,
-                &format!("`{plain}`: its `impl` and its record do not agree on the number of parameters"),
+                &format!("`{plain}`: its `impl` and the type it extends do not agree on the number of parameters"),
             );
             return None;
         }
         let bound: Vec<(String, Stood)> = params
             .iter()
-            .zip(&record.args)
+            .zip(args)
             .map(|(param, arg)| (param.clone(), Stood::Ty(*arg)))
             .collect();
-        let spelled = format!("{}.{}", record.spelled, method);
+        let spelled = format!("{spelled}.{method}");
         self.substituting = bound.clone();
         let instance = self.declare_instance(
             module,
-            decl,
-            Some(record.name),
+            Asking {
+                decl,
+                owner: Some(owner),
+                receiver: Some(as_ty),
+            },
             &plain,
             spelled,
             bound,
@@ -8683,6 +8750,7 @@ impl Instance {
             owner: self.owner,
             external: false,
             instantiated: true,
+            receiver: self.receiver,
             decl: self.decl,
         }
     }
@@ -8705,6 +8773,15 @@ fn spelled(name: &str, bound: &[(String, Stood)]) -> String {
 
 /// A symbol LLVM will print without quoting it: `<`, `>` and the commas
 /// between arguments become dots.
+/// What a receiver is called: a record or a sum type, with what it was made
+/// of. A method belongs to whichever one an `impl` extended.
+struct Owner {
+    name: &'static str,
+    spelled: String,
+    args: Vec<DuxType>,
+    as_ty: DuxType,
+}
+
 /// The name an instantiation is an instantiation of: `Pair<i32, string>.first`
 /// is an instantiation of `Pair.first`, and `max<i32>` is an instantiation of
 /// `max`. The written name is where a module's home is recorded.

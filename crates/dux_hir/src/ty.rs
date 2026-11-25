@@ -130,11 +130,13 @@ impl Ty {
     fn record(&self) -> Option<(&String, &[Ty])> {
         match self {
             Ty::Struct(name) => Some((name, &[])),
-            Ty::Instance { name, args } => Some((name, args)),
+            Ty::Instance { name, args } | Ty::Enum { name, args } => Some((name, args)),
             _ => None,
         }
     }
 
+    /// What a value is called, with whatever it was made of: a record or a sum
+    /// type, either of which an `impl` may extend.
     fn record_owner(&self) -> Option<&String> {
         match self {
             Ty::Struct(name) | Ty::Instance { name, .. } => Some(name),
@@ -1264,6 +1266,15 @@ impl<'a> Checker<'a> {
                 for (left, right) in left_args.iter().zip(right_args) {
                     let (left, right) = (left.clone(), right.clone());
                     args.push(self.meet(left, right, span, what));
+                }
+                // A record and a sum type are different things even when the
+                // name and the arguments print the same, so the answer keeps
+                // the shape the question was asked in.
+                if matches!(a, Ty::Enum { .. }) || matches!(b, Ty::Enum { .. }) {
+                    return Ty::Enum {
+                        name: left_name.clone(),
+                        args,
+                    };
                 }
                 Ty::Instance {
                     name: left_name.clone(),
@@ -2814,6 +2825,17 @@ impl<'a> Checker<'a> {
                     _ => {}
                 }
             }
+            // A sum type is a type an `impl` may extend too, and its arguments
+            // say what the `impl`'s parameters stand for. A sum type with no
+            // method of that name stays silent: the standard library's methods
+            // on `Option` and `Result` arrive with the milestone that writes
+            // them, and a call asking for one is not the program's mistake.
+            if let Ty::Enum { name: owner, .. } = &base {
+                let key = (owner.clone(), name.name.clone());
+                if let Some(generic) = self.generic_methods.get(&key).cloned() {
+                    return self.generic_method(&base, &key, &generic, args, span);
+                }
+            }
             if let Some(owner) = base.record_owner() {
                 let key = (owner.clone(), name.name.clone());
                 if let Some(generic) = self.generic_methods.get(&key).cloned() {
@@ -2946,7 +2968,12 @@ impl<'a> Checker<'a> {
 
     // ----------------------------------------------------------- statements
 
-    fn function(&mut self, function: &dux_ast::FnDecl, receiver: Option<&str>) {
+    fn function(
+        &mut self,
+        function: &dux_ast::FnDecl,
+        receiver: Option<&str>,
+        owner: &Ty,
+    ) {
         self.result = match &function.return_ty {
             Some(ty) => self.resolve_type(ty),
             None => Ty::Unit,
@@ -2956,11 +2983,17 @@ impl<'a> Checker<'a> {
         for parameter in &function.params {
             let ty = if parameter.name.name == "self" {
                 match receiver {
-                    Some(owner) => match &parameter.ty {
-                        Type::Pointer { .. } => {
-                            Ty::Targeted(Box::new(Ty::Struct(owner.to_string())))
+                    Some(_) => match &parameter.ty {
+                        Type::Named { name, args, .. }
+                            if args.is_empty()
+                                && !name.is_empty()
+                                && name.as_str() != "self"
+                                && self.resolve_type(&parameter.ty) != Ty::Opaque =>
+                        {
+                            self.resolve_type(&parameter.ty)
                         }
-                        _ => Ty::Struct(owner.to_string()),
+                        Type::Pointer { .. } => Ty::Targeted(Box::new(owner.clone())),
+                        _ => owner.clone(),
                     },
                     None => self.resolve_type(&parameter.ty),
                 }
@@ -2984,8 +3017,25 @@ impl<'a> Checker<'a> {
             .map(|param| (param.name.name.clone(), Ty::Opaque))
             .collect();
         let owner = named_owner(&self.home, &block.type_name.name);
+        // A bare `self` names the type the `impl` extends, filled with that
+        // `impl`'s own parameters: a method of `impl Cell<T>` reads its
+        // receiver as `Cell<T>`, symbolic and all.
+        let arguments: Vec<Ty> = self.instantiation.iter().map(|_| Ty::Opaque).collect();
+        let receiver = if arguments.is_empty() {
+            Ty::Struct(owner.clone())
+        } else if self.enums.contains_key(owner.as_str()) {
+            Ty::Enum {
+                name: owner.clone(),
+                args: arguments,
+            }
+        } else {
+            Ty::Instance {
+                name: owner.clone(),
+                args: arguments,
+            }
+        };
         for method in &block.methods {
-            self.function(method, Some(&owner));
+            self.function(method, Some(&owner), &receiver);
         }
         self.instantiation = saved;
     }
@@ -3433,7 +3483,7 @@ impl<'a> Checker<'a> {
         for entry in self.program.scoped().iter() {
             self.home = entry.home.clone();
             match entry.decl {
-                Decl::Fn(function) => self.function(function, None),
+                Decl::Fn(function) => self.function(function, None, &Ty::Unit),
                 Decl::Impl(block) => self.impl_block(block),
                 _ => {}
             }

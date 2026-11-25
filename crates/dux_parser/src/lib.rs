@@ -563,7 +563,16 @@ impl<'a> Parser<'a> {
         let start = self.peek().span;
         self.bump();
         let type_name = self.expect_ident("the type an impl block extends");
+        // `impl Pair<A, B>` names the type and, after it, the parameters that
+        // type is written with. Only the parameters are kept: they are what a
+        // method's body needs, and the name between them says nothing new.
         let type_params = self.type_params();
+        // `impl Pair<A, B>` names the type and, after it, the parameters that
+        // type is written with. Those arguments say nothing the parameters do
+        // not, so they are read past rather than kept.
+        if self.at_type_argument_list() {
+            let _ = self.type_argument_list();
+        }
         self.expect_punct(Punct::LBrace, "expected `{` to open the impl block");
         let mut methods = Vec::new();
         while !self.at_punct(Punct::RBrace) && !self.at_end() {

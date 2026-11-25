@@ -1614,3 +1614,44 @@ fn main() {
         "the method as written is code, not a function: {ir}"
     );
 }
+
+#[test]
+fn a_method_of_an_impl_of_a_sum_type_is_emitted_once_per_receiver() {
+    let ir = build(
+        r#"enum Maybe<T> {
+    Some(T),
+    Nothing,
+}
+
+impl Maybe<T> {
+    fn shown(self, fallback: T) -> T {
+        match self {
+            Maybe::Some(v) => return v,
+            Maybe::Nothing => return fallback,
+        }
+    }
+}
+
+fn main() {
+    a: Maybe<i32> = Maybe::Some(7)
+    b: Maybe<string> = Maybe::Nothing
+    println($"{}", a.shown(0))
+    println($"{}", b.shown("d"))
+}
+"#,
+    )
+    .expect("a method of an impl of a sum type is emitted at its receivers")
+    .ir_text();
+    assert!(
+        ir.contains("@dux.Maybe.i32.shown"),
+        "the `i32` receiver gets an `i32` method: {ir}"
+    );
+    assert!(
+        ir.contains("@dux.Maybe.string.shown"),
+        "the `string` receiver gets a `string` method, which is a different function: {ir}"
+    );
+    assert!(
+        !ir.contains("@dux.Maybe.shown"),
+        "the method as written is code, not a function: {ir}"
+    );
+}

@@ -14,7 +14,7 @@ each remaining gap is waiting for. A gap is a milestone, never a verdict.
 | `strings.dux` | checks clean; runs until `.bytes()` | `string` methods (`.bytes()`, `.runes()`) | the standard library (M5) |
 | `sum_types.dux` | compiles, runs; variants, payloads, guards, or-patterns, ranges and exhaustiveness all reach machine code, and the dispatch is the `switch` on the tag | — |
 | `option_result.dux` | checks until `fs.read_to_string`; the predeclared `Option`/`Result` lower and match today | `std/fs`, `.bytes()`, `.trim()`, and the `Option` methods (`unwrap`, `unwrap_or`), which are prelude code | the standard library (M5) |
-| `generics.dux` | checks clean; `max<i32>`, `max<f64>`, `max<i64>`, `Pair<i32, string>` and `zeros<4>` all reach machine code as functions and records of their own | an array returned from a function, and `HashMap<K, V>`, which is standard-library code (M5) |
+| `generics.dux` | checks clean; `max<i32>`, `max<f64>`, `max<i64>`, `Pair<i32, string>`, `Either<string, i32>` matched, `zeros<4>()` returning `[i32; 4]` and `sum(&[1, 2, 3])` all reach machine code | `HashMap<K, V>` and `bag.get("hp").unwrap_or(0)`, which are standard-library code (M5) |
 | `c_interop.dux` | parses | libclang importer (M6) |
 
 ## Deliberate runtime gaps today
@@ -51,25 +51,39 @@ each remaining gap is waiting for. A gap is a milestone, never a verdict.
 - **A record is matched whole.** `P { x }` names a variant, not a record: a
   `match` on a record takes a binder, a `_`, or an `else`, and destructuring a
   record through patterns is not in the design.
-- **`Option` has no methods.** `unwrap`, `unwrap_or`, `map` and the rest are
-  prelude code (DESIGN 4.5), and the prelude arrives with the standard library.
+- **`Option` has no methods yet, though it can have them.** `unwrap`,
+  `unwrap_or`, `map` and the rest are prelude code (DESIGN 4.5): an
+  `impl Option<T>` now checks and lowers, so what is missing is someone
+  writing it, which is the standard library's job. A call asking for a method
+  the sum type does not have stays silent for that reason.
+- **A module is a place names live in.** `mod gfx { … }` carries its
+  declarations, `import "gfx/shapes"` reads the file beside the one that asked
+  (or below it, or in `$DUX_STDLIB`), and what it declares is known as
+  `shapes.Size`, `shapes.area`, `shapes.LIMIT` — inside the module the same
+  names are bare. What waits: visibility (`pub` is out of scope, OPEN-18),
+  `Shape::Circle` of a module's own enum through the module's name, and the
+  `std/..` files themselves, which report E0007 until they are written.
 - **No bounds traps.** `dims[i]` is unchecked; the debug-mode bounds check
   waits on the panic runtime.
 - **`defer` is body-level.** Correct per-path behavior inside nested blocks
   needs a runtime defer chain (M3); nested `defer` reports E0007 honestly.
-- **Arrays do not cross function boundaries.** By-value array parameters and
-  results report E0007; they return in M3 with slices. It is what stops
-  `zeros<4>() -> [f32; N]` from running, not the generics.
+- **A fixed array is not a parameter.** A result crosses the boundary whole:
+  the callee reads the array out of wherever it was standing, the caller
+  builds it standing in a slot of its own, so `zeros<4>() -> [f32; N]` answers
+  and `p[0]` goes on reading it in place. An array written as a *parameter*
+  still reports E0007; pass `&xs`, which is a view.
 - **A generic is code, not a function.** A generic `fn` is emitted once per
   distinct list of arguments some call gave it — `dux.max.i32`,
   `dux.max.f64` — and not at all for a generic no call asked for. A parameter
   the call cannot say is said at the call, since nothing vaguer can be
   emitted in its place.
-- **A method's own parameters are not there yet.** `impl Pair<A, B> { … }`
-  parses and each receiver that calls for a method gets that method emitted
-  in its own types (`dux.Cell.i32.shown`, `dux.Cell.string.shown`), but a
-  method written over parameters of its own, and an `impl` of a generic
-  `enum`, report E0007.
+- **A method's own parameters are not there yet.** `impl Pair<A, B> { … }` and
+  `impl Option<T> { … }` parse — a sum type is a type an `impl` extends too,
+  and the predeclared enums are ordinary enums, so their methods are ordinary
+  code — and each receiver that calls for a method gets that method emitted in
+  its own types (`dux.Cell.i32.shown`, `dux.Option.string.shown`). A method
+  written over parameters of its own, beyond the `impl`'s, reports E0007, and
+  so does `impl<T> Option<T>`, which states the parameters twice.
 - **Ranges are loop-only.** `0..3` exists as a `for .. in` iterable, not as a
   value.
 - **An interpolated hole holds no quotes.** `{f("x")}` does not lex; `{x}` and
