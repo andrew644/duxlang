@@ -712,13 +712,18 @@ impl<'a> Checker<'a> {
         span: Span,
         expected: Option<&Ty>,
     ) -> Ty {
-        let saved = std::mem::take(&mut self.instantiation);
+        // The arguments are written in the scope of the call, so they are read
+        // there; only the record's own fields are read under them.
         let mut made_of: Vec<Ty> = Vec::new();
         if args.len() == record.params.len() {
-            for (param, arg) in record.params.iter().zip(args) {
-                let ty = self.resolve_type(arg);
-                made_of.push(ty.clone());
-                self.instantiation.push((param.clone(), ty));
+            for arg in args {
+                made_of.push(self.resolve_type(arg));
+            }
+        }
+        let saved = std::mem::take(&mut self.instantiation);
+        if made_of.len() == record.params.len() {
+            for (param, ty) in record.params.iter().zip(&made_of) {
+                self.instantiation.push((param.clone(), ty.clone()));
             }
         } else if let Some(Ty::Instance { name: owner, args: known }) = expected {
             if owner == name && known.len() == record.params.len() {
@@ -727,6 +732,9 @@ impl<'a> Checker<'a> {
                     self.instantiation.push((param.clone(), ty.clone()));
                 }
             }
+        }
+        if made_of.len() != record.params.len() {
+            made_of.clear();
         }
         for (field, value) in fields {
             let declared = record

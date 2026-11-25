@@ -14,7 +14,7 @@ each remaining gap is waiting for. A gap is a milestone, never a verdict.
 | `strings.dux` | checks clean; runs until `.bytes()` | `string` methods (`.bytes()`, `.runes()`) | the standard library (M5) |
 | `sum_types.dux` | compiles, runs; variants, payloads, guards, or-patterns, ranges and exhaustiveness all reach machine code, and the dispatch is the `switch` on the tag | — |
 | `option_result.dux` | checks until `fs.read_to_string`; the predeclared `Option`/`Result` lower and match today | `std/fs`, `.bytes()`, `.trim()`, and the `Option` methods (`unwrap`, `unwrap_or`), which are prelude code | the standard library (M5) |
-| `generics.dux` | parses | monomorphisation (M5) |
+| `generics.dux` | checks clean; `max<i32>`, `max<f64>`, `max<i64>`, `Pair<i32, string>` and `zeros<4>` all reach machine code as functions and records of their own | an array returned from a function, and `HashMap<K, V>`, which is standard-library code (M5) |
 | `c_interop.dux` | parses | libclang importer (M6) |
 
 ## Deliberate runtime gaps today
@@ -58,7 +58,16 @@ each remaining gap is waiting for. A gap is a milestone, never a verdict.
 - **`defer` is body-level.** Correct per-path behavior inside nested blocks
   needs a runtime defer chain (M3); nested `defer` reports E0007 honestly.
 - **Arrays do not cross function boundaries.** By-value array parameters and
-  results report E0007; they return in M3 with slices.
+  results report E0007; they return in M3 with slices. It is what stops
+  `zeros<4>() -> [f32; N]` from running, not the generics.
+- **A generic is code, not a function.** A generic `fn` is emitted once per
+  distinct list of arguments some call gave it — `dux.max.i32`,
+  `dux.max.f64` — and not at all for a generic no call asked for. A parameter
+  the call cannot say is said at the call, since nothing vaguer can be
+  emitted in its place.
+- **An `impl` is for a named record.** `impl Pair<A, B> { … }` does not parse:
+  a method on a generic record needs its own instantiation story, and no
+  example asks for one yet.
 - **Ranges are loop-only.** `0..3` exists as a `for .. in` iterable, not as a
   value.
 - **An interpolated hole holds no quotes.** `{f("x")}` does not lex; `{x}` and

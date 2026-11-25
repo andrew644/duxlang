@@ -93,6 +93,13 @@ pub(crate) struct ArrayInfo {
 #[derive(Debug)]
 pub(crate) struct StructInfo {
     pub(crate) name: &'static str,
+    /// What the record is called with its arguments: `Vec3`, or
+    /// `Pair<i32, string>`. Two ways of filling one generic `struct` are two
+    /// records, and this is the name that keeps their fields apart.
+    pub(crate) spelled: String,
+    /// The arguments it was made of, empty for a record that takes none. A
+    /// call that passes one says what its parameters stand for.
+    pub(crate) args: Vec<DuxType>,
     pub(crate) llvm: StructType<'static>,
 }
 
@@ -121,6 +128,9 @@ pub(crate) struct EnumInfo {
     pub(crate) name: &'static str,
     /// The instantiation, spelled for diagnostics: `Option<i32>`.
     pub(crate) spelled: String,
+    /// What it was made of, in order. A call that passes one says what its
+    /// parameters stand for.
+    pub(crate) args: Vec<DuxType>,
     pub(crate) variants: Vec<VariantInfo>,
     pub(crate) llvm: BasicTypeEnum<'static>,
     /// The tag's own type, and its offset — a tagged enum keeps it at zero.
@@ -508,6 +518,24 @@ fn fits_i128(value: i128, ty: DuxType) -> bool {
     }
 }
 
+/// What one generic parameter stands for while an instantiation is lowered:
+/// a type, or the value a `const` parameter was handed.
+#[derive(Clone, Copy)]
+enum Stood {
+    Ty(DuxType),
+    Const(u64),
+}
+
+/// A generic `fn` one call asked for, waiting for its body: the code is the
+/// declaration's, the types are the call's.
+#[derive(Clone)]
+struct Instance {
+    key: String,
+    symbol: String,
+    decl: &'static FnDecl,
+    bound: Vec<(String, Stood)>,
+}
+
 #[derive(Clone)]
 struct Signature {
     params: Vec<DuxType>,
@@ -529,6 +557,9 @@ struct Unit<'a> {
     symbol: String,
     owner: Option<&'a str>,
     external: bool,
+    /// This unit is one instantiation of a generic `fn`, not the generic `fn`
+    /// as written: its types are already known and it reaches the module.
+    instantiated: bool,
     decl: &'a FnDecl,
 }
 
@@ -539,6 +570,7 @@ impl<'a> Unit<'a> {
             symbol: decl.name.name.clone(),
             owner: None,
             external: false,
+            instantiated: false,
             decl,
         }
     }
@@ -556,6 +588,7 @@ impl<'a> Unit<'a> {
             symbol: format!("dux.{owner}.{}", decl.name.name),
             owner: Some(owner),
             external: false,
+            instantiated: false,
             decl,
         }
     }
@@ -596,6 +629,20 @@ pub(crate) struct Emitter {
     /// `StructInfo` (a nominal LLVM struct type plus resolved field types).
     struct_decls: Vec<dux_ast::StructDecl>,
     structs: HashMap<String, &'static StructInfo>,
+    /// Generic `fn` declarations, by name: the code each instantiation copies.
+    generic_fns: HashMap<String, &'static FnDecl>,
+    /// Generic `struct` declarations, by name.
+    generic_structs: HashMap<String, &'static dux_ast::StructDecl>,
+    /// A generic record at one instantiation, by the name it spells.
+    instances: HashMap<String, &'static StructInfo>,
+    /// What the parameters of the code being lowered stand for. A parameter
+    /// name means whatever this says it means.
+    substituting: Vec<(String, Stood)>,
+    /// Instantiations a call asked for, waiting for their body.
+    pending: Vec<Instance>,
+    /// Instantiations whose body is in the module already: one per distinct
+    /// set of arguments, however many calls asked for it.
+    emitted: HashSet<String>,
     /// A declared record's fields, by record name. They live here rather than
     /// on `StructInfo` so a record can exist — and be pointed at — before its
     /// fields are known, which is what `struct Node { next: *Node }` needs.
@@ -672,6 +719,12 @@ impl Emitter {
             signatures: HashMap::new(),
             struct_decls: Vec::new(),
             structs: HashMap::new(),
+            generic_fns: HashMap::new(),
+            generic_structs: HashMap::new(),
+            instances: HashMap::new(),
+            substituting: Vec::new(),
+            pending: Vec::new(),
+            emitted: HashSet::new(),
             struct_fields: HashMap::new(),
             shapes: HashMap::new(),
             enums: HashMap::new(),
@@ -758,6 +811,20 @@ impl Emitter {
             );
         }
         self.struct_decls = program.structs().cloned().collect();
+        for decl in program.structs() {
+            if !decl.type_params.is_empty() {
+                self.generic_structs
+                    .insert(decl.name.name.clone(), Box::leak(Box::new(decl.clone())));
+            }
+        }
+        for decl in program.functions() {
+            if !decl.type_params.is_empty() {
+                self.generic_fns.insert(
+                    decl.name.name.clone(),
+                    Box::leak(Box::new(decl.clone())),
+                );
+            }
+        }
         self.shapes = sums::prelude()
             .into_iter()
             .map(|shape| (shape.name.clone(), shape))
@@ -811,6 +878,13 @@ impl Emitter {
         for unit in &units {
             self.lower_body(module, unit);
         }
+        // A call inside one of those bodies may have asked for an
+        // instantiation; a generic body may ask for another. The queue is how
+        // the walk reaches the whole tree of them, recursion included.
+        while !self.pending.is_empty() {
+            let instance = self.pending.remove(0);
+            self.lower_instance(module, &instance);
+        }
         if let Some(dibuilder) = &self.dibuilder {
             dibuilder.finalize();
         }
@@ -829,17 +903,25 @@ impl Emitter {
     /// to its nominal record.
     fn type_of(&mut self, ty: &Type) -> Option<DuxType> {
         match ty {
-            Type::Named { name, args, .. } if args.is_empty() => match DuxType::named(name) {
-                Some(primitive) => Some(primitive),
-                None => match self.struct_type_of(name) {
-                    Some(record) => Some(record),
-                    None => self.enum_type_of(name, &[]),
-                },
-            },
+            Type::Named { name, args, .. } if args.is_empty() => {
+                match self.stands_for(name) {
+                    Some(Stood::Ty(ty)) => Some(ty),
+                    _ => match DuxType::named(name) {
+                        Some(primitive) => Some(primitive),
+                        None => match self.struct_type_of(name) {
+                            Some(record) => Some(record),
+                            None => self.enum_type_of(name, &[]),
+                        },
+                    },
+                }
+            }
             Type::Named { name, args, .. } => {
                 let mut given = Vec::new();
                 for argument in args {
                     given.push(self.type_of(argument)?);
+                }
+                if self.generic_structs.contains_key(name) {
+                    return self.record_instance_of(name, &given);
                 }
                 self.enum_type_of(name, &given)
             }
@@ -857,10 +939,8 @@ impl Emitter {
             }
             Type::Array { element, len, .. } => {
                 let element = self.type_of(element)?;
-                let Expr::Int { value, .. } = len.as_ref() else {
-                    return None;
-                };
-                Some(DuxType::array(element, u64::try_from(*value).ok()?))
+                let count = self.const_length(len)?;
+                Some(DuxType::array(element, count))
             }
             other => DuxType::from_ast(other),
         }
@@ -1003,6 +1083,7 @@ impl Emitter {
         let info: &'static EnumInfo = Box::leak(Box::new(EnumInfo {
             name: Box::leak(name.to_string().into_boxed_str()) as &str,
             spelled: key.clone(),
+            args: args.to_vec(),
             variants,
             llvm,
             tag,
@@ -1281,7 +1362,7 @@ impl Emitter {
         let decl = self
             .struct_decls
             .iter()
-            .find(|decl| decl.name.name == name)
+            .find(|decl| decl.name.name == name && decl.type_params.is_empty())
             .cloned()?;
         if self.resolving.iter().any(|busy| busy == name) {
             return self.in_progress(name);
@@ -1292,6 +1373,8 @@ impl Emitter {
         let llvm = self.context.opaque_struct_type(name);
         let info: &'static StructInfo = Box::leak(Box::new(StructInfo {
             name: Box::leak(name.to_string().into_boxed_str()) as &str,
+            spelled: name.to_string(),
+            args: Vec::new(),
             llvm,
         }));
         self.structs.insert(name.to_string(), info);
@@ -1352,7 +1435,7 @@ impl Emitter {
     /// A declared record's fields, in declaration order.
     fn struct_field_list(&self, info: &StructInfo) -> &[(&'static str, DuxType)] {
         self.struct_fields
-            .get(info.name)
+            .get(info.spelled.as_str())
             .map(Vec::as_slice)
             .unwrap_or_default()
     }
@@ -1833,9 +1916,11 @@ impl Emitter {
             );
             return;
         }
-        if !function.type_params.is_empty() {
+        if !function.type_params.is_empty() && !unit.instantiated {
+            // A generic `fn` is code that has not been asked for anything yet.
+            // It reaches the module one instantiation per call, which is what
+            // makes `max<i32>` a real function and `max` not one at all.
             self.skipped.insert(key.clone());
-            self.unsupported(function.name.span, "a generic `fn` (monomorphisation lands at M5)");
             return;
         }
         let mut params = Vec::new();
@@ -4301,15 +4386,11 @@ impl Emitter {
         expected: Option<DuxType>,
         span: Span,
     ) -> Option<Typed> {
-        let Expr::Int { value: count, .. } = len else {
+        let Some(count) = self.const_length(len) else {
             self.unsupported(
                 len.span(),
-                "a repeated array whose length is not a literal (constant folding lands at M3)",
+                "a repeated array whose length is neither a literal nor a `const` parameter this call filled in",
             );
-            return None;
-        };
-        let Ok(count) = u64::try_from(*count) else {
-            self.unsupported(len.span(), "an array length that does not fit a `u64`");
             return None;
         };
         if count > u32::MAX as u64 {
@@ -4941,6 +5022,20 @@ impl Emitter {
             return None;
         };
         let info = self.struct_of(ty)?;
+        self.record_value(module, ty, info, fields, span)
+    }
+
+    /// Fill a record's fields in, in the order written. The value lives in a
+    /// slot of its own, which is what makes assignment a copy of the whole.
+    fn record_value(
+        &mut self,
+        module: &Module<'static>,
+        ty: DuxType,
+        info: &'static StructInfo,
+        fields: &[(dux_ast::Ident, Expr)],
+        span: Span,
+    ) -> Option<Typed> {
+        let _ = span;
         let slot = self.alloca(ty, "record");
         let _ = self.builder.build_store(slot, info.llvm.const_zero());
         for (field, value) in fields {
@@ -5161,6 +5256,12 @@ impl Emitter {
                 if let Some(c) = self.consts.get(name).cloned() {
                     return Some(self.const_reference(&c, expected, *span));
                 }
+                // A `const` parameter is a value the body may name, and this
+                // is the instantiation that says which one.
+                if let Some(Stood::Const(value)) = self.stands_for(name) {
+                    let count = self.context.i64_type().const_int(value, false);
+                    return Some(Typed::int(count, DuxType::U64));
+                }
                 // `None` names a variant as plainly as it names a constant.
                 if !self.functions.contains_key(name.as_str()) {
                     if let Some(owner) = self.owner_of_variant(name) {
@@ -5235,7 +5336,10 @@ impl Emitter {
             Expr::Field { base, name, span } => {
                 self.field_expr(module, base, &name.name, name.span, *span)
             }
-            Expr::StructLiteral { name, fields, span, .. } => {
+            Expr::StructLiteral { name, args, fields, span } => {
+                if let Some(record) = self.generic_structs.get(name.as_str()).copied() {
+                    return self.generic_record_value(module, record, args, fields, *span);
+                }
                 if self.structs.contains_key(name.as_str()) || !name.contains("::") {
                     return self.struct_literal(module, name, fields, *span);
                 }
@@ -6162,6 +6266,14 @@ impl Emitter {
             Expr::Path { qualifier, name, .. } if self.shapes.contains_key(qualifier) => {
                 self.variant_value(module, qualifier, name, args, &[], span, expected)
             }
+            Expr::Path {
+                qualifier,
+                name,
+                args: written,
+                ..
+            } if qualifier.is_empty() && self.generic_fns.contains_key(name) => {
+                self.generic_call(module, name, written, args, span)
+            }
             Expr::Field { base, name, .. } => {
                 self.call_method(module, base, name, args, span)
             }
@@ -6188,6 +6300,9 @@ impl Emitter {
         // declares its own `make` wins.
         if matches!(name, "new" | "make" | "free" | "del") && !self.functions.contains_key(name) {
             return self.memory_builtin(module, name, args, span);
+        }
+        if self.generic_fns.contains_key(name) {
+            return self.generic_call(module, name, &[], args, span);
         }
         if self.skipped.contains(name) {
             return Some(Typed::error());
@@ -7878,6 +7993,458 @@ fn payload_field_of(info: Option<&'static EnumInfo>, variant: usize, name: &str)
 
 /// What an enum and its arguments are spelled as, which is also the key the
 /// instantiation is cached under: `Option<i32>`.
+impl Emitter {
+    /// What a generic parameter of the code being lowered stands for. Outside
+    /// an instantiation it stands for nothing, which is the honest answer: the
+    /// only code this build emits is code whose types are known.
+    fn stands_for(&self, name: &str) -> Option<Stood> {
+        self.substituting
+            .iter()
+            .find(|(param, _)| param == name)
+            .map(|(_, stood)| *stood)
+    }
+
+    /// An array length the lowering can count: a literal, or the value a
+    /// `const` parameter was handed.
+    fn const_length(&self, len: &Expr) -> Option<u64> {
+        match len {
+            Expr::Int { value, .. } => u64::try_from(*value).ok(),
+            Expr::Ident { name, .. } => match self.stands_for(name) {
+                Some(Stood::Const(value)) => Some(value),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    /// A generic `struct` at one instantiation. `Pair<i32, string>` and
+    /// `Pair<string, i32>` are as different as two `struct`s that share no
+    /// name, so each gets its own nominal LLVM type and its own field types.
+    fn record_instance_of(&mut self, name: &str, args: &[DuxType]) -> Option<DuxType> {
+        let spelled = instantiation(name, args);
+        if let Some(info) = self.instances.get(&spelled).copied() {
+            if self.resolving.contains(&spelled) {
+                return self.in_progress_record(&spelled, info, name);
+            }
+            return Some(DuxType::Struct(info));
+        }
+        let decl = self.generic_structs.get(name).copied()?;
+        if decl.type_params.len() != args.len() {
+            self.unsupported(
+                decl.span,
+                &format!(
+                    "`{name}` is written over {} parameters; this wants {}",
+                    decl.type_params.len(),
+                    args.len()
+                ),
+            );
+            return None;
+        }
+        let llvm = self.context.opaque_struct_type(&spelled);
+        let info: &'static StructInfo = Box::leak(Box::new(StructInfo {
+            name: Box::leak(name.to_string().into_boxed_str()) as &str,
+            spelled: spelled.clone(),
+            args: args.to_vec(),
+            llvm,
+        }));
+        // The handle exists before the fields are read, so a `*Self` of the
+        // same instantiation points at a type that is still being laid out.
+        self.instances.insert(spelled.clone(), info);
+        let saved = std::mem::take(&mut self.substituting);
+        self.substituting = decl
+            .type_params
+            .iter()
+            .zip(args)
+            .map(|(param, arg)| (param.name.name.clone(), Stood::Ty(*arg)))
+            .collect();
+        self.resolving.push(spelled.clone());
+        let mut fields = Vec::new();
+        let mut field_types = Vec::new();
+        let mut unresolved = false;
+        for field in &decl.fields {
+            let Some(ty) = self.type_of(&field.ty) else {
+                unresolved = true;
+                break;
+            };
+            fields.push((
+                Box::leak(field.name.name.clone().into_boxed_str()) as &str,
+                ty,
+            ));
+            field_types.push(ty.llvm(self.context));
+        }
+        self.resolving.pop();
+        self.substituting = saved;
+        if unresolved {
+            self.instances.remove(&spelled);
+            self.unsupported(
+                decl.span,
+                &format!("the type of one of `{spelled}`\'s fields"),
+            );
+            return None;
+        }
+        llvm.set_body(&field_types, false);
+        self.struct_fields.insert(spelled, fields);
+        Some(DuxType::Struct(info))
+    }
+
+    /// A generic record whose fields are still being read: only a pointer may
+    /// aim at it, because a value of it would contain itself.
+    fn in_progress_record(
+        &mut self,
+        spelled: &str,
+        info: &'static StructInfo,
+        name: &str,
+    ) -> Option<DuxType> {
+        if self.pointer_depth > 0 {
+            return Some(DuxType::Struct(info));
+        }
+        let span = self
+            .generic_structs
+            .get(name)
+            .map(|decl| decl.span)
+            .unwrap_or_default();
+        self.diagnostics.push(
+            Diagnostic::error(
+                code::CODEGEN_FAILED,
+                format!("`{spelled}` has no size: a `struct` field must reach itself through a pointer"),
+            )
+            .with_span(span),
+        );
+        None
+    }
+
+    /// `Pair<i32, string> { first: 1, second: "one" }`: the arguments say what
+    /// the record was made of, and the fields written have to fit that.
+    fn generic_record_value(
+        &mut self,
+        module: &Module<'static>,
+        record: &dux_ast::StructDecl,
+        args: &[Type],
+        fields: &[(dux_ast::Ident, Expr)],
+        span: Span,
+    ) -> Option<Typed> {
+        let mut given = Vec::new();
+        for arg in args {
+            let Some(ty) = self.type_of(arg) else {
+                self.unsupported(arg.span(), "this type argument");
+                return None;
+            };
+            given.push(ty);
+        }
+        let ty = self.record_instance_of(&record.name.name, &given)?;
+        let info = self.struct_of(ty)?;
+        self.record_value(module, ty, info, fields, span)
+    }
+
+    /// A call of a generic function. What it emits is the one instantiation
+    /// this call asks for: the declaration's code, the call's types. Nothing
+    /// is emitted for a generic no call asked for.
+    fn generic_call(
+        &mut self,
+        module: &Module<'static>,
+        name: &str,
+        written: &[Type],
+        args: &[Expr],
+        span: Span,
+    ) -> Option<Typed> {
+        let decl = self.generic_fns.get(name).copied()?;
+        // The arguments are the caller's, so they are lowered in the
+        // caller's types. What the parameters stand for is not known until
+        // they are, and is not the caller's business afterwards at all.
+        let mut lowered = Vec::new();
+        for arg in args {
+            lowered.push(self.expr(module, arg, None)?);
+        }
+        if lowered.len() != decl.params.len() {
+            self.diagnostics.push(
+                Diagnostic::error(
+                    code::WRONG_ARITY,
+                    format!(
+                        "`{name}` takes {} arguments, given {}",
+                        decl.params.len(),
+                        lowered.len()
+                    ),
+                )
+                .with_span(span),
+            );
+            return None;
+        }
+        let saved = std::mem::take(&mut self.substituting);
+        let instance = match self.instantiation_of(decl, written, &lowered, span) {
+            None => None,
+            Some(bound) => {
+                self.substituting = bound.clone();
+                self.declare_instance(module, decl, name, spelled(name, &bound), bound)
+            }
+        };
+        self.substituting = saved;
+        let Some(instance) = instance else {
+            return Some(Typed::error());
+        };
+        let Some(function) = self.functions.get(&instance.key).copied() else {
+            return Some(Typed::error());
+        };
+        let (params, return_ty, hidden_context) = {
+            let signature = self
+                .signatures
+                .get(&instance.key)
+                .expect("an instantiated function has a recorded signature");
+            (
+                signature.params.clone(),
+                signature.return_ty,
+                signature.hidden_context,
+            )
+        };
+        let mut arguments = Vec::new();
+        for (given, (arg, value)) in params.iter().zip(args.iter().zip(lowered)) {
+            let value = self.coerce_implicit(module, value, *given, arg.span())?;
+            match value.basic() {
+                Some(basic) => arguments.push(BasicMetadataValueEnum::from(basic)),
+                None => {
+                    self.unsupported(arg.span(), "passing this value");
+                    return None;
+                }
+            }
+        }
+        if hidden_context {
+            let context = self.context_value(span)?;
+            arguments.push(context.into());
+        }
+        self.invoke(function, arguments, return_ty)
+    }
+
+    /// What the parameters of a generic call stand for: what was written
+    /// between `<` and `>`, or what the arguments turned out to be.
+    fn instantiation_of(
+        &mut self,
+        decl: &FnDecl,
+        written: &[Type],
+        lowered: &[Typed],
+        span: Span,
+    ) -> Option<Vec<(String, Stood)>> {
+        let mut bound: Vec<(String, Stood)> = Vec::new();
+        if !written.is_empty() {
+            let mut types = decl.type_params.iter().filter(|param| !param.is_const);
+            for arg in written {
+                if let Type::ConstArgument { value, .. } = arg {
+                    let Some(ConstValue::Int(count)) = self.const_expr(value) else {
+                        self.unsupported(value.span(), "a `const` argument that is not a whole number");
+                        return None;
+                    };
+                    let Ok(count) = u64::try_from(count) else {
+                        self.unsupported(value.span(), "a `const` argument that does not fit a `u64`");
+                        return None;
+                    };
+                    let Some(param) = decl.type_params.iter().find(|param| param.is_const) else {
+                        self.unsupported(
+                            value.span(),
+                            "a value where this function takes no `const` parameter",
+                        );
+                        return None;
+                    };
+                    bound.push((param.name.name.clone(), Stood::Const(count)));
+                    continue;
+                }
+                let Some(param) = types.next() else { break };
+                let Some(ty) = self.type_of(arg) else {
+                    self.unsupported(arg.span(), "this type argument");
+                    return None;
+                };
+                bound.push((param.name.name.clone(), Stood::Ty(ty)));
+            }
+        } else {
+            for (param, value) in decl.params.iter().zip(lowered) {
+                self.bind_parameters(&decl.type_params, &param.ty, value.ty, &mut bound);
+            }
+        }
+        let mut missing: Vec<&str> = Vec::new();
+        for param in &decl.type_params {
+            if !bound.iter().any(|(known, _)| *known == param.name.name) {
+                missing.push(param.name.name.as_str());
+            }
+        }
+        if !missing.is_empty() {
+            self.diagnostics.push(
+                Diagnostic::error(
+                    code::TYPE_MISMATCH,
+                    format!(
+                        "this call of `{}` cannot say what {} stands for",
+                        decl.name.name,
+                        missing
+                            .iter()
+                            .map(|name| format!("`{name}`"))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ),
+                )
+                .with_span(span)
+                .with_note("write the arguments between `<` and `>`, or give the binding a type"),
+            );
+            return None;
+        }
+        // The same call shape always fills the parameters in the same order,
+        // and two calls that ask for the same thing get the same function.
+        let order = decl
+            .type_params
+            .iter()
+            .map(|param| param.name.name.clone())
+            .collect::<Vec<_>>();
+        bound.sort_by_key(|(param, _)| {
+            order
+                .iter()
+                .position(|name| name == param)
+                .unwrap_or(usize::MAX)
+        });
+        Some(bound)
+    }
+
+    /// One declared parameter type against the type the call actually passed,
+    /// binding the parameters that type mentions.
+    fn bind_parameters(
+        &mut self,
+        params: &[dux_ast::TypeParam],
+        declared: &Type,
+        given: DuxType,
+        bound: &mut Vec<(String, Stood)>,
+    ) {
+        let mentions = |name: &str, bound: &[(String, Stood)]| {
+            params
+                .iter()
+                .any(|param| param.name.name == name && !param.is_const)
+                && !bound.iter().any(|(known, _)| known == name)
+        };
+        match declared {
+            Type::Named { name, args, .. } if args.is_empty() => {
+                if mentions(name, bound) {
+                    bound.push((name.clone(), Stood::Ty(given)));
+                }
+            }
+            Type::Named { name, args, .. } => {
+                let _ = name;
+                let inner: Vec<DuxType> = match given {
+                    DuxType::Enum(info) => info.args.clone(),
+                    DuxType::Struct(info) => info.args.clone(),
+                    _ => Vec::new(),
+                };
+                for (param, given) in args.iter().zip(inner) {
+                    self.bind_parameters(params, param, given, bound);
+                }
+            }
+            Type::Pointer { pointee, .. } => {
+                if let Some(target) = self.pointee_of(given) {
+                    self.bind_parameters(params, pointee, target, bound);
+                }
+            }
+            Type::Slice { element, .. } => {
+                if let DuxType::Slice(target) = given {
+                    self.bind_parameters(params, element, *target, bound);
+                }
+            }
+            Type::Array { element, .. } => {
+                if let Some(info) = given.array_info() {
+                    self.bind_parameters(params, element, info.elem, bound);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Declare the instantiation this call asked for, and queue its body if it
+    /// is not emitted yet. The declaration is the same machinery every other
+    /// function goes through, read under the types this call brought.
+    fn declare_instance(
+        &mut self,
+        module: &Module<'static>,
+        decl: &'static FnDecl,
+        name: &str,
+        spelled: String,
+        bound: Vec<(String, Stood)>,
+    ) -> Option<Instance> {
+        if self.allocating.contains(name) {
+            self.allocating.insert(spelled.clone());
+        }
+        if self.skipped.contains(&spelled) {
+            return None;
+        }
+        let instance = Instance {
+            symbol: symbol_of(&spelled),
+            key: spelled,
+            decl,
+            bound,
+        };
+        if self.functions.contains_key(&instance.key) {
+            return Some(instance);
+        }
+        let unit = Unit {
+            key: instance.key.clone(),
+            symbol: instance.symbol.clone(),
+            owner: None,
+            external: false,
+            instantiated: true,
+            decl: instance.decl,
+        };
+        self.declare(module, &unit);
+        if !self.functions.contains_key(&instance.key) {
+            return None;
+        }
+        if !self.emitted.contains(&instance.key) {
+            self.pending.push(instance.clone());
+        }
+        Some(instance)
+    }
+
+    /// The other half of an instantiation: the body, in the types the call
+    /// asked for. A call inside it may ask for another one, which the queue
+    /// reaches after this body is done.
+    fn lower_instance(&mut self, module: &Module<'static>, instance: &Instance) {
+        if self.emitted.contains(&instance.key) {
+            return;
+        }
+        self.emitted.insert(instance.key.clone());
+        let saved = std::mem::take(&mut self.substituting);
+        self.substituting = instance.bound.clone();
+        let unit = Unit {
+            key: instance.key.clone(),
+            symbol: instance.symbol.clone(),
+            owner: None,
+            external: false,
+            instantiated: true,
+            decl: instance.decl,
+        };
+        self.lower_body(module, &unit);
+        self.substituting = saved;
+    }
+}
+
+/// The name of the function one set of arguments asks for: `max<i32>`.
+fn spelled(name: &str, bound: &[(String, Stood)]) -> String {
+    let parts = bound
+        .iter()
+        .map(|(_, stood)| match stood {
+            Stood::Ty(ty) => ty.name(),
+            Stood::Const(value) => value.to_string(),
+        })
+        .collect::<Vec<_>>();
+    if parts.is_empty() {
+        return name.to_string();
+    }
+    format!("{name}<{}>", parts.join(", "))
+}
+
+/// A symbol LLVM will print without quoting it: `<`, `>` and the commas
+/// between arguments become dots.
+fn symbol_of(key: &str) -> String {
+    let mut symbol = String::from("dux.");
+    for letter in key.chars() {
+        match letter {
+            '<' | ',' | ' ' => symbol.push('.'),
+            '>' => {}
+            other => symbol.push(other),
+        }
+    }
+    symbol
+}
+
 fn instantiation(name: &str, args: &[DuxType]) -> String {
     if args.is_empty() {
         return name.to_string();

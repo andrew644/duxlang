@@ -1410,3 +1410,139 @@ fn main() -> i32 {
         "the binder holds the payload:\n{ir}"
     );
 }
+
+const MAX: &str = "fn max<T>(a: T, b: T) -> T {
+    return if a > b { a } else { b }
+}";
+
+#[test]
+fn a_generic_fn_is_emitted_once_per_thing_it_was_asked_to_be() {
+    let ir = build(&format!(
+        "{MAX}\nfn main() {{\n    println($\"{{}}\", max(3, 7))\n    println($\"{{}}\", max(2.5, 1.5))\n}}",
+    ))
+    .expect("builds")
+    .ir_text();
+    assert!(
+        ir.contains("define i32 @dux.max.i32(i32 %")
+            && ir.contains("define double @dux.max.f64(double %"),
+        "the two calls ask for two functions, and both are here:\n{ir}"
+    );
+    assert!(
+        !ir.contains("@dux.max(") && !ir.contains("@max("),
+        "and there is no `max` that stands for no type at all:\n{ir}"
+    );
+    assert_eq!(
+        ir.matches("define i32 @dux.max.i32").count(),
+        1,
+        "one call or ten, an instantiation is emitted once:\n{ir}"
+    );
+}
+
+#[test]
+fn a_generic_no_call_asked_for_is_not_in_the_module() {
+    let ir = build(&format!(
+        "{MAX}\nfn main() {{\n    println($\"{{}}\", 1)\n}}",
+    ))
+    .expect("builds")
+    .ir_text();
+    assert!(
+        !ir.contains("@dux.max"),
+        "`max` was never called, so nothing of it is code-generated:\n{ir}"
+    );
+}
+
+#[test]
+fn a_generic_body_that_calls_itself_reaches_the_same_function_it_is_in() {
+    let ir = build(
+        "fn fact<T>(n: T) -> T {
+    return if n <= 1 { n } else { n * fact(n - 1) }
+}
+fn main() {
+    println($\"{}\", fact<i64>(5))
+}",
+    )
+    .expect("builds")
+    .ir_text();
+    assert!(
+        ir.contains("define i64 @dux.fact.i64(i64 %"),
+        "{ir}"
+    );
+    assert!(
+        ir.contains("call i64 @dux.fact.i64(i64 %"),
+        "the body's own call is to the instantiation it is part of, and to no \
+         function that stands for no type:\n{ir}"
+    );
+    assert!(
+        !ir.contains("@dux.fact(i64 5)") && ir.contains("call i64 @dux.fact.i64(i64 5)"),
+        "the call in `main` reaches the same one function:\n{ir}"
+    );
+}
+
+#[test]
+fn a_generic_record_is_a_record_whose_fields_are_the_arguments() {
+    let ir = build(
+        "struct Pair<A, B> {
+    first: A,
+    second: B,
+}
+fn main() {
+    p := Pair<i32, string> { first: 1, second: \"one\" }
+    println($\"{} {}\", p.first, p.second)
+}",
+    )
+    .expect("builds")
+    .ir_text();
+    assert!(
+        ir.contains("%\"Pair<i32, string>\" = type { i32, { ptr, i64 } }"),
+        "the instantiation says what it was filled with:\n{ir}"
+    );
+}
+
+#[test]
+fn two_ways_of_filling_one_record_are_two_records() {
+    let ir = build(
+        "struct Pair<A, B> {
+    first: A,
+    second: B,
+}
+fn main() {
+    a := Pair<i32, string> { first: 1, second: \"one\" }
+    b := Pair<string, i32> { first: \"one\", second: 1 }
+    println($\"{} {}\", a.first, b.second)
+}",
+    )
+    .expect("builds")
+    .ir_text();
+    assert!(
+        ir.contains("%\"Pair<i32, string>\" = type { i32, { ptr, i64 } }")
+            && ir.contains("%\"Pair<string, i32>\" = type { { ptr, i64 }, i32 }"),
+        "swapping the arguments swaps the fields, and LLVM sees two types:\n{ir}"
+    );
+}
+
+#[test]
+fn a_const_parameter_answers_a_length_the_body_asks_for() {
+    let ir = build(
+        "fn tally<const N: usize>() -> i32 {
+    grid := [7; N]
+    total: i32 = 0
+    for v in grid {
+        total += v
+    }
+    return total
+}
+fn main() {
+    println($\"{}\", tally<3>())
+}",
+    )
+    .expect("builds")
+    .ir_text();
+    assert!(
+        ir.contains("alloca [3 x i32]") || ir.contains("[3 x i32]"),
+        "`N` was three, so the array is three wide:\n{ir}"
+    );
+    assert!(
+        !ir.contains("@dux.tally("),
+        "and the function that exists is the one that was asked for:\n{ir}"
+    );
+}

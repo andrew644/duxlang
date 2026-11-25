@@ -1,0 +1,63 @@
+package main
+
+// Monomorphisation: a generic `fn` reaches machine code once per thing it was
+// asked to be, and a generic `struct` once per way it was filled in.
+
+fn max<T>(a: T, b: T) -> T {
+    return if a > b { a } else { b }
+}
+
+fn fact<T>(n: T) -> T {
+    return if n <= 1 { n } else { n * fact(n - 1) }
+}
+
+struct Pair<A, B> {
+    first: A,
+    second: B,
+}
+
+fn swap<A, B>(p: Pair<A, B>) -> Pair<B, A> {
+    return Pair<B, A> { first: p.second, second: p.first }
+}
+
+// A `const` parameter is a compile-time value, which is how a generic gets to
+// name an array size.
+fn tally<const N: usize>(step: i32) -> i32 {
+    grid := [step; N]
+    total: i32 = 0
+    for v in grid {
+        total += v
+    }
+    return total
+}
+
+struct Cell<T> {
+    value: T,
+    next: Option<*Cell<T>>,
+}
+
+fn head<T>(c: Cell<T>) -> T {
+    return c.value
+}
+
+fn main() {
+    println($"max={} {} {}", max(3, 7), max(2.5, 1.5), max<i64>(9, 4))
+    println($"fact={}", fact<i64>(5))
+
+    p := Pair<i32, string> { first: 1, second: "one" }
+    q := swap(p)
+    println($"pair={} {} swapped={} {}", p.first, p.second, q.first, q.second)
+    println($"tally={} {}", tally<3>(7), tally<5>(2))
+
+    tail := Cell<string> { value: "last", next: None }
+    mid := Cell<string> { value: "mid", next: Some(&tail) }
+    top := Cell<string> { value: "top", next: Some(&mid) }
+    println($"head={}", head(top))
+    cursor: Option<*Cell<string>> = Some(&top)
+    hops: i32 = 0
+    while Some(cell) := cursor {
+        hops += 1
+        cursor = cell.next
+    }
+    println($"hops={}", hops)
+}
