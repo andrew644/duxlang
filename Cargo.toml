@@ -8,6 +8,7 @@ members = [
     "crates/dux_parser",
     "crates/dux_hir",
     "crates/dux_codegen",
+    "crates/dux_cinterop",
     "crates/dux_driver",
     "crates/duxc",
 ]

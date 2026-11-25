@@ -1,0 +1,11 @@
+[package]
+name = "dux_cinterop"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+dux_diag = { workspace = true }
+clang-sys = { version = "1.9", features = ["clang_3_9", "clang_4_0", "clang_5_0", "clang_6_0"] }
+
+[dev-dependencies]
