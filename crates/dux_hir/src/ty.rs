@@ -8,7 +8,7 @@
 //! C types, pointer targets) gets [`Ty::Opaque`], which never errors. A
 //! checker that guesses is worse than a checker that waits.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use dux_ast::{
     AssignOp, BinaryOp, Block, Decl, Expr, FieldPattern, ForKind, ImplDecl, MatchArm, Pattern,
@@ -52,6 +52,9 @@ pub enum Ty {
     /// A declared `enum`, with the arguments it was made of: `Shape` carries
     /// none, `Option<i32>` carries the one. Nominal, like a record.
     Enum { name: String, args: Vec<Ty> },
+    /// A generic `struct` made concrete: `Pair<i32, string>`. Nominal like a
+    /// record, and the arguments say what its fields were filled with.
+    Instance { name: String, args: Vec<Ty> },
     /// `return`, `break`, `panic`: a value that cannot arrive, so an arm that
     /// ends in one has whatever type the other arms agree on (DESIGN 4.5).
     Never,
@@ -84,6 +87,11 @@ impl Ty {
             Ty::Array(element) => format!("[{}]", element.name()),
             Ty::Slice(element) => format!("[]{}", element.name()),
             Ty::Struct(name) => name.clone(),
+            Ty::Instance { name, args } if args.is_empty() => name.clone(),
+            Ty::Instance { name, args } => format!(
+                "{name}<{}>",
+                args.iter().map(Ty::name).collect::<Vec<_>>().join(", ")
+            ),
             Ty::Enum { name, args } if args.is_empty() => name.clone(),
             Ty::Enum { name, args } => format!(
                 "{name}<{}>",
@@ -118,11 +126,8 @@ impl Ty {
     /// record a pointer aims at.
     fn record_owner(&self) -> Option<&String> {
         match self {
-            Ty::Struct(name) => Some(name),
-            Ty::Targeted(target) => match &**target {
-                Ty::Struct(name) => Some(name),
-                _ => None,
-            },
+            Ty::Struct(name) | Ty::Instance { name, .. } => Some(name),
+            Ty::Targeted(target) => target.record_owner(),
             _ => None,
         }
     }
@@ -442,6 +447,24 @@ struct Signature {
     check_arguments: bool,
 }
 
+/// A `struct` written with type parameters. Its fields are source types that
+/// only mean something once an instantiation says what the parameters are.
+#[derive(Clone)]
+struct GenericRecord {
+    params: Vec<String>,
+    fields: Vec<(String, Type)>,
+}
+
+/// A `fn` written with type parameters, kept as it was written so every call
+/// can be read again with the arguments that call brought.
+#[derive(Clone)]
+struct GenericFunction {
+    type_params: Vec<String>,
+    const_params: Vec<String>,
+    params: Vec<Type>,
+    result: Option<Type>,
+}
+
 struct Context {
     name: String,
     ty: Ty,
@@ -454,6 +477,16 @@ pub(crate) struct Checker<'a> {
     functions: HashMap<String, Signature>,
     methods: HashMap<(String, String), Signature>,
     structs: HashMap<String, Vec<(String, Type)>>,
+    /// Every generic `struct`, by name: its fields name parameters, so they
+    /// are kept as source types and read again per instantiation.
+    generic_structs: HashMap<String, GenericRecord>,
+    /// Every generic `fn`, by name, as written.
+    generic_functions: HashMap<String, GenericFunction>,
+    /// The instantiation the body being checked is read under: a type
+    /// parameter name means whatever this says it means.
+    instantiation: Vec<(String, Ty)>,
+    /// A generic body is read once per instantiation, not once per call.
+    read_instantiations: HashSet<String>,
     aliases: HashMap<String, Type>,
     /// Every `enum` in the file, over the two the universe predeclares.
     enums: HashMap<String, Shape>,
@@ -471,6 +504,10 @@ impl<'a> Checker<'a> {
             functions: HashMap::new(),
             methods: HashMap::new(),
             structs: HashMap::new(),
+            generic_structs: HashMap::new(),
+            generic_functions: HashMap::new(),
+            instantiation: Vec::new(),
+            read_instantiations: HashSet::new(),
             aliases: HashMap::new(),
             enums: sums::prelude()
                 .into_iter()
@@ -496,7 +533,21 @@ impl<'a> Checker<'a> {
                         .iter()
                         .map(|field| (field.name.name.clone(), field.ty.clone()))
                         .collect();
-                    self.structs.insert(decl.name.name.clone(), fields);
+                    if decl.type_params.is_empty() {
+                        self.structs.insert(decl.name.name.clone(), fields);
+                    } else {
+                        self.generic_structs.insert(
+                            decl.name.name.clone(),
+                            GenericRecord {
+                                params: decl
+                                    .type_params
+                                    .iter()
+                                    .map(|param| param.name.name.clone())
+                                    .collect(),
+                                fields,
+                            },
+                        );
+                    }
                 }
                 Decl::TypeAlias(TypeAliasDecl { name, type_params, aliased, .. }) => {
                     if type_params.is_empty() {
@@ -516,7 +567,28 @@ impl<'a> Checker<'a> {
         let functions: Vec<&dux_ast::FnDecl> = self.program.functions().collect();
         for function in functions {
             let signature = self.signature(function, false);
-            self.functions.insert(function.name.name.clone(), signature);
+            if !function.type_params.is_empty() {
+                let mut type_params = Vec::new();
+                let mut const_params = Vec::new();
+                for param in &function.type_params {
+                    if param.is_const {
+                        const_params.push(param.name.name.clone());
+                    } else {
+                        type_params.push(param.name.name.clone());
+                    }
+                }
+                self.generic_functions.insert(
+                    function.name.name.clone(),
+                    GenericFunction {
+                        type_params,
+                        const_params,
+                        params: function.params.iter().map(|p| p.ty.clone()).collect(),
+                        result: function.return_ty.clone(),
+                    },
+                );
+            }
+            self.functions
+                .insert(function.name.name.clone(), signature);
         }
         let decls: &[Decl] = self.program.decls.as_slice();
         for decl in decls {
@@ -547,7 +619,8 @@ impl<'a> Checker<'a> {
     }
 
     fn resolve_type(&self, ty: &Type) -> Ty {
-        self.resolve_type_in(ty, 0, &[])
+        let instantiation = self.instantiation.as_slice();
+        self.resolve_type_in(ty, 0, instantiation)
     }
 
     /// A source type, with the enclosing enum's parameters replaced by the
@@ -583,6 +656,18 @@ impl<'a> Checker<'a> {
                     };
                 }
                 if !args.is_empty() {
+                    if let Some(record) = self.generic_structs.get(name) {
+                        if record.params.len() != args.len() {
+                            return Ty::Opaque;
+                        }
+                        return Ty::Instance {
+                            name: name.clone(),
+                            args: args
+                                .iter()
+                                .map(|arg| self.resolve_type_in(arg, depth + 1, params))
+                                .collect(),
+                        };
+                    }
                     return Ty::Opaque;
                 }
                 if self.structs.contains_key(name.as_str()) {
@@ -616,21 +701,275 @@ impl<'a> Checker<'a> {
     /// does not read yet (M5). The arguments are still walked, so a fault inside
     /// one is not lost, and the answer is the type the name has without them —
     /// which is why the build has to say so rather than carry on.
-    fn waits_for_generics(&mut self, args: &[Type], span: Span) {
-        if args.is_empty() {
+    /// `Pair<i32, string> { first: 1, second: "one" }`: the arguments fill the
+    /// record's fields in, and what was written has to fit what they became.
+    fn generic_record_value(
+        &mut self,
+        name: &str,
+        record: &GenericRecord,
+        args: &[Type],
+        fields: &[(dux_ast::Ident, Expr)],
+        span: Span,
+        expected: Option<&Ty>,
+    ) -> Ty {
+        let saved = std::mem::take(&mut self.instantiation);
+        let mut made_of: Vec<Ty> = Vec::new();
+        if args.len() == record.params.len() {
+            for (param, arg) in record.params.iter().zip(args) {
+                let ty = self.resolve_type(arg);
+                made_of.push(ty.clone());
+                self.instantiation.push((param.clone(), ty));
+            }
+        } else if let Some(Ty::Instance { name: owner, args: known }) = expected {
+            if owner == name && known.len() == record.params.len() {
+                for (param, ty) in record.params.iter().zip(known) {
+                    made_of.push(ty.clone());
+                    self.instantiation.push((param.clone(), ty.clone()));
+                }
+            }
+        }
+        for (field, value) in fields {
+            let declared = record
+                .fields
+                .iter()
+                .find(|(known, _)| known == &field.name)
+                .map(|(_, ty)| ty.clone());
+            match declared {
+                Some(declared) => {
+                    let want = self.resolve_type(&declared);
+                    if want == Ty::Opaque {
+                        let _ = self.infer(value);
+                    } else {
+                        self.expect(value, &want);
+                    }
+                }
+                None => {
+                    let _ = self.infer(value);
+                    self.missing_field(name, &field.name, field.span);
+                }
+            }
+        }
+        self.instantiation = saved;
+        let _ = span;
+        Ty::Instance {
+            name: name.to_string(),
+            args: made_of,
+        }
+    }
+
+    /// A call of a generic function. The type parameters are answered either
+    /// as written (`max<i64>`) or read off the arguments (`max(3, 7)`), and
+    /// the body is then read once with those types in it: an instantiation
+    /// that cannot work is said here, at the call that asked for it.
+    fn generic_call(
+        &mut self,
+        name: &str,
+        generic: &GenericFunction,
+        written: &[Type],
+        args: &[Expr],
+        span: Span,
+    ) -> Ty {
+        if generic.params.len() != args.len() {
+            // The resolver counts the arguments of a call by name and says so;
+            // the checker reads what it can and says nothing twice.
+            for argument in args {
+                let _ = self.infer(argument);
+            }
+            return Ty::Opaque;
+        }
+        let saved = std::mem::take(&mut self.instantiation);
+        let bound = self.substitution_for(generic, name, written, args, span);
+        self.instantiation = bound.clone();
+        for (declared, argument) in generic.params.iter().zip(args) {
+            let param = self.resolve_type(declared);
+            if param == Ty::Opaque {
+                let _ = self.infer(argument);
+            } else {
+                self.expect(argument, &param);
+            }
+        }
+        let result = generic
+            .result
+            .as_ref()
+            .map(|ty| self.resolve_type(ty))
+            .unwrap_or(Ty::Unit);
+        self.read_instantiation(name, &bound, span);
+        self.instantiation = saved;
+        result
+    }
+
+    /// What the type parameters of a generic call were asked to be. Written
+    /// arguments answer directly; otherwise they are read off what the call
+    /// actually passed, one declared parameter type at a time.
+    fn substitution_for(
+        &mut self,
+        generic: &GenericFunction,
+        name: &str,
+        written: &[Type],
+        args: &[Expr],
+        span: Span,
+    ) -> Vec<(String, Ty)> {
+        let mut bound: Vec<(String, Ty)> = Vec::new();
+        if !written.is_empty() {
+            let asked = generic.type_params.len() + generic.const_params.len();
+            if asked != written.len() {
+                self.report(
+                    span,
+                    Diagnostic::error(
+                        code::TYPE_MISMATCH,
+                        format!(
+                            "`{name}` is written over {asked} parameter{}",
+                            if asked == 1 { "" } else { "s" }
+                        ),
+                    )
+                    .with_note(format!(
+                        "`{name}` takes {} and {} type parameters, and this call gives {}",
+                        generic.type_params.len(),
+                        generic.const_params.len(),
+                        written.len()
+                    )),
+                );
+            }
+            let mut types = generic.type_params.iter();
+            let mut consts = generic.const_params.iter();
+            for arg in written {
+                match arg {
+                    // A `const` parameter takes a value, and the checker's
+                    // lattice has no lengths to answer with: `[f32; N]` is
+                    // `Ty::Array(f32)` either way. The value is codegen's.
+                    Type::ConstArgument { .. } => {
+                        let _ = consts.next();
+                    }
+                    other => {
+                        if let Some(param) = types.next() {
+                            let ty = self.resolve_type(other);
+                            bound.push((param.clone(), ty));
+                        }
+                    }
+                }
+            }
+            return bound;
+        }
+        for (declared, argument) in generic.params.iter().zip(args) {
+            let seen = self.infer(argument);
+            self.fill(&generic.type_params, declared, &seen, &mut bound);
+        }
+        bound
+    }
+
+    /// One declared parameter type against what the call passed, binding the
+    /// parameters that type mentions. A literal has not chosen a type yet, so
+    /// it adopts its default (D17).
+    fn fill(
+        &self,
+        params: &[String],
+        declared: &Type,
+        seen: &Ty,
+        bound: &mut Vec<(String, Ty)>,
+    ) {
+        let seen = seen.defaulted();
+        let asks = |name: &str| {
+            params.iter().any(|param| param == name)
+                && !bound.iter().any(|(known, _)| known == name)
+        };
+        match declared {
+            Type::Named { name, args, .. } if args.is_empty() => {
+                if asks(name) {
+                    bound.push((name.clone(), seen));
+                }
+            }
+            Type::Named { args, .. } => {
+                let inner: &[Ty] = match &seen {
+                    Ty::Enum { args, .. } | Ty::Instance { args, .. } => args,
+                    _ => &[],
+                };
+                for (declared, seen) in args.iter().zip(inner) {
+                    self.fill(params, declared, seen, bound);
+                }
+            }
+            Type::Pointer { pointee, .. } => {
+                if let Ty::Targeted(target) = &seen {
+                    self.fill(params, pointee, target, bound);
+                }
+            }
+            Type::Array { element, .. } => {
+                if let Ty::Array(target) = &seen {
+                    self.fill(params, element, target, bound);
+                }
+            }
+            Type::Slice { element, .. } => {
+                if let Ty::Slice(target) = &seen {
+                    self.fill(params, element, target, bound);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Read a generic body with one instantiation's types in it. Which `T` is
+    /// asked for decides whether a body that never worked for any `T` works
+    /// here, and only this reading can say (DESIGN 10).
+    fn read_instantiation(&mut self, name: &str, bound: &[(String, Ty)], span: Span) {
+        let arguments = bound
+            .iter()
+            .map(|(_, ty)| ty.name())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let asked = format!("{name}<{arguments}>");
+        if !self.read_instantiations.insert(asked.clone()) {
             return;
         }
-        for arg in args {
-            let _ = self.resolve_type(arg);
+        let program = self.program;
+        let Some(declaration) = program.find_function(name) else {
+            return;
+        };
+        let mut locals = Vec::new();
+        for param in &declaration.params {
+            let ty = self.resolve_type(&param.ty);
+            locals.push((param.name.name.clone(), ty));
         }
-        self.report(
-            span,
-            Diagnostic::error(
-                code::UNSUPPORTED_IN_BUILD,
-                "generic arguments at a use are not supported by this compiler build yet",
-            )
-            .with_note("monomorphisation is milestone M5, not a language question"),
-        );
+        let result = declaration
+            .return_ty
+            .as_ref()
+            .map(|ty| self.resolve_type(ty))
+            .unwrap_or(Ty::Unit);
+        let said: Vec<(&'static str, String, u32)> = self
+            .diagnostics
+            .iter()
+            .map(|done| (done.code, done.message.clone(), done.span.map_or(0, |s| s.start)))
+            .collect();
+        let saved_result = std::mem::replace(&mut self.result, result);
+        let saved_main = std::mem::replace(&mut self.in_main, false);
+        let mark = self.diagnostics.len();
+        self.scopes.push(Vec::new());
+        for (name, ty) in locals {
+            if let Some(scope) = self.scopes.last_mut() {
+                scope.push(Context {
+                    name,
+                    ty,
+                    is_const: false,
+                });
+            }
+        }
+        self.block(&declaration.body);
+        self.scopes.pop();
+        self.result = saved_result;
+        self.in_main = saved_main;
+        let mut fresh = self.diagnostics.split_off(mark);
+        fresh.retain(|late| {
+            !said.iter().any(|(code, message, start)| {
+                late.code == *code && late.message == *message && late.span.map_or(0, |s| s.start) == *start
+            })
+        });
+        self.diagnostics.extend(fresh);
+        for late in &mut self.diagnostics[mark..] {
+            let note = format!("in the instantiation of `{asked}`, in the body of `{name}`");
+            late.span = Some(span);
+            late.note = Some(match late.note.take() {
+                Some(already) => format!("{note}; {already}"),
+                None => note,
+            });
+        }
     }
 
     fn report(&mut self, span: Span, diagnostic: Diagnostic) {
@@ -910,7 +1249,13 @@ impl<'a> Checker<'a> {
             );
             return Ty::Opaque;
         }
-        if matches!(left, Ty::Struct(_) | Ty::Array(_)) || matches!(right, Ty::Struct(_) | Ty::Array(_)) {
+        if matches!(
+            left,
+            Ty::Struct(_) | Ty::Instance { .. } | Ty::Array(_)
+        ) || matches!(
+            right,
+            Ty::Struct(_) | Ty::Instance { .. } | Ty::Array(_)
+        ) {
             if !op.is_comparison() {
                 self.error(
                     code::TYPE_MISMATCH,
@@ -2021,7 +2366,9 @@ impl<'a> Checker<'a> {
                 args,
                 span,
             } => {
-                self.waits_for_generics(args, *span);
+                for arg in args {
+                    let _ = self.resolve_type(arg);
+                }
                 self.nullary_variant_of(qualifier, name, *span, expected)
             }
             Expr::StructLiteral {
@@ -2030,11 +2377,17 @@ impl<'a> Checker<'a> {
                 fields,
                 span,
             } => {
-                self.waits_for_generics(args, *span);
                 if !self.structs.contains_key(name.as_str()) {
+                    if let Some(record) = self.generic_structs.get(name.as_str()).cloned() {
+                        return self
+                            .generic_record_value(name, &record, args, fields, *span, expected);
+                    }
                     if let Some(owner) = self.owner_of_variant(variant_of_name(name)) {
                         return self.named_constructor(&owner, name, fields, *span, expected);
                     }
+                }
+                for arg in args {
+                    let _ = self.resolve_type(arg);
                 }
                 let declared = self.structs.get(name).cloned();
                 for (field, value) in fields {
@@ -2156,6 +2509,30 @@ impl<'a> Checker<'a> {
         if let Ty::Targeted(target) = base {
             return self.field_type(target, field, span);
         }
+        if let Ty::Instance { name, args } = base {
+            let record = self.generic_structs.get(name).cloned();
+            if let Some(record) = record {
+                let declared = record
+                    .fields
+                    .iter()
+                    .find(|(known, _)| known == field)
+                    .map(|(_, ty)| ty.clone());
+                if let Some(declared) = declared {
+                    let saved = std::mem::take(&mut self.instantiation);
+                    self.instantiation = record
+                        .params
+                        .iter()
+                        .cloned()
+                        .zip(args.iter().cloned())
+                        .collect();
+                    let ty = self.resolve_type(&declared);
+                    self.instantiation = saved;
+                    return ty;
+                }
+                self.missing_field(name, field, span);
+            }
+            return Ty::Opaque;
+        }
         if let Ty::Struct(name) = base {
             if let Some(fields) = self.structs.get(name) {
                 if let Some((_, ty)) = fields.iter().find(|(known, _)| known == field) {
@@ -2172,7 +2549,12 @@ impl<'a> Checker<'a> {
             .structs
             .get(owner)
             .map(|fields| fields.iter().map(|(known, _)| known.as_str()).collect())
-            .unwrap_or_default();
+            .unwrap_or_else(|| {
+                self.generic_structs
+                    .get(owner)
+                    .map(|record| record.fields.iter().map(|(known, _)| known.as_str()).collect())
+                    .unwrap_or_default()
+            });
         known.sort_unstable();
         self.report(
             span,
@@ -2236,13 +2618,27 @@ impl<'a> Checker<'a> {
                     return self.constructor(&owner, name, args, span, expected);
                 }
             }
+            if let Some(generic) = self.generic_functions.get(name.as_str()).cloned() {
+                return self.generic_call(name, &generic, &[], args, span);
+            }
             if let Some(signature) = self.functions.get(name).cloned() {
                 return self.call_signature(&signature, args, span);
             }
         }
         // The type arguments a path carries are read where the path itself is
         // checked, so a call says nothing about them and nothing is said twice.
-        if let Expr::Path { qualifier, name, .. } = callee {
+        if let Expr::Path {
+            qualifier,
+            name,
+            args: written,
+            ..
+        } = callee
+        {
+            if qualifier.is_empty() {
+                if let Some(generic) = self.generic_functions.get(name.as_str()).cloned() {
+                    return self.generic_call(name, &generic, written, args, span);
+                }
+            }
             if self.enums.contains_key(qualifier) {
                 return self.constructor(qualifier, name, args, span, expected);
             }
