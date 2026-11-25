@@ -10,7 +10,7 @@ each remaining gap is waiting for. A gap is a milestone, never a verdict.
 | `types.dux` | parses; fixed arrays now lower | tuples `pair.0` (M3) |
 | `structs.dux` | compiles, runs, `math.sqrt` and all — `std/math` is a file in this repo now | — |
 | `pointers.dux` | compiles, runs; `Option<*Node>` is one word and the list walk is a pattern condition | — |
-| `memory.dux` | parses | `std/mem` (the arena the context rebinding wants) and `Vec<string>` returning through a call |
+| `memory.dux` | compiles, runs — rebinding `context` to `mem.Arena` redirects the stdlib, the concatenation and a function that does not know; a nested block's scratch is destroyed on the way out, memory the arena never handed out falls through to the context behind it, and one `destroy` takes the block back | — |
 | `strings.dux` | compiles and runs until `"héllo".runes()`: concatenation, byte slicing, raw and escaped literals, `c".."`, `.len()`, `.bytes()` and `fmt.println` all lower | `.runes()`, which decodes UTF-8 and needs the string a rune prints as |
 | `sum_types.dux` | compiles, runs; variants, payloads, guards, or-patterns, ranges and exhaustiveness all reach machine code, and the dispatch is the `switch` on the tag | — |
 | `option_result.dux` | the predeclared `Option`/`Result` lower and match today, and `std/prelude` now hands every program `unwrap_or`, `is_some` and `is_none` | `std/fs` (file reading over `extern`), `.bytes()`, `.trim()`, and `unwrap`, which stops the program (the panic runtime) |
@@ -81,13 +81,32 @@ each remaining gap is waiting for. A gap is a milestone, never a verdict.
   and `strings.less` are what an `import "std/.."` brings.
 - **No bounds traps.** `dims[i]` is unchecked; the debug-mode bounds check
   waits on the panic runtime.
-- **`defer` is body-level.** Correct per-path behavior inside nested blocks
-  needs a runtime defer chain (M3); nested `defer` reports E0007 honestly.
+- **`defer` belongs to a function body or to a plain block.** A `{ .. }` block
+  fires what it captured, most recent first, on the way out; a `return` replays
+  the whole chain along its own path and leaves the stack standing for the paths
+  that did not return. A `defer` written in an `if` branch or a loop body still
+  reports E0007 honestly, and so does leaving a loop body with deferred work
+  pending.
 - **A fixed array is not a parameter.** A result crosses the boundary whole:
   the callee reads the array out of wherever it was standing, the caller
   builds it standing in a slot of its own, so `zeros<4>() -> [f32; N]` answers
   and `p[0]` goes on reading it in place. An array written as a *parameter*
   still reports E0007; pass `&xs`, which is a view.
+- **The context answers with its own functions.** An allocation or a free reads
+  the allocator and the deallocator out of the two slots of whatever context is
+  current, never a function the compiler picked at the call site — that is what
+  makes `context = arena.ctx()` a redirect and not a decoration. `std/mem`'s
+  `Arena` is ordinary Dux: its context is a record whose first field is the
+  context, so the arena's address is the context's address, and memory it
+  cannot serve or never handed out falls through to the context that was
+  current when the arena was made. `free(NULL)` is a silent no-op, as in C.
+- **A `fn` value is one word and a promise about its shape.** `&doubling` names
+  the address of a `#[no_context]` function — a function that carries the
+  hidden context has no address in that shape, and says so — and a call through
+  the value is an indirect call shaped by the `fn` type, not by a name.
+- **Untyped arithmetic adopts what a call asks for.** `4 * 1024`, folded from
+  literals, is still the number when a `usize` parameter wants it (D17); a
+  typed operand lands in the ordinary lattice and D25 rules from there.
 - **A generic is code, not a function.** A generic `fn` is emitted once per
   distinct list of arguments some call gave it — `dux.max.i32`,
   `dux.max.f64` — and not at all for a generic no call asked for. A parameter

@@ -1,0 +1,36 @@
+package main
+import "std/mem"
+
+fn spare() -> i64 {
+    p := new(i64)
+    *p = 99
+    return *p
+}
+
+fn main() {
+    single := new(i32)
+    *single = 7
+    arena := mem.Arena.new(4 * 1024)
+    context = arena.ctx()
+    kept := new(i64)
+    *kept = 1
+    text := "bump" + "ed"
+    println($"{} {} {}", *single, *kept, text)
+    println($"through_a_function={}", spare())
+    {
+        scratch := mem.Arena.new(64)
+        defer scratch.destroy()
+        context = scratch.ctx()
+        inner := new(i64)
+        *inner = 4
+        println($"scratch={}", *inner)
+    }
+    later := new(i64)
+    *later = 2
+    println($"after={} {}", *later, *kept)
+    del(text)
+    free(kept)
+    free(single)
+    arena.destroy()
+    println($"done")
+}

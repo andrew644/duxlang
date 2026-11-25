@@ -1,0 +1,87 @@
+// `std/mem`. Bump allocation: an arena hands out successive blocks from one
+// allocation, and one `destroy` reclaims everything it handed out.
+//
+// A context is three words — the allocator, the deallocator, a label — and
+// the compiler reaches the first two through those slots, never its own.
+// This record mirrors that layout, and an `Arena` keeps one as its first
+// field so the address of the arena is the address of the context. The
+// context a call sees when the arena is made is kept as `saved`: blocks the
+// arena cannot serve fall through to it, and so does any memory that was not
+// the arena's to keep.
+
+struct Context {
+    alloc: fn(rawptr, usize, usize, rawptr) -> rawptr,
+    free: fn(rawptr, rawptr),
+    label: rawptr,
+}
+
+struct Arena {
+    context: Context,
+    base: usize,
+    cursor: usize,
+    end: usize,
+    saved: rawptr,
+}
+
+// The arena's allocator: advance the cursor, or let the context that was
+// current when the arena was made serve the block instead.
+#[no_context]
+fn bump(ctx: rawptr, size: usize, align: usize, location: rawptr) -> rawptr {
+    arena := ctx as *Arena
+    at := arena.cursor
+    pad := at % align
+    if pad != 0 {
+        at += align - pad
+    }
+    top := at + size
+    if top > arena.end {
+        outer := arena.saved as *Context
+        f := outer.alloc
+        return f(arena.saved, size, align, location)
+    }
+    arena.cursor = top
+    return at as rawptr
+}
+
+// Memory from inside the block is the arena's to keep: there is nothing to
+// do until `destroy`. Anything else belongs to the context behind the arena,
+// and goes back there.
+#[no_context]
+fn release(ctx: rawptr, memory: rawptr) {
+    arena := ctx as *Arena
+    at := memory as usize
+    if at >= arena.base && at < arena.end {
+        return
+    }
+    outer := arena.saved as *Context
+    g := outer.free
+    g(arena.saved, memory)
+}
+
+impl Arena {
+    fn new(capacity: usize) -> Arena {
+        here := context
+        outer := here as *Context
+        f := outer.alloc
+        block := f(here, capacity, 16, 0 as rawptr)
+        base := block as usize
+        return Arena { context: Context { alloc: &bump, free: &release, label: 0 as rawptr }, base: base, cursor: base, end: base + capacity, saved: here }
+    }
+
+    // What to rebind `context` to: `context = arena.ctx()` sends every later
+    // allocation in the block through the arena.
+    fn ctx(self: *Arena) -> rawptr {
+        return (&self.context) as rawptr
+    }
+
+    // One free for everything the arena handed out. The block itself came
+    // from the context behind the arena, and goes back there.
+    fn destroy(self: *Arena) {
+        outer := self.saved as *Context
+        g := outer.free
+        g(self.saved, self.base as rawptr)
+        self.base = 0
+        self.cursor = 0
+        self.end = 0
+    }
+}

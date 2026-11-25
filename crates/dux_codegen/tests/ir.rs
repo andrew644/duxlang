@@ -210,6 +210,47 @@ fn defer_replays_captured_calls_at_every_exit() {
 }
 
 #[test]
+fn untyped_arithmetic_adopts_the_type_the_call_asks_for() {
+    let ir = build(
+        "package main\nfn take(n: usize) -> usize { return n }\nfn main() { page := take(4 * 1024) }",
+    )
+    .expect("builds")
+    .ir_text();
+    assert!(
+        ir.contains("@take(i64 4096)"),
+        "`4 * 1024` is still the number when `usize` asks for it (D17):\n{ir}"
+    );
+}
+
+#[test]
+fn a_function_pointer_is_called_through_its_address() {
+    let ir = build(
+        "package main\n#[no_context]\nfn doubling(x: i32) -> i32 { return x * 2 }\nfn main() {\n    cb := &doubling\n    println($\"{}\", cb(21))\n}",
+    )
+    .expect("builds")
+    .ir_text();
+    assert!(
+        ir.contains("call i32 %load"),
+        "the call goes to the address the pointer holds:\n{ir}"
+    );
+    assert!(
+        !ir.contains("call i32 @doubling"),
+        "nothing calls `doubling` by name:\n{ir}"
+    );
+}
+
+#[test]
+fn the_context_frees_through_its_own_slot() {
+    let ir = build("package main\nfn main() { p := new(i32)\n free(p) }")
+        .expect("builds")
+        .ir_text();
+    assert!(
+        ir.contains("getelementptr i8, ptr") && ir.contains("call void %free(ptr"),
+        "the deallocator comes out of the context, not the compiler:\n{ir}"
+    );
+}
+
+#[test]
 fn fixed_arrays_live_in_slots_and_iterate_with_a_counter() {
     let ir = build(
         "package main\nfn main() -> i32 { xs := [1, 2, 3]; total := 0; for v in xs { total += v }; return total }",
@@ -361,7 +402,7 @@ fn milestone_gaps_report_e0007_with_the_milestone_in_the_message() {
         ),
         (
             "package main\nfn main() { if true { defer println(\"x\") } }",
-            "nested block",
+            "top of a function",
         ),
     ];
     for (source, needle) in cases {
@@ -1123,8 +1164,12 @@ fn main() {
     .expect("builds")
     .ir_text();
     assert!(
-        ir.contains("call ptr @dux.runtime.alloc("),
-        "the joined string comes from the context:\n{ir}"
+        ir.contains("call ptr %alloc("),
+        "the joined string comes through the context's own function:\n{ir}"
+    );
+    assert!(
+        ir.contains("ptr @dux.runtime.alloc"),
+        "the default context carries the runtime allocator in its first slot:\n{ir}"
     );
     assert!(
         ir.contains("call void @llvm.memcpy"),
@@ -1230,8 +1275,8 @@ fn main() {
         "the length is measured first:\n{ir}"
     );
     assert!(
-        ir.contains("call ptr @dux.runtime.alloc("),
-        "and then the block is asked for:\n{ir}"
+        ir.contains("call ptr %alloc("),
+        "the block is asked for through the context, whatever context that is:\n{ir}"
     );
     assert!(
         ir.contains("@snprintf(ptr %"),

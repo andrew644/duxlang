@@ -13,6 +13,7 @@ struct Spec {
     expect_error: Option<String>,
     expected_exit: i32,
     expected_stderr: Option<String>,
+    require_clean_stderr: bool,
     release: bool,
     program_args: Vec<String>,
 }
@@ -33,6 +34,7 @@ impl Spec {
             expect_error: None,
             expected_exit: 0,
             expected_stderr: None,
+            require_clean_stderr: false,
             release: false,
             program_args: Vec::new(),
         };
@@ -59,6 +61,7 @@ impl Spec {
                 Some("stderr") => {
                     spec.expected_stderr = Some(directive["stderr".len()..].trim().to_string());
                 }
+                Some("stderr_empty") => spec.require_clean_stderr = true,
                 Some("release") => spec.release = true,
                 Some("args") => spec.program_args = words.map(String::from).collect(),
                 Some(other) => panic!("{}: unknown directive `//@{other}`", spec.name),
@@ -155,6 +158,9 @@ fn evaluate(spec: &Spec) -> Result<(), String> {
                     "{}: exit code {} but expected {}",
                     spec.name, run.code, spec.expected_exit
                 ));
+            }
+            if spec.require_clean_stderr && !run.stderr.is_empty() {
+                return Err(format!("{}: stderr is not empty:\n{}", spec.name, run.stderr));
             }
             if let Some(needle) = &spec.expected_stderr {
                 if !run.stderr.contains(needle) {

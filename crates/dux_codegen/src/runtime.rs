@@ -31,12 +31,10 @@ const SIZE_MAX: u64 = u64::MAX;
 
 /// The allocation runtime of one generated module.
 pub struct Runtime {
-    /// The context `main` starts with: `@dux.default_context`.
+    /// The context `main` starts with: `@dux.default_context`. Its own slots
+    /// carry the allocator and the deallocator; every allocation goes
+    /// through whatever context is current, so no call site names these.
     pub default_context: PointerValue<'static>,
-    /// `ptr @dux.runtime.alloc(ptr context, i64 size, i64 align, ptr location)`
-    pub alloc: FunctionValue<'static>,
-    /// `void @dux.runtime.free(ptr context, ptr memory)`
-    pub free: FunctionValue<'static>,
     /// `void @dux.runtime.report()` — unreleased blocks, in debug mode.
     pub report: Option<FunctionValue<'static>>,
     /// `noreturn @dux.runtime.trap(ptr message)` — a language rule the running
@@ -118,8 +116,6 @@ impl Runtime {
 
         Runtime {
             default_context: default.as_pointer_value(),
-            alloc,
-            free,
             report,
             trap,
         }
@@ -326,15 +322,20 @@ fn emit_free_debug(
 ) {
     let i64_type = context.i64_type();
     let entry = context.append_basic_block(free, "entry");
+    let done = context.append_basic_block(free, "done");
     let check = context.append_basic_block(free, "check");
     let bad = context.append_basic_block(free, "bad");
     let release = context.append_basic_block(free, "release");
     builder.position_at_end(entry);
     let memory = free.get_nth_param(1).unwrap().into_pointer_value();
+    // As in C, freeing nothing is a silent no-op: an arena that handed out
+    // nothing has nothing to take back.
     let is_null = builder.build_is_null(memory, "null").expect("null");
     builder
-        .build_conditional_branch(is_null, bad, check)
+        .build_conditional_branch(is_null, done, check)
         .expect("branch");
+    builder.position_at_end(done);
+    builder.build_return(None).expect("return");
 
     builder.position_at_end(check);
     let header = offset(builder, context, memory, SIZE_MAX - HEADER + 1, "header");

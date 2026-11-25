@@ -26,11 +26,11 @@ use inkwell::debug_info::{
 use inkwell::module::Module;
 use inkwell::targets::TargetData;
 use inkwell::types::{
-    BasicMetadataTypeEnum, BasicType, BasicTypeEnum, FloatType, IntType, StructType,
+    BasicMetadataTypeEnum, BasicType, BasicTypeEnum, FloatType, FunctionType, IntType, StructType,
 };
 use inkwell::values::{
-    BasicMetadataValueEnum, BasicValueEnum, FloatValue, GlobalValue, IntValue, PointerValue,
-    StructValue,
+    BasicMetadataValueEnum, BasicValueEnum, CallSiteValue, FloatValue, GlobalValue, IntValue,
+    PointerValue, StructValue,
 };
 use inkwell::values::{BasicValue, FunctionValue, ValueKind};
 use inkwell::{AddressSpace, FloatPredicate, IntPredicate};
@@ -77,6 +77,9 @@ pub(crate) enum DuxType {
     /// big enough for the largest payload — so a sum-type value is a value like
     /// a record: it copies, travels in registers and lives in a slot.
     Enum(&'static EnumInfo),
+    /// `fn(i32) -> i32`: the address of a function, held as one word. The
+    /// shape matters only where the address is called.
+    Fn(&'static FnInfo),
     /// Something we could not type; it silences follow-on diagnostics.
     Error,
 }
@@ -88,6 +91,25 @@ pub(crate) type Binding = (String, DuxType, PointerValue<'static>);
 pub(crate) struct ArrayInfo {
     pub(crate) elem: DuxType,
     pub(crate) len: u64,
+}
+
+/// The shape a function pointer carries: what it takes and what it answers.
+/// A `fn` type is the C ABI — `&` takes the address of a `#[no_context]`
+/// function, and the hidden context stays where it belongs, out of the shape.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct FnInfo {
+    pub(crate) params: Vec<DuxType>,
+    pub(crate) returns: Option<DuxType>,
+}
+
+impl FnInfo {
+    fn spelled(info: &FnInfo) -> String {
+        let params: Vec<String> = info.params.iter().map(|ty| ty.name()).collect();
+        match info.returns {
+            Some(answer) => format!("fn({}) -> {}", params.join(", "), answer.name()),
+            None => format!("fn({})", params.join(", ")),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -176,6 +198,10 @@ impl DuxType {
 
     fn array(elem: DuxType, len: u64) -> DuxType {
         DuxType::Array(Box::leak(Box::new(ArrayInfo { elem, len })))
+    }
+
+    fn function(params: Vec<DuxType>, returns: Option<DuxType>) -> DuxType {
+        DuxType::Fn(Box::leak(Box::new(FnInfo { params, returns })))
     }
 
     /// The elements a slice runs over.
@@ -283,6 +309,7 @@ impl DuxType {
             DuxType::F32 => context.f32_type().into(),
             DuxType::F64 => context.f64_type().into(),
             DuxType::Ptr | DuxType::Error => context.ptr_type(AddressSpace::default()).into(),
+            DuxType::Fn(_) => context.ptr_type(AddressSpace::default()).into(),
             DuxType::Pointer(_) => context.ptr_type(AddressSpace::default()).into(),
             DuxType::Array(info) => info.elem.llvm(context).array_type(info.len as u32).into(),
             DuxType::Slice(_) | DuxType::Str => context.struct_type(&[context.ptr_type(AddressSpace::default()).into(), context.i64_type().into()], false).into(),
@@ -328,6 +355,7 @@ impl DuxType {
             DuxType::Slice(element) => format!("[]{}", element.name()),
             DuxType::Struct(info) => info.name.to_string(),
             DuxType::Enum(info) => info.spelled.clone(),
+            DuxType::Fn(info) => FnInfo::spelled(info),
             DuxType::Error => "<error>".to_string(),
         }
     }
@@ -342,6 +370,7 @@ impl DuxType {
             DuxType::Slice(element) => format!("[]{}", element.key()),
             DuxType::Struct(info) => info.spelled.clone(),
             DuxType::Enum(info) => info.spelled.clone(),
+            DuxType::Fn(info) => FnInfo::spelled(info),
             other => other.name(),
         }
     }
@@ -359,7 +388,7 @@ impl DuxType {
             DuxType::U64 => 1 << 64,
             DuxType::F32 | DuxType::F64 => return true,
             DuxType::Array(..) | DuxType::Struct(..) | DuxType::Enum(_) | DuxType::Str
-            | DuxType::Ptr => return false,
+            | DuxType::Ptr | DuxType::Fn(_) => return false,
             DuxType::Slice(_) => return false,
             DuxType::Pointer(_) => return false,
             DuxType::Error => return false,
@@ -488,9 +517,14 @@ struct Join<'a> {
     broken: bool,
 }
 
+#[derive(Clone, Copy)]
 struct Loop {
     continuation: BasicBlock<'static>,
     exit: BasicBlock<'static>,
+    /// How many deferred calls existed when the loop began: leaving the body
+    /// past a deferred call skips the firing the block would have done on its
+    /// way out, which needs the defer chain to follow the paths.
+    defer_base: usize,
 }
 
 #[derive(Clone)]
@@ -664,6 +698,7 @@ enum Deferred {
     /// end of the function, through the context of the `defer`.
     Release {
         slot: (DuxType, PointerValue<'static>),
+        span: Span,
     },
 }
 
@@ -738,6 +773,10 @@ pub(crate) struct Emitter {
     globals: HashMap<String, (DuxType, GlobalValue<'static>)>,
     loops: Vec<Loop>,
     defers: Vec<Deferred>,
+    /// The blocks that own deferred work: where `defers` stood when the block
+    /// began, and how deep the scopes were while it was open. A block fires
+    /// what it captured on the way out.
+    defer_blocks: Vec<(usize, usize)>,
     /// The allocator runtime, emitted when some function in the program
     /// allocates.
     runtime: Option<Runtime>,
@@ -806,6 +845,7 @@ impl Emitter {
             globals: HashMap::new(),
             loops: Vec::new(),
             defers: Vec::new(),
+            defer_blocks: Vec::new(),
             runtime: None,
             hash: None,
             debug_allocator: true,
@@ -1102,6 +1142,17 @@ impl Emitter {
                 let element = self.type_of(element)?;
                 let count = self.const_length(len)?;
                 Some(DuxType::array(element, count))
+            }
+            Type::Function { params, return_ty, .. } => {
+                let mut given = Vec::new();
+                for parameter in params {
+                    given.push(self.type_of(parameter)?);
+                }
+                let answer = match return_ty {
+                    Some(ty) => Some(self.type_of(ty)?),
+                    None => None,
+                };
+                Some(DuxType::function(given, answer))
             }
             other => DuxType::from_ast(other),
         }
@@ -1764,6 +1815,102 @@ impl Emitter {
             .map(|value| value.into_pointer_value())
     }
 
+    /// The function in one slot of the current context: the allocator at 0,
+    /// the deallocator at 1. A rebound context answers with its own
+    /// functions, which is what makes an arena writable as ordinary code.
+    fn context_function(
+        &mut self,
+        index: u64,
+        span: Span,
+    ) -> Option<(PointerValue<'static>, PointerValue<'static>)> {
+        let context = self.context_value(span)?;
+        let pointer_type = self.context.ptr_type(AddressSpace::default());
+        let byte = self.context.i8_type();
+        let cell = unsafe {
+            self.builder.build_gep(
+                byte,
+                context,
+                &[byte.const_int(index * 8, false)],
+                if index == 0 { "allocfn" } else { "freefn" },
+            )
+        }
+        .ok()?;
+        let function = self
+            .builder
+            .build_load(pointer_type, cell, if index == 0 { "alloc" } else { "free" })
+            .ok()?
+            .into_pointer_value();
+        Some((context, function))
+    }
+
+    /// Bytes from the allocator the current context names, not from one the
+    /// compiler picked at the call site.
+    fn call_alloc(
+        &mut self,
+        span: Span,
+        size: IntValue<'static>,
+        align: u64,
+        location: PointerValue<'static>,
+    ) -> Option<PointerValue<'static>> {
+        if self.runtime.is_none() {
+            self.unsupported(span, "allocating in a program with no memory runtime");
+            return None;
+        }
+        let (context, function) = self.context_function(0, span)?;
+        let pointer_type = self.context.ptr_type(AddressSpace::default());
+        let i64_type = self.context.i64_type();
+        let fn_type = pointer_type.fn_type(
+            &[
+                pointer_type.into(),
+                i64_type.into(),
+                i64_type.into(),
+                pointer_type.into(),
+            ],
+            false,
+        );
+        self.builder
+            .build_indirect_call(
+                fn_type,
+                function,
+                &[
+                    context.into(),
+                    size.into(),
+                    i64_type.const_int(align, false).into(),
+                    location.into(),
+                ],
+                "alloc",
+            )
+            .ok()?
+            .try_as_basic_value()
+            .basic()
+            .map(|value| value.into_pointer_value())
+    }
+
+    /// Hand memory back to the deallocator the current context names. Memory
+    /// an arena handed out comes back through the arena that made it.
+    fn call_free(&mut self, span: Span, memory: PointerValue<'static>) -> bool {
+        if self.runtime.is_none() {
+            self.unsupported(span, "freeing in a program with no memory runtime");
+            return false;
+        }
+        let Some((context, function)) = self.context_function(1, span) else {
+            return false;
+        };
+        let pointer_type = self.context.ptr_type(AddressSpace::default());
+        let fn_type = self
+            .context
+            .void_type()
+            .fn_type(&[pointer_type.into(), pointer_type.into()], false);
+        self.builder
+            .build_indirect_call(
+                fn_type,
+                function,
+                &[context.into(), memory.into()],
+                "free",
+            )
+            .is_ok()
+    }
+
     /// Bind `context` for the running function. `main` starts with the default
     /// context; every other allocating function is handed its caller's.
     fn bind_context(&mut self, module: &Module<'static>, argument: Option<u32>) {
@@ -1944,33 +2091,8 @@ impl Emitter {
         count: IntValue<'static>,
         align: u32,
     ) -> Option<PointerValue<'static>> {
-        let Some(alloc) = self.runtime.as_ref().map(|runtime| runtime.alloc) else {
-            self.unsupported(span, "allocating in a program with no memory runtime");
-            return None;
-        };
-        let Some(context) = self.context_value(span) else {
-            self.unsupported(
-                span,
-                "allocating in a function that carries no context",
-            );
-            return None;
-        };
         let location = self.location(span);
-        self.builder
-            .build_call(
-                alloc,
-                &[
-                    context.into(),
-                    count.into(),
-                    self.context.i64_type().const_int(align as u64, false).into(),
-                    location.into(),
-                ],
-                "alloc",
-            )
-            .ok()?
-            .try_as_basic_value()
-            .basic()
-            .map(|value| value.into_pointer_value())
+        self.call_alloc(span, count, align as u64, location)
     }
 
     fn memory_builtin(
@@ -1980,14 +2102,10 @@ impl Emitter {
         args: &[Expr],
         span: Span,
     ) -> Option<Typed> {
-        let (alloc, free) = match &self.runtime {
-            Some(runtime) => (runtime.alloc, runtime.free),
-            None => {
-                self.unsupported(span, "allocation");
-                return None;
-            }
-        };
-        let context = self.context_value(span)?;
+        if self.runtime.is_none() {
+            self.unsupported(span, "allocation");
+            return None;
+        }
         let location = self.location(args.first().map_or(span, Expr::span));
         match name {
             "new" => {
@@ -1995,22 +2113,7 @@ impl Emitter {
                 let llvm = element.llvm(self.context);
                 let size = self.size_of(llvm)?;
                 let align = self.alignment_of(llvm);
-                let pointer = self
-                    .builder
-                    .build_call(
-                        alloc,
-                        &[
-                            context.into(),
-                            size.into(),
-                            self.context.i64_type().const_int(align as u64, false).into(),
-                            location.into(),
-                        ],
-                        "new",
-                    )
-                    .ok()?
-                    .try_as_basic_value()
-                    .basic()
-                    .map(|value| value.into_pointer_value())?;
+                let pointer = self.call_alloc(args.first()?.span(), size, align as u64, location)?;
                 Some(Typed {
                     core: Core::Ptr(pointer),
                     ty: self.pointer_to(element),
@@ -2040,22 +2143,7 @@ impl Emitter {
                     .builder
                     .build_int_mul(each, count, "bytes")
                     .ok()?;
-                let pointer = self
-                    .builder
-                    .build_call(
-                        alloc,
-                        &[
-                            context.into(),
-                            total.into(),
-                            self.context.i64_type().const_int(align as u64, false).into(),
-                            location.into(),
-                        ],
-                        "make",
-                    )
-                    .ok()?
-                    .try_as_basic_value()
-                    .basic()
-                    .map(|value| value.into_pointer_value())?;
+                let pointer = self.call_alloc(args[1].span(), total, align as u64, location)?;
                 let zero = self.context.i8_type().const_zero();
                 let _ = self.builder.build_memset(pointer, align, zero, total);
                 Some(self.view(element, pointer, count))
@@ -2066,9 +2154,7 @@ impl Emitter {
                     self.unsupported(args[0].span(), "`free` of something that is not a pointer");
                     return None;
                 };
-                let _ = self
-                    .builder
-                    .build_call(free, &[context.into(), pointer.into()], "free");
+                self.call_free(span, pointer);
                 Some(Typed::void())
             }
             "del" => {
@@ -2077,9 +2163,7 @@ impl Emitter {
                     self.unsupported(args[0].span(), "`del` of something that is not a slice");
                     return None;
                 };
-                let _ = self
-                    .builder
-                    .build_call(free, &[context.into(), pointer.into()], "del");
+                self.call_free(span, pointer);
                 Some(Typed::void())
             }
             _ => None,
@@ -2432,14 +2516,41 @@ impl Emitter {
     /// A block whose scope starts with the bindings a pattern made elsewhere:
     /// `while P := e { … }` tests in one block and binds in the body.
     fn block_body_bound(&mut self, module: &Module<'static>, block: &Block, bound: &[Binding]) {
+        self.block_body_owning(module, block, bound, false);
+    }
+
+    /// `owns_defers` marks the plain `{ .. }` statements whose exit is their
+    /// own: a `defer` written directly inside one runs when that block runs
+    /// out. Branches and loop bodies do not own defers; a `defer` written in
+    /// one is still the gap it was.
+    fn block_body_owning(
+        &mut self,
+        module: &Module<'static>,
+        block: &Block,
+        bound: &[Binding],
+        owns_defers: bool,
+    ) {
         self.scopes.push(HashMap::new());
         self.declare_bindings(bound);
         let outer = self.save_context(block);
+        let base = self.defers.len();
+        let depth = self.scopes.len();
+        if owns_defers {
+            self.defer_blocks.push((base, depth));
+        }
         for stmt in &block.stmts {
             if self.dead {
                 break;
             }
             self.stmt(module, stmt);
+        }
+        if owns_defers {
+            self.defer_blocks.pop();
+        }
+        // The function body's own exit is the epilogue's to fire; a block
+        // that owns its defers fires what it captured on the way out.
+        if owns_defers && !self.dead {
+            self.fire_before(module, base, true);
         }
         self.restore_context(outer);
         self.scopes.pop();
@@ -3415,12 +3526,15 @@ impl Emitter {
             }
             Stmt::Break { span } | Stmt::Continue { span } => {
                 let is_break = matches!(stmt, Stmt::Break { .. });
-                match self.loops.last() {
-                    Some(Loop {
-                        continuation,
-                        exit,
-                    }) => {
-                        let target = if is_break { *exit } else { *continuation };
+                match self.loops.last().copied() {
+                    Some(loop_) => {
+                        if self.defers.len() > loop_.defer_base {
+                            self.unsupported(
+                                *span,
+                                "leaving a loop body that has deferred work: the defer chain lands at M3",
+                            );
+                        }
+                        let target = if is_break { loop_.exit } else { loop_.continuation };
                         self.unwind_contexts();
                         self.br(target);
                         self.dead = true;
@@ -3443,7 +3557,7 @@ impl Emitter {
             }
             Stmt::Return { value, span } => self.return_stmt(module, value.as_ref(), *span),
             Stmt::Defer { stmt, span } => self.defer_stmt(module, stmt, *span),
-            Stmt::Block { block, .. } => self.block_body(module, block),
+            Stmt::Block { block, .. } => self.block_body_owning(module, block, &[], true),
             Stmt::Match { subject, arms, span } => {
                 self.matching(module, subject, arms, None, false, *span);
             }
@@ -3650,7 +3764,7 @@ impl Emitter {
     }
 
     fn return_stmt(&mut self, module: &Module<'static>, value: Option<&Expr>, span: Span) {
-        self.fire_defers(module);
+        self.fire_before(module, 0, false);
         match (value, self.result_ty) {
             (None, Some(ty)) => {
                 if self.is_main || ty == DuxType::I32 || ty == DuxType::I64 {
@@ -3851,10 +3965,14 @@ impl Emitter {
     /// now, at the `defer` statement; only the call itself is postponed to
     /// every exit of the enclosing function.
     fn defer_stmt(&mut self, module: &Module<'static>, stmt: &Stmt, span: Span) {
-        if self.scopes.len() != 2 {
+        let at_open_block = self
+            .defer_blocks
+            .last()
+            .is_some_and(|(_, depth)| *depth == self.scopes.len());
+        if self.scopes.len() != 2 && !at_open_block {
             self.unsupported(
                 span,
-                "`defer` inside a nested block (per-path defer chains land at M3)",
+                "`defer` here (a `defer` belongs at the top of a function or directly inside a block)",
             );
             return;
         }
@@ -3866,8 +3984,12 @@ impl Emitter {
             self.unsupported(span, "deferring anything but a call expression");
             return;
         };
+        if let Expr::Field { base, name, .. } = callee.as_ref() {
+            self.defer_method(module, base, name, args, span);
+            return;
+        }
         let Expr::Ident { name, .. } = callee.as_ref() else {
-            self.unsupported(span, "deferring a call to anything but a plain named function");
+            self.unsupported(span, "deferring a call to anything but a named function or a method");
             return;
         };
         if name == "print" || name == "println" {
@@ -3885,7 +4007,7 @@ impl Emitter {
             let Some(slot) = self.capture(module, value, "deferred", span) else {
                 return;
             };
-            self.defers.push(Deferred::Release { slot });
+            self.defers.push(Deferred::Release { slot, span });
             return;
         }
         if self.skipped.contains(name) {
@@ -3942,6 +4064,123 @@ impl Emitter {
             name: name.clone(),
             slots,
             hidden_context,
+        });
+    }
+
+    /// `defer arena.destroy()`: the receiver and every argument are evaluated
+    /// now and kept in slots; only the call waits. A pointer receiver keeps
+    /// the address of its place, a value receiver a copy of its own.
+    fn defer_method(
+        &mut self,
+        module: &Module<'static>,
+        base: &Expr,
+        name: &dux_ast::Ident,
+        args: &[Expr],
+        span: Span,
+    ) {
+        let place = self.place_of_expr(module, base);
+        let (base_ty, base_at) = match place {
+            Some((ty, at)) => (ty, Some(at)),
+            None => {
+                let Some(value) = self.expr(module, base, None) else {
+                    return;
+                };
+                let at = self.materialize(value, "recv");
+                (value.ty, at)
+            }
+        };
+        let owner = match (self.record_of(base_ty), self.enum_of(base_ty)) {
+            (Some(record), _) => record.name,
+            (None, Some(shape)) => shape.name,
+            _ => {
+                self.unsupported(
+                    base.span(),
+                    "deferring a method of anything but a record or a sum type",
+                );
+                return;
+            }
+        };
+        let key = format!("{owner}.{}", name.name);
+        if !self.functions.contains_key(&key) {
+            self.unsupported(
+                span,
+                &format!("deferring `{key}` (an instance made per receiver is not there to defer)"),
+            );
+            return;
+        }
+        let Some(signature) = self.signatures.get(key.as_str()).cloned() else {
+            self.unsupported(span, &format!("deferring `{key}`"));
+            return;
+        };
+        let Some(want) = signature.receiver else {
+            self.unsupported(span, &format!("`{key}` is not a method"));
+            return;
+        };
+        let Some(at) = base_at else {
+            self.unsupported(
+                base.span(),
+                "deferring a call whose receiver has no place to keep",
+            );
+            return;
+        };
+        let receiver = match want {
+            DuxType::Pointer(target) if base_ty == *target => Typed::pointer(at, want),
+            DuxType::Pointer(_) | DuxType::Struct(_) | DuxType::Enum(_)
+            | DuxType::Slice(_) | DuxType::Str | DuxType::Array(_) => {
+                match self.load(base_ty, at) {
+                    Some(value) if value.ty == want => value,
+                    _ => {
+                        self.unsupported(
+                            base.span(),
+                            &format!("`{}` cannot take `{}` as its receiver", key, base_ty.name()),
+                        );
+                        return;
+                    }
+                }
+            }
+            _ => {
+                self.unsupported(span, &format!("deferring `{key}`"));
+                return;
+            }
+        };
+        let Some(receiver_slot) = self.capture(module, receiver, "deferrecv", base.span()) else {
+            return;
+        };
+        if args.len() != signature.params.len() {
+            self.diagnostics.push(
+                Diagnostic::error(
+                    code::WRONG_ARITY,
+                    format!(
+                        "`{key}` takes {} arguments, given {}",
+                        signature.params.len(),
+                        args.len()
+                    ),
+                )
+                .with_span(span),
+            );
+            return;
+        }
+        let mut slots = vec![receiver_slot];
+        for (index, (parameter, arg)) in signature.params.iter().zip(args).enumerate() {
+            let Some(value) = self.expr(module, arg, Some(*parameter)) else {
+                return;
+            };
+            if value.ty == DuxType::Error {
+                return;
+            }
+            let Some(value) = self.coerce_implicit(module, value, *parameter, arg.span()) else {
+                return;
+            };
+            let Some(slot) = self.capture(module, value, &format!("defer{index}"), arg.span())
+            else {
+                return;
+            };
+            slots.push(slot);
+        }
+        self.defers.push(Deferred::Call {
+            name: key,
+            slots,
+            hidden_context: signature.hidden_context,
         });
     }
 
@@ -4048,6 +4287,14 @@ impl Emitter {
     /// Replay every deferred call at a function exit, innermost first. The
     /// list is left intact: each exit block replays the same registrations.
     fn fire_defers(&mut self, module: &Module<'static>) {
+        self.fire_before(module, 0, true);
+    }
+
+    /// Fire the deferred work registered since `base`, most recent first.
+    /// A block on its way out and the end of a function consume what they
+    /// fire; a `return` only replays the chain along its own path, leaving
+    /// the rest of the stack standing for the paths that did not return.
+    fn fire_before(&mut self, module: &Module<'static>, base: usize, consume: bool) {
         enum Owned {
             Write {
                 newline: bool,
@@ -4062,9 +4309,10 @@ impl Emitter {
             },
             Release {
                 slot: (DuxType, PointerValue<'static>),
+                span: Span,
             },
         }
-        for index in (0..self.defers.len()).rev() {
+        for index in (base..self.defers.len()).rev() {
             let owned = match &self.defers[index] {
                 Deferred::Write {
                     newline,
@@ -4086,7 +4334,10 @@ impl Emitter {
                     slots: slots.clone(),
                     hidden_context: *hidden_context,
                 },
-                Deferred::Release { slot } => Owned::Release { slot: *slot },
+                Deferred::Release { slot, span } => Owned::Release {
+                    slot: *slot,
+                    span: *span,
+                },
             };
             match owned {
                 Owned::Write {
@@ -4149,15 +4400,7 @@ impl Emitter {
                             .ok();
                     }
                 }
-                Owned::Release { slot: (ty, slot) } => {
-                    let Some(runtime) = &self.runtime else {
-                        continue;
-                    };
-                    let free = runtime.free;
-                    let Some(context) = self.context_slot else {
-                        continue;
-                    };
-                    let pointer_type = self.context.ptr_type(AddressSpace::default());
+                Owned::Release { slot: (ty, slot), span } => {
                     let memory = match self.load(ty, slot) {
                         Some(value) => value
                             .pointer_value()
@@ -4167,19 +4410,12 @@ impl Emitter {
                     let Some(memory) = memory else {
                         continue;
                     };
-                    let context = self
-                        .builder
-                        .build_load(pointer_type, context, "context")
-                        .ok()
-                        .map(|value| value.into_pointer_value());
-                    let Some(context) = context else {
-                        continue;
-                    };
-                    let _ = self
-                        .builder
-                        .build_call(free, &[context.into(), memory.into()], "deferred");
+                    self.call_free(span, memory);
                 }
             }
+        }
+        if consume {
+            self.defers.truncate(base);
         }
     }
 
@@ -4221,6 +4457,7 @@ impl Emitter {
         self.loops.push(Loop {
             continuation: cond_block,
             exit: exit_block,
+            defer_base: self.defers.len(),
         });
         self.block_body_bound(module, body, &bound);
         self.loops.pop();
@@ -4240,6 +4477,7 @@ impl Emitter {
         self.loops.push(Loop {
             continuation: body_block,
             exit: exit_block,
+            defer_base: self.defers.len(),
         });
         self.block_body(module, body);
         self.loops.pop();
@@ -4276,6 +4514,7 @@ impl Emitter {
         self.loops.push(Loop {
             continuation: step_block,
             exit: exit_block,
+            defer_base: self.defers.len(),
         });
         self.block_body(module, body);
         self.loops.pop();
@@ -4418,6 +4657,7 @@ impl Emitter {
         self.loops.push(Loop {
             continuation: step_block,
             exit: exit_block,
+            defer_base: self.defers.len(),
         });
         self.block_body(module, body);
         self.loops.pop();
@@ -4559,6 +4799,7 @@ impl Emitter {
         self.loops.push(Loop {
             continuation: step_block,
             exit: exit_block,
+            defer_base: self.defers.len(),
         });
         self.block_body(module, body);
         self.loops.pop();
@@ -5621,10 +5862,7 @@ impl Emitter {
             } => self.unary(module, *op, operand, *span, expected),
             Expr::Binary {
                 op, lhs, rhs, span, ..
-            } => {
-                let _ = expected;
-                self.binary(module, *op, lhs, rhs, *span)
-            }
+            } => self.binary(module, *op, lhs, rhs, *span, expected),
             Expr::Cast { value, target, .. } => self.cast(module, value, target),
             Expr::Call { callee, args, span } => self.call(module, callee, args, *span, expected),
             Expr::Path {
@@ -5811,23 +6049,31 @@ impl Emitter {
                     None
                 }
             }
-            UnaryOp::AddressOf => match self
-                .borrowed(module, operand, span)
-                .or_else(|| self.borrowed_temporary(module, operand))
-            {
-                Some(view) => Some(view),
-                None => {
-                    self.diagnostics.push(
-                        Diagnostic::error(
-                            code::TYPE_MISMATCH,
-                            "`&` takes the address of a binding, a field or an element",
-                        )
-                        .with_span(operand.span())
-                        .with_note("a temporary has no address to keep: bind it first"),
-                    );
-                    None
+            UnaryOp::AddressOf => {
+                if let Expr::Ident { name, .. } = operand {
+                    let named = self.named_in_home(name);
+                    if self.slot_of(name).is_none() && self.signatures.contains_key(&named) {
+                        return self.function_address(operand, span);
+                    }
                 }
-            },
+                match self
+                    .borrowed(module, operand, span)
+                    .or_else(|| self.borrowed_temporary(module, operand))
+                {
+                    Some(view) => Some(view),
+                    None => {
+                        self.diagnostics.push(
+                            Diagnostic::error(
+                                code::TYPE_MISMATCH,
+                                "`&` takes the address of a binding, a field or an element",
+                            )
+                            .with_span(operand.span())
+                            .with_note("a temporary has no address to keep: bind it first"),
+                        );
+                        None
+                    }
+                }
+            }
             UnaryOp::Load => {
                 let value = self.expr(module, operand, None)?;
                 match self.pointee_of(value.ty) {
@@ -5972,9 +6218,28 @@ impl Emitter {
         lhs: &Expr,
         rhs: &Expr,
         span: Span,
+        expected: Option<DuxType>,
     ) -> Option<Typed> {
         if matches!(op, BinaryOp::And | BinaryOp::Or) {
             return self.short_circuit(module, op, lhs, rhs);
+        }
+        // Untyped constants keep their untyped-ness through arithmetic (D17),
+        // so `4 * 1024` handed to a `usize` is still the number, not an `i32`
+        // the conversion has to forgive.
+        if let (Some(left), Some(right)) =
+            (self.literal_integer(lhs), self.literal_integer(rhs))
+        {
+            let folded = match op {
+                BinaryOp::Add => left.checked_add(right),
+                BinaryOp::Sub => left.checked_sub(right),
+                BinaryOp::Mul => left.checked_mul(right),
+                BinaryOp::Div => left.checked_div(right),
+                BinaryOp::Mod => left.checked_rem(right),
+                _ => None,
+            };
+            if let Some(value) = folded {
+                return Some(self.constant_integer(value, expected, span));
+            }
         }
         let (left, right) = self.operands(module, lhs, rhs)?;
         if left.ty == DuxType::Error || right.ty == DuxType::Error {
@@ -5999,6 +6264,79 @@ impl Emitter {
             return None;
         }
         self.binary_typed(module, op, left, right, span)
+    }
+
+    /// The number an integer literal expression denotes: a literal, a
+    /// parenthesis, a negation, or arithmetic over those — what an untyped
+    /// constant folds from (D17). Anything else is not literal.
+    fn literal_integer(&self, expr: &Expr) -> Option<i128> {
+        match expr {
+            Expr::Int { value, .. } => i128::try_from(*value).ok(),
+            Expr::Paren { inner, .. } => self.literal_integer(inner),
+            Expr::Unary {
+                op: UnaryOp::Neg,
+                operand,
+                ..
+            } => self.literal_integer(operand)?.checked_neg(),
+            Expr::Binary { op, lhs, rhs, .. } => {
+                let left = self.literal_integer(lhs)?;
+                let right = self.literal_integer(rhs)?;
+                match op {
+                    BinaryOp::Add => left.checked_add(right),
+                    BinaryOp::Sub => left.checked_sub(right),
+                    BinaryOp::Mul => left.checked_mul(right),
+                    BinaryOp::Div => left.checked_div(right),
+                    BinaryOp::Mod => left.checked_rem(right),
+                    _ => None,
+                }
+            }
+            _ => None,
+        }
+    }
+
+    /// A folded number written the way the literal would have been written:
+    /// in the type asked for (D17), or in the smallest one that holds it.
+    fn constant_integer(&mut self, value: i128, expected: Option<DuxType>, span: Span) -> Typed {
+        let unsigned = value.unsigned_abs();
+        if let Some(to) = expected.filter(|ty| ty.is_integral() || *ty == DuxType::Bool) {
+            if to.fits(unsigned, value < 0) {
+                let constant = to
+                    .int_type(self.context)
+                    .const_int(value as u64, value < 0);
+                return Typed::int(constant, to);
+            }
+            self.diagnostics.push(
+                Diagnostic::error(
+                    code::LITERAL_OUT_OF_RANGE,
+                    format!("the constant {value} does not fit a `{}`", to.name()),
+                )
+                .with_span(span),
+            );
+            return Typed::error();
+        }
+        if matches!(expected, Some(DuxType::F32) | Some(DuxType::F64)) {
+            let ty = if expected == Some(DuxType::F32) {
+                DuxType::F32
+            } else {
+                DuxType::F64
+            };
+            let constant = ty.float_type(self.context).const_float(value as f64);
+            return Typed {
+                core: Core::Float(constant),
+                ty,
+            };
+        }
+        let ty = if i32::MIN as i128 <= value && value <= i32::MAX as i128 {
+            DuxType::I32
+        } else if i64::MIN as i128 <= value && value <= i64::MAX as i128 {
+            DuxType::I64
+        } else {
+            DuxType::U64
+        };
+        let constant = ty
+            .int_type(self.context)
+            .const_int(value as u64, value < 0);
+        Typed::int(constant, ty)
     }
 
     /// Lower both operands of a binary operator. A float literal beside an
@@ -6600,7 +6938,12 @@ impl Emitter {
         expected: Option<DuxType>,
     ) -> Option<Typed> {
         match callee {
-            Expr::Ident { name, .. } => self.call_named(module, name, args, callee, span, expected),
+            Expr::Ident { name, .. } => {
+                if matches!(self.slot_of(name), Some((DuxType::Fn(_), _))) {
+                    return self.indirect_call(module, callee, args, span);
+                }
+                self.call_named(module, name, args, callee, span, expected)
+            }
             Expr::Paren { inner, .. } => self.call(module, inner, args, span, expected),
             Expr::Path { qualifier, name, .. } if self.shapes.contains_key(qualifier) => {
                 self.variant_value(module, qualifier, name, args, &[], span, expected)
@@ -6623,6 +6966,23 @@ impl Emitter {
                         return self.call_named(module, &named, args, callee, span, expected);
                     }
                 }
+                // `mem.Arena.new(4096)`: a module, a type it holds, and a
+                // method that type owns. No receiver walks off the dot.
+                if let Expr::Field { base: owner, name: type_name, .. } = base.as_ref() {
+                    if let Expr::Ident { name: place, .. } = owner.as_ref() {
+                        let qualified =
+                            format!("{place}.{}.{name}", type_name.name, name = name.name);
+                        let plain = format!("{}.{name}", type_name.name, name = name.name);
+                        let named = if self.functions.contains_key(&qualified) {
+                            qualified
+                        } else if self.functions.contains_key(&plain) {
+                            plain
+                        } else {
+                            return self.call_method(module, base, name, args, span);
+                        };
+                        return self.call_named(module, &named, args, callee, span, expected);
+                    }
+                }
                 self.call_method(module, base, name, args, span)
             }
             _ => {
@@ -6630,6 +6990,110 @@ impl Emitter {
                 None
             }
         }
+    }
+
+    /// The address `&doubling` names: the function itself, in the shape a
+    /// `fn` type carries. A function that takes the hidden context has no
+    /// address in that shape, and says so.
+    fn function_address(&mut self, operand: &Expr, span: Span) -> Option<Typed> {
+        let miss = || {
+            Diagnostic::error(
+                code::TYPE_MISMATCH,
+                "`&` takes the address of a binding, a field, an element or a function",
+            )
+            .with_span(operand.span())
+            .with_note("a temporary has no address to keep: bind it first")
+        };
+        let Expr::Ident { name, .. } = operand else {
+            self.diagnostics.push(miss());
+            return None;
+        };
+        let named = self.named_in_home(name);
+        let Some(signature) = self.signatures.get(named.as_str()).cloned() else {
+            self.diagnostics.push(miss());
+            return None;
+        };
+        if signature.hidden_context || signature.receiver.is_some() {
+            self.unsupported(
+                span,
+                "taking the address of a function that carries a `context`: \
+                 mark it `#[no_context]`",
+            );
+            return None;
+        }
+        let Some(function) = self.functions.get(named.as_str()).copied() else {
+            self.diagnostics.push(miss());
+            return None;
+        };
+        let address = function.as_global_value().as_pointer_value();
+        Some(Typed {
+            core: Core::Ptr(address),
+            ty: DuxType::function(signature.params, signature.return_ty),
+        })
+    }
+
+    /// A call through a `fn` value. The shape the value carries decides the
+    /// arguments and the answer; the address carries nothing of its own.
+    fn indirect_call(
+        &mut self,
+        module: &Module<'static>,
+        callee: &Expr,
+        args: &[Expr],
+        span: Span,
+    ) -> Option<Typed> {
+        let target = self.expr(module, callee, None)?;
+        let DuxType::Fn(info) = target.ty else {
+            self.diagnostics.push(
+                Diagnostic::error(
+                    code::TYPE_MISMATCH,
+                    "only a `fn` value can be called through its address".to_string(),
+                )
+                .with_span(callee.span()),
+            );
+            return None;
+        };
+        let function = target.pointer_value()?;
+        if args.len() != info.params.len() {
+            self.diagnostics.push(
+                Diagnostic::error(
+                    code::WRONG_ARITY,
+                    format!(
+                        "`{}` takes {} arguments, given {}",
+                        target.ty.name(),
+                        info.params.len(),
+                        args.len()
+                    ),
+                )
+                .with_span(span),
+            );
+            return None;
+        }
+        let mut arguments = Vec::new();
+        for (parameter, arg) in info.params.iter().zip(args) {
+            let value = self.expr(module, arg, Some(*parameter))?;
+            if value.ty == DuxType::Error {
+                return None;
+            }
+            let value = self.coerce_implicit(module, value, *parameter, arg.span())?;
+            match value.basic() {
+                Some(basic) => arguments.push(BasicMetadataValueEnum::from(basic)),
+                None => {
+                    self.unsupported(arg.span(), "passing this value");
+                    return None;
+                }
+            }
+        }
+        let llvm_params: Vec<BasicMetadataTypeEnum<'static>> = info
+            .params
+            .iter()
+            .map(|ty| BasicMetadataTypeEnum::from(ty.llvm(self.context)))
+            .collect();
+        let return_ty = info.returns;
+        let fn_type = match return_ty {
+            Some(ty) => ty.llvm(self.context).fn_type(&llvm_params, false),
+            None => self.context.void_type().fn_type(&llvm_params, false),
+        };
+        self.invoke_pointer(function, fn_type, arguments, return_ty)
     }
 
     fn call_named(
@@ -7003,6 +7467,31 @@ impl Emitter {
         return_ty: Option<DuxType>,
     ) -> Option<Typed> {
         let call = self.builder.build_call(function, &arguments, "call").ok()?;
+        self.finish_call(call, return_ty)
+    }
+
+    /// A call through an address: what a `fn` value carries, and what the
+    /// context's allocator slots hold. The shape is written at the call
+    /// because the address itself carries none.
+    fn invoke_pointer(
+        &mut self,
+        function: PointerValue<'static>,
+        fn_type: FunctionType<'static>,
+        arguments: Vec<BasicMetadataValueEnum<'static>>,
+        return_ty: Option<DuxType>,
+    ) -> Option<Typed> {
+        let call = self
+            .builder
+            .build_indirect_call(fn_type, function, &arguments, "call")
+            .ok()?;
+        self.finish_call(call, return_ty)
+    }
+
+    fn finish_call(
+        &mut self,
+        call: CallSiteValue<'static>,
+        return_ty: Option<DuxType>,
+    ) -> Option<Typed> {
         let answer = call.try_as_basic_value();
         let ty = return_ty?;
         // A fixed array that comes back from a call comes back whole; a fixed
@@ -8030,7 +8519,7 @@ fn spec_for(ty: DuxType) -> Option<&'static str> {
         DuxType::U64 => "lu",
         DuxType::F32 | DuxType::F64 => "g",
         DuxType::Str => ".*s",
-        DuxType::Ptr | DuxType::Pointer(_) => "p",
+        DuxType::Ptr | DuxType::Pointer(_) | DuxType::Fn(_) => "p",
         DuxType::Array(..) | DuxType::Struct(..) | DuxType::Enum(_) | DuxType::Slice(_)
         | DuxType::Error => return None,
     })
