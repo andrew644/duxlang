@@ -1147,3 +1147,78 @@ fn main() {
         "a string keeps its address behind an `as`"
     );
 }
+
+#[test]
+fn a_method_called_on_the_type_reads_the_generic_body_at_that_instantiation() {
+    assert_eq!(
+        codes(
+            "struct Bag<T> {
+    items: []T,
+    count: usize,
+}
+
+impl Bag<T> {
+    fn empty() -> Bag<T> {
+        return Bag<T> { items: make(T, 4), count: 0 }
+    }
+
+    fn put(self: *Bag<T>, value: T) {
+        self.items[self.count] = value
+        self.count += 1
+    }
+
+    fn take(self: *Bag<T>) -> Option<T> {
+        if self.count == 0 {
+            return None
+        }
+        self.count -= 1
+        return Some(self.items[self.count])
+    }
+}
+
+fn main() {
+    bag := Bag<i32>.empty()
+    bag.put(1)
+    bag.put(2)
+    if Some(v) := bag.take() {
+        println($\"{}\", v)
+    }
+    text := Bag<string>.empty()
+    text.put(\"dux\")
+    println($\"{}\", text.take().unwrap_or(\"?\"))
+}
+"
+        ),
+        Vec::<&'static str>::new()
+    );
+}
+
+#[test]
+fn a_method_called_on_the_type_checks_its_arguments_through_the_instantiation() {
+    assert_eq!(
+        codes(
+            "struct Bag<T> {
+    items: []T,
+    count: usize,
+}
+
+impl Bag<T> {
+    fn empty() -> Bag<T> {
+        return Bag<T> { items: make(T, 4), count: 0 }
+    }
+
+    fn put(self: *Bag<T>, value: T) {
+        self.items[self.count] = value
+        self.count += 1
+    }
+}
+
+fn main() {
+    bag := Bag<i32>.empty()
+    bag.put(\"not an i32\")
+}
+"
+        ),
+        vec![dux_diag::code::TYPE_MISMATCH]
+    );
+}

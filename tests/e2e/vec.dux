@@ -1,0 +1,48 @@
+package main
+
+// `Vec<T>` is the prelude's growable array: `make` and `del` through the
+// hidden context, written in Dux, not built in.
+
+fn fill(xs: *Vec<i32>, n: i32) {
+    at: i32 = 0
+    while at < n {
+        xs.push(at)
+        at += 1
+    }
+}
+
+fn main() {
+    xs := Vec<i32>.new()
+    println($"fresh={} {}", xs.len(), xs.is_empty())
+    xs.push(1)
+    xs.push(2)
+    xs.push(3)
+    println($"len={} first={} second={}", xs.len(), xs.get(0).unwrap_or(0), xs.get(1).unwrap_or(0))
+    println($"missing={}", xs.get(9).unwrap_or(-1))
+    if Some(last) := xs.pop() {
+        println($"pop={} len={}", last, xs.len())
+    }
+
+    many := Vec<i32>.new()
+    fill(&many, 100)
+    total: i64 = 0
+    at: usize = 0
+    while at < many.len() {
+        if Some(v) := many.get(at) {
+            total += v as i64
+        }
+        at += 1
+    }
+    println($"grown={} sum={}", many.len(), total)
+
+    words := Vec<string>.new()
+    words.push("dux")
+    words.push("lang")
+    println($"word={} {}", words.get(0).unwrap_or("?"), words.len())
+
+    xs.clear()
+    println($"cleared={} {}", xs.len(), xs.is_empty())
+    xs.destroy()
+    many.destroy()
+    words.destroy()
+}

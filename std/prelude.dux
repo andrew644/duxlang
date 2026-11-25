@@ -2,6 +2,82 @@
 // and `Result` are the two predeclared enums; everything else the language
 // uses through them is written here, in the language.
 
+// `Vec<T>` is a growable array written against the context, as DESIGN D13
+// asks: the storage comes from `make` and goes back with `del`, and nothing
+// here is a builtin.
+struct Vec<T> {
+    items: []T,
+    count: usize,
+}
+
+impl Vec<T> {
+    fn new() -> Vec<T> {
+        return Vec<T> { items: make(T, 8), count: 0 }
+    }
+
+    fn len(self) -> usize {
+        return self.count
+    }
+
+    fn is_empty(self) -> bool {
+        return self.count == 0
+    }
+
+    fn push(self: *Vec<T>, value: T) {
+        if self.count >= self.items.len() {
+            self.grow()
+        }
+        self.items[self.count] = value
+        self.count += 1
+    }
+
+    fn get(self, at: usize) -> Option<T> {
+        if at < self.count {
+            return Some(self.items[at])
+        }
+        return None
+    }
+
+    fn pop(self: *Vec<T>) -> Option<T> {
+        if self.count == 0 {
+            return None
+        }
+        self.count -= 1
+        return Some(self.items[self.count])
+    }
+
+    fn clear(self: *Vec<T>) {
+        self.count = 0
+    }
+
+    // The view a `Vec` is holding: the filled prefix, no copy and no
+    // allocation.
+    fn slice(self) -> []T {
+        return self.items[0..self.count]
+    }
+
+    // The storage is one block from the context; handing it back early is the
+    // program saying it is done, and using the `Vec` after is the program's
+    // mistake to make.
+    fn destroy(self: *Vec<T>) {
+        del(self.items)
+        self.items = self.items[0..0]
+        self.count = 0
+    }
+
+    fn grow(self: *Vec<T>) {
+        room := self.items.len() * 2
+        taller := make(T, room)
+        at: usize = 0
+        while at < self.count {
+            taller[at] = self.items[at]
+            at += 1
+        }
+        del(self.items)
+        self.items = taller
+    }
+}
+
 impl Option<T> {
     // `unwrap` stops the program when there is nothing to take, which waits on
     // the runtime that says why. `unwrap_or` can answer today.

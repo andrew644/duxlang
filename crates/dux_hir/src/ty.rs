@@ -2802,6 +2802,28 @@ impl<'a> Checker<'a> {
             }
         }
         if let Expr::Field { base, name, .. } = callee {
+            // `Vec<i32>.new()`: a method of a generic `impl` called on the
+            // type, which says what the `impl`'s parameters stand for.
+            if let Expr::Path {
+                qualifier,
+                name: type_name,
+                args: written,
+                ..
+            } = base.as_ref()
+            {
+                if qualifier.is_empty() && !written.is_empty() {
+                    let spelled = Type::Named {
+                        name: type_name.clone(),
+                        args: written.clone(),
+                        span,
+                    };
+                    let base = self.resolve_type(&spelled);
+                    let key = (type_name.clone(), name.name.clone());
+                    if let Some(generic) = self.generic_methods.get(&key).cloned() {
+                        return self.generic_method(&base, &key, &generic, args, span);
+                    }
+                }
+            }
             // `math.sqrt(x)`: what walks off the dot is a module, not a value,
             // and a module's members are known by where they live.
             if let Expr::Ident {

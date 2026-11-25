@@ -81,9 +81,14 @@ impl<'a> Resolver<'a> {
             match scoped.decl {
                 Decl::Fn(function) => self.function(function),
                 Decl::Impl(impl_block) => {
+                    self.scopes.push(Vec::new());
+                    for parameter in &impl_block.type_params {
+                        self.bind(&parameter.name.name);
+                    }
                     for method in &impl_block.methods {
                         self.function(method);
                     }
+                    self.scopes.pop();
                 }
                 Decl::Const(decl) => self.expr(&decl.value),
                 Decl::Global(decl) => {

@@ -6623,6 +6623,29 @@ impl Emitter {
         args: &[Expr],
         span: Span,
     ) -> Option<Typed> {
+        if let Expr::Path {
+            qualifier,
+            name: type_name,
+            args: written,
+            ..
+        } = base
+        {
+            // `Vec<i32>.new()`: the base is a type, not a value, and the
+            // method is called on it rather than on a receiver.
+            if qualifier.is_empty() && !written.is_empty() {
+                let plain = format!("{type_name}.{}", name.name);
+                if self.generic_methods.contains_key(&plain) {
+                    return self.static_generic_method(
+                        module,
+                        type_name,
+                        written,
+                        &name.name,
+                        args,
+                        span,
+                    );
+                }
+            }
+        }
         let place = self.place_of_expr(module, base);
         let (base_ty, base_at) = match place {
             Some((ty, at)) => (ty, Some(at)),
@@ -8537,6 +8560,109 @@ impl Emitter {
                 signature.hidden_context,
             )
         };
+        let mut arguments = Vec::new();
+        for (given, (arg, value)) in params.iter().zip(args.iter().zip(lowered)) {
+            let value = self.coerce_implicit(module, value, *given, arg.span())?;
+            match value.basic() {
+                Some(basic) => arguments.push(BasicMetadataValueEnum::from(basic)),
+                None => {
+                    self.unsupported(arg.span(), "passing this value");
+                    return None;
+                }
+            }
+        }
+        if hidden_context {
+            let context = self.context_value(span)?;
+            arguments.push(context.into());
+        }
+        self.invoke(function, arguments, return_ty)
+    }
+
+    /// A method of a generic `impl` called on the type itself, as in
+    /// `Vec<i32>.new()`: the type arguments are written, and there is no
+    /// receiver to pass.
+    fn static_generic_method(
+        &mut self,
+        module: &Module<'static>,
+        owner: &str,
+        written: &[Type],
+        method: &str,
+        args: &[Expr],
+        span: Span,
+    ) -> Option<Typed> {
+        let plain = format!("{owner}.{method}");
+        let decl = self.generic_methods.get(&plain).copied()?;
+        let Some(params) = self.impl_params.get(owner).cloned() else {
+            self.unsupported(
+                span,
+                &format!("`{plain}` written on a type that is not generic"),
+            );
+            return None;
+        };
+        if params.len() != written.len() {
+            self.unsupported(
+                span,
+                &format!("`{plain}`: its `impl` and the type it extends do not agree on the number of parameters"),
+            );
+            return None;
+        }
+        let mut bound = Vec::new();
+        let mut parts = Vec::new();
+        for (param, argument) in params.iter().zip(written) {
+            let ty = self.type_of(argument)?;
+            parts.push(ty.name());
+            bound.push((param.clone(), Stood::Ty(ty)));
+        }
+        let mut lowered = Vec::new();
+        for arg in args {
+            lowered.push(self.expr(module, arg, None)?);
+        }
+        let spelled = format!("{owner}<{}>.{method}", parts.join(", "));
+        let saved = std::mem::take(&mut self.substituting);
+        self.substituting = bound.clone();
+        let instance = self.declare_instance(
+            module,
+            Asking {
+                decl,
+                owner: Some(Box::leak(owner.to_string().into_boxed_str())),
+                receiver: None,
+            },
+            &plain,
+            spelled,
+            bound,
+        );
+        self.substituting = saved;
+        let Some(instance) = instance else {
+            return Some(Typed::error());
+        };
+        let Some(function) = self.functions.get(&instance.key).copied() else {
+            return Some(Typed::error());
+        };
+        let (params, return_ty, hidden_context) = {
+            let signature = self
+                .signatures
+                .get(&instance.key)
+                .expect("an instantiated function has a recorded signature");
+            (
+                signature.params.clone(),
+                signature.return_ty,
+                signature.hidden_context,
+            )
+        };
+        if args.len() != params.len() {
+            self.diagnostics.push(
+                Diagnostic::error(
+                    code::WRONG_ARITY,
+                    format!(
+                        "`{plain}` takes {} arguments, given {}",
+                        params.len(),
+                        args.len()
+                    ),
+                )
+                .with_span(span),
+            );
+            return None;
+        }
         let mut arguments = Vec::new();
         for (given, (arg, value)) in params.iter().zip(args.iter().zip(lowered)) {
             let value = self.coerce_implicit(module, value, *given, arg.span())?;

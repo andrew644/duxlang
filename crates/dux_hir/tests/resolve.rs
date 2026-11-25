@@ -538,3 +538,53 @@ fn the_normative_corpus_resolves_without_a_single_diagnostic() {
         "the corpus should still be reviewed as a whole: {example_count} files"
     );
 }
+
+#[test]
+fn an_impls_parameters_reach_its_method_bodies() {
+    assert_eq!(
+        codes(
+            "struct Buf<T> {
+    data: *T,
+}
+
+impl Buf<T> {
+    fn one() -> Buf<T> {
+        return Buf<T> { data: new(T) }
+    }
+
+    fn many(n: usize) -> []T {
+        return make(T, n)
+    }
+}
+
+fn main() {
+    b := Buf<i32>.one()
+}
+"
+        ),
+        Vec::<&'static str>::new()
+    );
+}
+
+#[test]
+fn a_name_that_is_not_an_impls_parameter_is_still_unknown_in_its_methods() {
+    assert_eq!(
+        codes(
+            "struct Buf<T> {
+    data: *T,
+}
+
+impl Buf<T> {
+    fn one() -> Buf<T> {
+        return Buf<T> { data: new(Z) }
+    }
+}
+
+fn main() {
+    b := Buf<i32>.one()
+}
+"
+        ),
+        vec![dux_diag::code::UNDECLARED]
+    );
+}
