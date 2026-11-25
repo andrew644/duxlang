@@ -17,6 +17,7 @@ use dux_diag::{code, Diagnostic};
 use dux_hir::sums::{self, Payload, Shape};
 use dux_hir::ty::CInt;
 use dux_source::{FileId, SourceMap, Span};
+use inkwell::attributes::{Attribute, AttributeLoc};
 use inkwell::basic_block::BasicBlock;
 use inkwell::builder::Builder;
 use inkwell::context::Context;
@@ -2475,14 +2476,38 @@ impl Emitter {
         let mut declared = receiver
             .iter()
             .chain(params.iter())
-            .map(|ty| BasicMetadataTypeEnum::from(ty.llvm(self.context)))
+            .map(|ty| match ty {
+                // A record that crosses the C boundary crosses it by
+                // address. The importer's wrappers take records as
+                // pointers for exactly this reason: LLVM and clang do not
+                // agree on the shape of a by-value record, and an address
+                // is one shape everyone shares.
+                DuxType::Struct(_) if external => {
+                    BasicMetadataTypeEnum::from(self.context.ptr_type(AddressSpace::default()))
+                }
+                other => BasicMetadataTypeEnum::from(other.llvm(self.context)),
+            })
             .collect::<Vec<BasicMetadataTypeEnum>>();
         if hidden_context {
             declared.push(self.context.ptr_type(AddressSpace::default()).into());
         }
-        let signature = match return_ty {
-            Some(ty) => ty.llvm(self.context).fn_type(&declared, external),
-            None => self.context.void_type().fn_type(&declared, external),
+        // A C function that hands back a record hands it back through a
+        // slot the caller provides. LLVM spells that slot as a leading
+        // `sret` pointer and a `void` result — the shape clang gives the
+        // `__duxr_` wrappers the importer compiles, so the declaration
+        // here and the definition in the linked bitcode are one function.
+        let sret = external && matches!(return_ty, Some(DuxType::Struct(_)));
+        let signature = if sret {
+            let mut shaped = vec![BasicMetadataTypeEnum::from(
+                self.context.ptr_type(AddressSpace::default()),
+            )];
+            shaped.extend(declared.iter().copied());
+            self.context.void_type().fn_type(&shaped, external)
+        } else {
+            match return_ty {
+                Some(ty) => ty.llvm(self.context).fn_type(&declared, external),
+                None => self.context.void_type().fn_type(&declared, external),
+            }
         };
         // Two declarations may name one C symbol — a `#[c_name]` alias and
         // the plain declaration, say. The symbol is the truth: both keys
@@ -2490,7 +2515,16 @@ impl Emitter {
         let existing = module.get_function(&unit.symbol).filter(|_| external);
         let fn_value = match existing {
             Some(found) => found,
-            None => module.add_function(&unit.symbol, signature, None),
+            None => {
+                let made = module.add_function(&unit.symbol, signature, None);
+                if sret {
+                    made.add_attribute(
+                        AttributeLoc::Param(0),
+                        Emitter::sret_attribute(self.context),
+                    );
+                }
+                made
+            }
         };
         self.functions.insert(key.clone(), fn_value);
         self.signatures.insert(
@@ -7505,6 +7539,14 @@ impl Emitter {
                     core: value.core,
                     ty: parameter.unwrap_or(value.ty),
                 }
+            } else if external
+                && matches!(value.ty, DuxType::Struct(_))
+                && parameter.is_some_and(|ty| matches!(ty, DuxType::Struct(_)))
+            {
+                // The record travels by address, into the wrapper that
+                // opens it up again on the C side.
+                let at = self.materialize(value, "arg")?;
+                Typed::pointer(at, DuxType::Ptr)
             } else if let Some(parameter) = parameter {
                 self.coerce_implicit(module, value, parameter, arg.span())?
             } else if value.ty == DuxType::F32 {
@@ -7810,8 +7852,38 @@ impl Emitter {
         arguments: Vec<BasicMetadataValueEnum<'static>>,
         return_ty: Option<DuxType>,
     ) -> Option<Typed> {
+        // The `sret` shape: a record that comes back from C comes back
+        // through a slot the caller reserves, and the call itself answers
+        // nothing. A Dux function returning a record returns it as a
+        // value, and its call lands in `finish_call` instead.
+        let through_slot = return_ty.is_some_and(|ty| matches!(ty, DuxType::Struct(_)))
+            && function.get_type().get_return_type().is_none();
+        if through_slot {
+            let ty = return_ty?;
+            let slot = self.alloca(ty, "retslot");
+            let mut arguments = arguments;
+            arguments.insert(0, slot.into());
+            let call = self.builder.build_call(function, &arguments, "").ok()?;
+            call.add_attribute(
+                AttributeLoc::Param(0),
+                Emitter::sret_attribute(self.context),
+            );
+            let whole = self
+                .builder
+                .build_load(ty.llvm(self.context), slot, "ret")
+                .ok()?;
+            return Some(Typed {
+                core: Core::Aggregate(whole.into_struct_value()),
+                ty,
+            });
+        }
         let call = self.builder.build_call(function, &arguments, "call").ok()?;
         self.finish_call(call, return_ty)
+    }
+
+    /// The `sret` parameter attribute, by the name LLVM gives it in IR.
+    fn sret_attribute(context: &Context) -> Attribute {
+        context.create_enum_attribute(Attribute::get_named_enum_kind_id("sret"), 0)
     }
 
     /// The System V variadic rule: the call instruction carries no count of

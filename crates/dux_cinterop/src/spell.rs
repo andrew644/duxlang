@@ -118,16 +118,22 @@ fn spell_with(
             // A `static inline` definition is called through the wrapper
             // the compiled translation unit hands it: the symbol a Dux
             // declaration binds to is the doorway, not the private name.
-            let text = if function.header_definition {
+            // Two reasons to call through a wrapper: a `static inline`
+            // definition needs a doorway out of the translation unit, and
+            // a record crossing the boundary by value needs the one
+            // spelling everybody agrees on — result through a slot,
+            // records in through pointers.
+            let needs_wrapper = function.header_definition || crate::wraps_record(function);
+            let text = if needs_wrapper {
                 match wrapper_name(function) {
                     Some(wrapper) => format!("#[c_name(\"{wrapper}\")] {text}"),
                     None => {
                         missed.push(crate::Skipped {
                             name: function.name.clone(),
                             reason: if function.variadic {
-                                "a variadic `static inline` cannot be wrapped".to_string()
+                                "a variadic function cannot be wrapped".to_string()
                             } else {
-                                "a header definition's types cannot cross".to_string()
+                                "a wrapper for this signature cannot be written in C".to_string()
                             },
                         });
                         continue;

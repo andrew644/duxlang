@@ -1,0 +1,14 @@
+package main
+
+#[c_include("crec.h")]
+mod rec;
+
+fn main() {
+    p := rec.make_point(3, 4)
+    println($"point=({p.x}, {p.y})")
+    println($"sum={rec.sum_point(p)}")
+    q := rec.shift_point(p, 10)
+    println($"shift=({q.x}, {q.y})")
+    r := rec.halves(7)
+    println($"halves=({r.a}, {r.b})")
+}

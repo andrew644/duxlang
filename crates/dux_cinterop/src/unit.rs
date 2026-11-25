@@ -17,11 +17,44 @@ pub fn wrapper_name(function: &CFunction) -> Option<String> {
     if function.variadic {
         return None;
     }
+    if !wraps_record(function) && !function.header_definition {
+        return None;
+    }
     c_spelling(&function.returns.clone().unwrap_or(CType::Void))?;
     for (_, ty) in &function.params {
         c_spelling(ty)?;
     }
     Some(format!("__duxw_{}", function.name))
+}
+
+/// Whether a C function hands back a record by value. LLVM and clang do
+/// not agree on how to spell one in IR — two floats are a `<2 x float>`
+/// to one and a `{ float, float }` to the other — so Dux never asks a C
+/// function for that shape directly. A wrapper takes the result's address
+/// instead, and the one spelling works for every record on every ABI.
+pub fn returns_record(returns: Option<&CType>) -> bool {
+    match returns {
+        Some(CType::Struct(_)) => true,
+        Some(CType::Typedef(_, target)) => matches!(**target, CType::Struct(_)),
+        _ => false,
+    }
+}
+
+/// Whether a record crosses this function's boundary by value, in either
+/// direction. Such a function is called through a wrapper: LLVM and clang
+/// disagree about the shape of a by-value record often enough to matter
+/// (two floats are a vector to one and a pair to the other), and one
+/// spelling — results through an address the caller reserves, records in
+/// through pointers — is right on every ABI.
+pub fn wraps_record(function: &CFunction) -> bool {
+    if function.variadic {
+        return false;
+    }
+    returns_record(function.returns.as_ref())
+        || function
+            .params
+            .iter()
+            .any(|(_, ty)| returns_record(Some(ty)))
 }
 
 /// The C source: one include per header the reader was given, and one
@@ -38,7 +71,8 @@ pub fn c_source(headers: &[String], decls: &[CDecl]) -> String {
         let CDecl::Function(function) = decl else {
             continue;
         };
-        if !function.header_definition {
+        let record = returns_record(function.returns.as_ref());
+        if !wraps_record(function) && !function.header_definition {
             continue;
         }
         let Some(wrapper) = wrapper_name(function) else {
@@ -52,8 +86,15 @@ pub fn c_source(headers: &[String], decls: &[CDecl]) -> String {
                 params.push_str(", ");
                 arguments.push_str(", ");
             }
-            params.push_str(&format!("{spelled} __p{at}"));
-            arguments.push_str(&format!("__p{at}"));
+            // A record comes in through a pointer, and the call behind the
+            // wrapper opens it up again. C sees exactly what it expects.
+            if returns_record(Some(ty)) {
+                params.push_str(&format!("{spelled} *__p{at}"));
+                arguments.push_str(&format!("*__p{at}"));
+            } else {
+                params.push_str(&format!("{spelled} __p{at}"));
+                arguments.push_str(&format!("__p{at}"));
+            }
         }
         // The parentheses are load-bearing: they stop a function-like macro
         // from swallowing the call, which a real header (stb's `stbi__err`)
@@ -62,6 +103,17 @@ pub fn c_source(headers: &[String], decls: &[CDecl]) -> String {
         match &function.returns {
             None | Some(CType::Void) => {
                 out.push_str(&format!("void {wrapper}({params}) {{ {call}; }}\n"));
+            }
+            Some(returns) if record => {
+                let spelled = c_spelling(returns).expect("wrapper_name checked this");
+                let head = if params.is_empty() {
+                    format!("{spelled} *__dux_out")
+                } else {
+                    format!("{spelled} *__dux_out, {params}")
+                };
+                out.push_str(&format!(
+                    "void {wrapper}({head}) {{ *__dux_out = {call}; }}\n"
+                ));
             }
             Some(returns) => {
                 let spelled = c_spelling(returns).expect("wrapper_name checked this");

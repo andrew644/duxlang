@@ -16,7 +16,7 @@ mod unit;
 mod walk;
 
 pub use spell::{spell, spell_report};
-pub use unit::{c_source, wrapper_name};
+pub use unit::{c_source, returns_record, wrapper_name, wraps_record};
 pub use walk::import;
 
 /// A name the boundary could not carry, and why. This is what
