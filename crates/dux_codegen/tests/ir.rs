@@ -210,6 +210,58 @@ fn defer_replays_captured_calls_at_every_exit() {
 }
 
 #[test]
+fn c_declarations_are_variadic_candidates_and_one_symbol_is_one_function() {
+    let ir = build(
+        "package main\nextern \"C\" {\n    fn dprintf(fd: c_int, fmt: *c_char) -> c_int\n    #[c_name(\"strlen\")]\n    fn text_len(s: *c_char) -> usize\n}\nfn main() {\n    dprintf(1, c\"v %d\\n\", 7)\n    text_len(c\"ab\")\n}",
+    )
+    .expect("builds")
+    .ir_text();
+    assert!(
+        ir.contains("declare i32 @dprintf(i32, ptr, ...)"),
+        "a C declaration may take more than its written list:\n{ir}"
+    );
+    assert!(
+        ir.contains("mov $$0, %al"),
+        "the variadic call says how many vector registers it used:\n{ir}"
+    );
+    assert!(
+        ir.contains("declare i64 @strlen("),
+        "`#[c_name]` names the symbol, not the Dux spelling:\n{ir}"
+    );
+    assert!(
+        !ir.contains("text_len"),
+        "the Dux spelling never reaches the object file:\n{ir}"
+    );
+}
+
+#[test]
+fn an_f32_past_the_written_list_becomes_a_double() {
+    let ir = build(
+        "package main\nextern \"C\" {\n    fn logfmt(fmt: *c_char) -> c_int\n}\nfn main() {\n    width: f32 = 1.5\n    logfmt(c\"%f\", width)\n}",
+    )
+    .expect("builds")
+    .ir_text();
+    assert!(ir.contains("fpext"), "C promotes a float vararg:\n{ir}");
+    assert!(
+        ir.contains("mov $$1, %al"),
+        "one float argument, one vector register:\n{ir}"
+    );
+}
+
+#[test]
+fn a_string_crosses_the_boundary_as_its_bytes() {
+    let ir = build(
+        "package main\nextern \"C\" {\n    fn strlen(s: *c_char) -> usize\n}\nfn main() {\n    text := \"dux\"\n    n := strlen(text)\n    println($\"{}\", n)\n}",
+    )
+    .expect("builds")
+    .ir_text();
+    assert!(
+        ir.contains("@strlen(ptr %view.data)"),
+        "the address travels and the count stays home:\n{ir}"
+    );
+}
+
+#[test]
 fn untyped_arithmetic_adopts_the_type_the_call_asks_for() {
     let ir = build(
         "package main\nfn take(n: usize) -> usize { return n }\nfn main() { page := take(4 * 1024) }",

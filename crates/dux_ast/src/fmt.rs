@@ -257,8 +257,11 @@ impl Printer {
                 .map(|ty| format!(" -> {}", self.ty(ty)))
                 .unwrap_or_default()
         );
+        // An `extern "C"` block declares signatures without bodies, and the
+        // grammar separates declarations with newlines, not semicolons: what
+        // the printer writes must be what the parser reads.
         if signature_only && function.body.stmts.is_empty() {
-            return format!("{head};");
+            return head;
         }
         if function.body.stmts.is_empty() {
             return format!("{head} {{\n{p}}}");

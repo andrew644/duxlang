@@ -159,3 +159,19 @@ fn formatter_output_is_a_fixed_point() {
     let run = duxc(&["fmt", "--check", dir.to_str().unwrap()]);
     assert_eq!(run.code, 0, "{}", run.stderr);
 }
+
+#[test]
+fn extern_signatures_are_printed_the_way_the_parser_reads_them() {
+    let clean = "package main\n\nextern \"C\" {\n    fn floor(x: f64) -> f64\n}\n\nfn main() {\n    floor(1.0)\n}\n";
+    let dir = scratch("fmt_extern");
+    let file = dir.join("abi.dux");
+    std::fs::write(&file, clean).unwrap();
+
+    let run = duxc(&["fmt", file.to_str().unwrap()]);
+    assert_eq!(run.code, 0, "{} {}", run.stdout, run.stderr);
+    assert_eq!(
+        std::fs::read_to_string(&file).unwrap(),
+        clean,
+        "an extern block round-trips: the grammar separates declarations with newlines"
+    );
+}

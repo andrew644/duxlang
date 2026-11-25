@@ -1,0 +1,42 @@
+//@stderr_empty
+package main
+
+// The hand-written road into C, first class: `extern "C"` declarations with
+// distinct `c_long` and `c_int` (D18), a `#[c_name]` symbol override, varargs
+// called directly, a `string` crossing to `char *` as its bytes, a C `NULL`
+// arriving as `Option<*c_char>` and `std/c` turning it back into text.
+
+import "std/c"
+
+#[link(name = "m")]
+extern "C" {
+    fn fma(x: c_double, y: c_double, z: c_double) -> c_double
+    #[c_name("strlen")]
+    fn text_len(s: *c_char) -> usize
+}
+
+#[link(name = "c")]
+extern "C" {
+    fn dprintf(fd: c_int, fmt: *c_char) -> c_int
+    fn strlen(text: *c_char) -> usize
+    fn getenv(name: *c_char) -> Option<*c_char>
+    fn time(what: Option<*c_long>) -> c_long
+}
+
+fn main() {
+    wide: c_long = 40000
+    back: i64 = wide as i64
+    text := "duxlang"
+    n := strlen(text)
+    dprintf(1, c"varargs %d\n", 42)
+    home := c.to_string(getenv(c"DUX_DEFINITELY_NOT_SET"))
+    match home {
+        Some(where_) => println($"home={where_}"),
+        None => println($"no home set"),
+    }
+    now := time(None) as i64
+    println($"len={} wide={} fma={} alen={}", n, back, fma(2.0, 3.0, 4.0), text_len(c"abcd"))
+    if now > 1700000000 {
+        println($"clock ok")
+    }
+}

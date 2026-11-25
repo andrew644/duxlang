@@ -10,11 +10,12 @@ use std::collections::{HashMap, HashSet};
 
 use crate::runtime::{HashRuntime, Runtime};
 use dux_ast::{
-    BinaryOp, Block, ConstDecl, Decl, Expr, FnDecl, ForKind, GlobalDecl, InterpolationPart, Program,
-    Stmt, Type, UnaryOp,
+    AttributeArgument, BinaryOp, Block, ConstDecl, Decl, Expr, FnDecl, ForKind, GlobalDecl,
+    InterpolationPart, Program, Stmt, Type, UnaryOp,
 };
 use dux_diag::{code, Diagnostic};
 use dux_hir::sums::{self, Payload, Shape};
+use dux_hir::ty::CInt;
 use dux_source::{FileId, SourceMap, Span};
 use inkwell::basic_block::BasicBlock;
 use inkwell::builder::Builder;
@@ -51,6 +52,10 @@ pub(crate) enum DuxType {
     U16,
     U32,
     U64,
+    /// A C integer (D18): an `i8`..`i64` in the machine's eyes, its own type
+    /// in the program's. The classification methods below answer through the
+    /// kind, so the arithmetic lattice treats it like the width it has.
+    C(CInt),
     F32,
     F64,
     /// A string literal: a pointer into NUL terminated static storage. The
@@ -230,6 +235,20 @@ impl DuxType {
             "u16" => DuxType::U16,
             "u32" | "uint" => DuxType::U32,
             "u64" | "usize" => DuxType::U64,
+            "c_char" => DuxType::C(CInt::Char),
+            "c_schar" => DuxType::C(CInt::SChar),
+            "c_uchar" => DuxType::C(CInt::UChar),
+            "c_short" => DuxType::C(CInt::Short),
+            "c_ushort" => DuxType::C(CInt::UShort),
+            "c_int" => DuxType::C(CInt::Int),
+            "c_uint" => DuxType::C(CInt::UInt),
+            "c_long" => DuxType::C(CInt::Long),
+            "c_ulong" => DuxType::C(CInt::ULong),
+            "c_long_long" => DuxType::C(CInt::LongLong),
+            "c_ulong_long" => DuxType::C(CInt::ULongLong),
+            "c_bool" => DuxType::C(CInt::Bool),
+            "c_float" => DuxType::F32,
+            "c_double" => DuxType::F64,
             "f32" => DuxType::F32,
             "f64" | "float" => DuxType::F64,
             "string" => DuxType::Str,
@@ -265,14 +284,18 @@ impl DuxType {
                 | DuxType::U16
                 | DuxType::U32
                 | DuxType::U64
+                | DuxType::C(_)
         )
     }
 
     fn is_signed(self) -> bool {
-        matches!(
-            self,
-            DuxType::I8 | DuxType::I16 | DuxType::I32 | DuxType::I64
-        )
+        match self {
+            DuxType::C(kind) => kind.signed(),
+            _ => matches!(
+                self,
+                DuxType::I8 | DuxType::I16 | DuxType::I32 | DuxType::I64
+            ),
+        }
     }
 
     fn is_float(self) -> bool {
@@ -292,6 +315,7 @@ impl DuxType {
     fn width(self) -> u32 {
         match self {
             DuxType::Bool => 1,
+            DuxType::C(kind) => kind.width(),
             DuxType::I8 | DuxType::U8 => 8,
             DuxType::I16 | DuxType::U16 => 16,
             DuxType::I32 | DuxType::U32 | DuxType::F32 => 32,
@@ -306,6 +330,12 @@ impl DuxType {
             DuxType::I16 | DuxType::U16 => context.i16_type().into(),
             DuxType::I32 | DuxType::U32 => context.i32_type().into(),
             DuxType::I64 | DuxType::U64 => context.i64_type().into(),
+            DuxType::C(kind) => match kind.width() {
+                8 => context.i8_type().into(),
+                16 => context.i16_type().into(),
+                32 => context.i32_type().into(),
+                _ => context.i64_type().into(),
+            },
             DuxType::F32 => context.f32_type().into(),
             DuxType::F64 => context.f64_type().into(),
             DuxType::Ptr | DuxType::Error => context.ptr_type(AddressSpace::default()).into(),
@@ -321,6 +351,12 @@ impl DuxType {
     fn int_type(self, context: &'static Context) -> IntType<'static> {
         match self {
             DuxType::Bool => context.bool_type(),
+            DuxType::C(kind) => match kind.width() {
+                8 => context.i8_type(),
+                16 => context.i16_type(),
+                32 => context.i32_type(),
+                _ => context.i64_type(),
+            },
             DuxType::I8 | DuxType::U8 => context.i8_type(),
             DuxType::I16 | DuxType::U16 => context.i16_type(),
             DuxType::I32 | DuxType::U32 => context.i32_type(),
@@ -346,6 +382,7 @@ impl DuxType {
             DuxType::U16 => "u16".to_string(),
             DuxType::U32 => "u32".to_string(),
             DuxType::U64 => "u64".to_string(),
+            DuxType::C(kind) => kind.spelled().to_string(),
             DuxType::F32 => "f32".to_string(),
             DuxType::F64 => "f64".to_string(),
             DuxType::Str => "string".to_string(),
@@ -386,6 +423,13 @@ impl DuxType {
             DuxType::U16 => 1 << 16,
             DuxType::U32 => 1 << 32,
             DuxType::U64 => 1 << 64,
+            DuxType::C(kind) => {
+                if kind.signed() {
+                    1u128 << (kind.width() - 1)
+                } else {
+                    1u128 << kind.width()
+                }
+            }
             DuxType::F32 | DuxType::F64 => return true,
             DuxType::Array(..) | DuxType::Struct(..) | DuxType::Enum(_) | DuxType::Str
             | DuxType::Ptr | DuxType::Fn(_) => return false,
@@ -570,6 +614,14 @@ impl ConstValue {
 fn fits_i128(value: i128, ty: DuxType) -> bool {
     match ty {
         DuxType::Bool => value == 0 || value == 1,
+        DuxType::C(kind) => {
+            if kind.signed() {
+                let limit = 1i128 << (kind.width() - 1);
+                -limit <= value && value < limit
+            } else {
+                value >= 0 && value < 1i128 << kind.width()
+            }
+        }
         DuxType::I8 => i8::try_from(value).is_ok(),
         DuxType::I16 => i16::try_from(value).is_ok(),
         DuxType::I32 => i32::try_from(value).is_ok(),
@@ -624,6 +676,9 @@ struct Signature {
     /// The LLVM parameter list ends with the hidden `context` pointer, which
     /// the argument list never mentions.
     hidden_context: bool,
+    /// The declaration came from C: its parameter list is exactly what was
+    /// written, and a call may bring more arguments than that.
+    external: bool,
 }
 
 /// A `fn` or a method, named the way the lowering names it. A method's key
@@ -657,7 +712,19 @@ impl<'a> Unit<'a> {
     }
 
     fn imported(decl: &'a FnDecl) -> Self {
+        // `#[c_name("real_c_symbol")]` is the in-place fix for the symbol the
+        // importer — or a linking scheme — would otherwise get wrong.
+        let symbol = decl
+            .attributes
+            .iter()
+            .find(|attribute| attribute.name == "c_name")
+            .and_then(|attribute| match attribute.arguments.first() {
+                Some(AttributeArgument::Literal(name)) => Some(name.clone()),
+                _ => None,
+            })
+            .unwrap_or_else(|| decl.name.name.clone());
         Self {
+            symbol,
             external: true,
             ..Self::function(decl)
         }
@@ -2272,6 +2339,7 @@ impl Emitter {
                     return_ty: Some(DuxType::I32),
                     receiver: None,
                     hidden_context: false,
+                    external: false,
                 },
             );
             return;
@@ -2328,10 +2396,17 @@ impl Emitter {
             declared.push(self.context.ptr_type(AddressSpace::default()).into());
         }
         let signature = match return_ty {
-            Some(ty) => ty.llvm(self.context).fn_type(&declared, false),
-            None => self.context.void_type().fn_type(&declared, false),
+            Some(ty) => ty.llvm(self.context).fn_type(&declared, external),
+            None => self.context.void_type().fn_type(&declared, external),
         };
-        let fn_value = module.add_function(&unit.symbol, signature, None);
+        // Two declarations may name one C symbol — a `#[c_name]` alias and
+        // the plain declaration, say. The symbol is the truth: both keys
+        // answer with the same function.
+        let existing = module.get_function(&unit.symbol).filter(|_| external);
+        let fn_value = match existing {
+            Some(found) => found,
+            None => module.add_function(&unit.symbol, signature, None),
+        };
         self.functions.insert(key.clone(), fn_value);
         self.signatures.insert(
             key,
@@ -2340,6 +2415,7 @@ impl Emitter {
                 return_ty,
                 receiver,
                 hidden_context,
+                external,
             },
         );
     }
@@ -5741,6 +5817,15 @@ impl Emitter {
             DuxType::U16 => ("u16", 16, DW_ATE_UNSIGNED),
             DuxType::U32 => ("u32", 32, DW_ATE_UNSIGNED),
             DuxType::U64 => ("u64", 64, DW_ATE_UNSIGNED),
+            DuxType::C(kind) => (
+                kind.spelled(),
+                kind.width() as u64,
+                if kind.signed() {
+                    DW_ATE_SIGNED
+                } else {
+                    DW_ATE_UNSIGNED
+                },
+            ),
             DuxType::F32 => ("f32", 32, DW_ATE_FLOAT),
             DuxType::F64 => ("f64", 64, DW_ATE_FLOAT),
             _ => return None,
@@ -6672,7 +6757,10 @@ impl Emitter {
         value: Typed,
         to: DuxType,
     ) -> Option<Typed> {
-        if value.ty != DuxType::Ptr || to != DuxType::Str {
+        if value.ty != DuxType::Ptr
+            && !matches!(value.ty, DuxType::Pointer(_))
+            || to != DuxType::Str
+        {
             return None;
         }
         let data = value.pointer_value()?;
@@ -6779,6 +6867,10 @@ impl Emitter {
             return true;
         }
         if from.is_integral() && to.is_integral() {
+            // D18: the C ladder and Dux's ladder are separate.
+            if matches!(from, DuxType::C(_)) != matches!(to, DuxType::C(_)) {
+                return false;
+            }
             return match (from.is_signed(), to.is_signed()) {
                 (true, true) | (false, false) => to.width() >= from.width(),
                 (false, true) => to.width() > from.width(),
@@ -6806,6 +6898,14 @@ impl Emitter {
         let from = value.ty;
         if from == to {
             return Some(value);
+        }
+        // Every pointer is the same word; a target is something the program
+        // says *about* the address, not a different address.
+        if from.is_pointer_like() && to.is_pointer_like() {
+            return Some(Typed {
+                core: value.core,
+                ty: to,
+            });
         }
         if from.is_integral() && to.is_integral() {
             let cast = self
@@ -7144,7 +7244,7 @@ impl Emitter {
             );
             return None;
         };
-        let (params, return_ty, hidden_context) = {
+        let (params, return_ty, hidden_context, external) = {
             let signature = self
                 .signatures
                 .get(name)
@@ -7153,9 +7253,10 @@ impl Emitter {
                 signature.params.clone(),
                 signature.return_ty,
                 signature.hidden_context,
+                signature.external,
             )
         };
-        if args.len() != params.len() {
+        if args.len() < params.len() || (args.len() > params.len() && !external) {
             self.diagnostics.push(
                 Diagnostic::error(
                     code::WRONG_ARITY,
@@ -7170,12 +7271,60 @@ impl Emitter {
             return None;
         }
         let mut arguments = Vec::new();
-        for (parameter, arg) in params.iter().zip(args) {
-            let value = self.expr(module, arg, Some(*parameter))?;
+        // The System V rule for calls through `...`: `%al` says how many of
+        // the extra arguments went into vector registers. Counting them is
+        // the callee's business; setting the register is ours.
+        let mut vector_registers = 0;
+        for (index, arg) in args.iter().enumerate() {
+            let parameter = params.get(index).copied();
+            let value = self.expr(module, arg, parameter)?;
             if value.ty == DuxType::Error {
                 return None;
             }
-            let value = self.coerce_implicit(module, value, *parameter, arg.span())?;
+            // A C function exchanges addresses: a string crosses as the
+            // address of its bytes (the count does not travel), and an
+            // address of one shape is the same word as an address of any
+            // other. An argument past the declared list gets C's default
+            // promotions: an `f32` becomes a double, and every integer is
+            // already at least an `i32` here.
+            let pointer_slot =
+                external && parameter.is_none_or(|ty| ty.is_pointer_like());
+            let value = if pointer_slot && value.ty == DuxType::Str {
+                let Some((data, _)) = self.slice_parts(value) else {
+                    self.unsupported(arg.span(), "passing this string to C");
+                    return None;
+                };
+                Typed::pointer(data, parameter.unwrap_or(DuxType::Ptr))
+            } else if external
+                && value.ty.is_pointer_like()
+                && parameter.is_some_and(|ty| {
+                    ty.is_pointer_like() || ty.llvm(self.context) == value.ty.llvm(self.context)
+                }) {
+                // The same word in two spellings: every pointer is one
+                // address, and a niche `Option<*T>` *is* its pointer.
+                Typed {
+                    core: value.core,
+                    ty: parameter.unwrap_or(value.ty),
+                }
+            } else if let Some(parameter) = parameter {
+                self.coerce_implicit(module, value, parameter, arg.span())?
+            } else if value.ty == DuxType::F32 {
+                let promoted = self
+                    .builder
+                    .build_float_ext(
+                        value.float_value()?,
+                        self.context.f64_type(),
+                        "promote",
+                    )
+                    .ok()?;
+                vector_registers += 1;
+                Typed::float(promoted, DuxType::F64)
+            } else {
+                if value.ty.is_float() {
+                    vector_registers += 1;
+                }
+                value
+            };
             match value.basic() {
                 Some(basic) => arguments.push(BasicMetadataValueEnum::from(basic)),
                 None => {
@@ -7187,6 +7336,9 @@ impl Emitter {
         if hidden_context {
             let context = self.context_value(span)?;
             arguments.push(context.into());
+        }
+        if external && args.len() > params.len() {
+            self.set_vector_registers(vector_registers.min(8));
         }
         self.invoke(function, arguments, return_ty)
     }
@@ -7468,6 +7620,23 @@ impl Emitter {
     ) -> Option<Typed> {
         let call = self.builder.build_call(function, &arguments, "call").ok()?;
         self.finish_call(call, return_ty)
+    }
+
+    /// The System V variadic rule: the call instruction carries no count of
+    /// the vector-register arguments, so `%al` must say it. An odd number
+    /// keeps the stack aligned the way the shadow space expects.
+    fn set_vector_registers(&mut self, count: u32) {
+        let fn_type = self.context.void_type().fn_type(&[], false);
+        let asm = self.context.create_inline_asm(
+            fn_type,
+            format!("mov $${count}, %al"),
+            "~{eax}".to_string(),
+            true,
+            false,
+            Some(inkwell::InlineAsmDialect::ATT),
+            false,
+        );
+        let _ = self.builder.build_indirect_call(fn_type, asm, &[], "");
     }
 
     /// A call through an address: what a `fn` value carries, and what the
@@ -8517,6 +8686,12 @@ fn spec_for(ty: DuxType) -> Option<&'static str> {
         DuxType::U8 | DuxType::U16 | DuxType::U32 => "u",
         DuxType::I64 => "ld",
         DuxType::U64 => "lu",
+        DuxType::C(kind) => match (kind.width(), kind.signed()) {
+            (64, true) => "ld",
+            (64, false) => "lu",
+            (_, true) => "d",
+            _ => "u",
+        },
         DuxType::F32 | DuxType::F64 => "g",
         DuxType::Str => ".*s",
         DuxType::Ptr | DuxType::Pointer(_) | DuxType::Fn(_) => "p",

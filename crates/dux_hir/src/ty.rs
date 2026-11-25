@@ -21,6 +21,65 @@ use dux_diag::code;
 use dux_diag::Diagnostic;
 use dux_source::Span;
 
+/// The C integer types, distinct from Dux's own (D18): `c_long` is not `i64`
+/// even where the widths agree, so an LLP64 or a 32-bit `time_t` build is a
+/// type error rather than quietly wrong bytes. The widths are the host C
+/// ABI's — LP64 here — because a hand-written declaration says what the C
+/// says, and C on this machine means LP64. A future `#[c_include]` reads
+/// widths from clang instead of assuming them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CInt {
+    Char,
+    SChar,
+    UChar,
+    Short,
+    UShort,
+    Int,
+    UInt,
+    Long,
+    ULong,
+    LongLong,
+    ULongLong,
+    Bool,
+}
+
+impl CInt {
+    pub fn spelled(self) -> &'static str {
+        match self {
+            CInt::Char => "c_char",
+            CInt::SChar => "c_schar",
+            CInt::UChar => "c_uchar",
+            CInt::Short => "c_short",
+            CInt::UShort => "c_ushort",
+            CInt::Int => "c_int",
+            CInt::UInt => "c_uint",
+            CInt::Long => "c_long",
+            CInt::ULong => "c_ulong",
+            CInt::LongLong => "c_long_long",
+            CInt::ULongLong => "c_ulong_long",
+            CInt::Bool => "c_bool",
+        }
+    }
+
+    pub fn width(self) -> u32 {
+        match self {
+            CInt::Char | CInt::SChar | CInt::UChar | CInt::Bool => 8,
+            CInt::Short | CInt::UShort => 16,
+            CInt::Int | CInt::UInt => 32,
+            CInt::Long | CInt::ULong | CInt::LongLong | CInt::ULongLong => 64,
+        }
+    }
+
+    pub fn signed(self) -> bool {
+        // `char` is signed on this target, which is what the spelling promises
+        // until an import asks clang.
+        matches!(
+            self,
+            CInt::Char | CInt::SChar | CInt::Short | CInt::Int | CInt::Long | CInt::LongLong
+        )
+    }
+}
+
 /// A type as the checker sees it. Primitives mirror the codegen lattice so
 /// the two passes can never disagree about `lossless`; `IntConst` and
 /// `FloatConst` are the untyped literals of D17, which adopt an integer or
@@ -36,6 +95,9 @@ pub enum Ty {
     U16,
     U32,
     U64,
+    /// A C integer: its own type, never interchangeable with `i8`..`i64`
+    /// without a written `as` (D18).
+    C(CInt),
     F32,
     F64,
     Str,
@@ -68,6 +130,7 @@ impl Ty {
     fn name(&self) -> String {
         match self {
             Ty::Bool => "bool".to_string(),
+            Ty::C(kind) => kind.spelled().to_string(),
             Ty::I8 => "i8".to_string(),
             Ty::I16 => "i16".to_string(),
             Ty::I32 => "i32".to_string(),
@@ -105,12 +168,15 @@ impl Ty {
     fn is_integral(&self) -> bool {
         matches!(
             self,
-            Ty::I8 | Ty::I16 | Ty::I32 | Ty::I64 | Ty::U8 | Ty::U16 | Ty::U32 | Ty::U64
+            Ty::I8 | Ty::I16 | Ty::I32 | Ty::I64 | Ty::U8 | Ty::U16 | Ty::U32 | Ty::U64 | Ty::C(_)
         )
     }
 
     fn is_signed(&self) -> bool {
-        matches!(self, Ty::I8 | Ty::I16 | Ty::I32 | Ty::I64)
+        match self {
+            Ty::C(kind) => kind.signed(),
+            _ => matches!(self, Ty::I8 | Ty::I16 | Ty::I32 | Ty::I64),
+        }
     }
 
     fn is_float(&self) -> bool {
@@ -160,6 +226,7 @@ impl Ty {
     fn width(&self) -> u32 {
         match self {
             Ty::Bool => 1,
+            Ty::C(kind) => kind.width(),
             Ty::I8 | Ty::U8 => 8,
             Ty::I16 | Ty::U16 => 16,
             Ty::I32 | Ty::U32 | Ty::F32 => 32,
@@ -199,6 +266,13 @@ impl Ty {
     /// limits exactly, so `-128: i8` is fine and `128: i8` is not.
     fn fits(&self, value: i128) -> bool {
         match self {
+            Ty::C(kind) => match kind.signed() {
+                true => {
+                    let limit = 1i128 << (kind.width() - 1);
+                    -limit <= value && value < limit
+                }
+                false => value >= 0 && value < 1i128 << kind.width(),
+            },
             Ty::Bool => value == 0 || value == 1,
             Ty::I8 => (-128..=127).contains(&value),
             Ty::I16 => (i16::MIN as i128..=i16::MAX as i128).contains(&value),
@@ -220,6 +294,11 @@ impl Ty {
             return true;
         }
         if self.is_integral() && to.is_integral() {
+            // D18: the C ladder and Dux's ladder are separate. Same width and
+            // signedness is not the same type; crossing families is written.
+            if matches!(self, Ty::C(_)) != matches!(to, Ty::C(_)) {
+                return false;
+            }
             return match (self.is_signed(), to.is_signed()) {
                 (true, true) | (false, false) => to.width() >= self.width(),
                 (false, true) => to.width() > self.width(),
@@ -418,9 +497,31 @@ fn variant_of_name(name: &str) -> &str {
     name.rsplit("::").next().unwrap_or(name)
 }
 
+/// `Option<*T>`, for any pointer: the shape a C `T *` arrives as, and the
+/// shape a C string literal adopts when the slot asks for one.
+fn option_of_pointer(ty: &Ty) -> bool {
+    matches!(ty, Ty::Enum { name, args } if name == "Option" && args.first().is_some_and(Ty::is_pointer))
+}
+
 fn primitive(name: &str) -> Option<Ty> {
     Some(match name {
         "bool" => Ty::Bool,
+        "c_char" => Ty::C(CInt::Char),
+        "c_schar" => Ty::C(CInt::SChar),
+        "c_uchar" => Ty::C(CInt::UChar),
+        "c_short" => Ty::C(CInt::Short),
+        "c_ushort" => Ty::C(CInt::UShort),
+        "c_int" => Ty::C(CInt::Int),
+        "c_uint" => Ty::C(CInt::UInt),
+        "c_long" => Ty::C(CInt::Long),
+        "c_ulong" => Ty::C(CInt::ULong),
+        "c_long_long" => Ty::C(CInt::LongLong),
+        "c_ulong_long" => Ty::C(CInt::ULongLong),
+        "c_bool" => Ty::C(CInt::Bool),
+        // C's floats map straight through (DESIGN 5.2): no distinct type and
+        // no newtype, because there is only one IEEE shape each.
+        "c_float" => Ty::F32,
+        "c_double" => Ty::F64,
         "i8" | "byte" => Ty::I8,
         "i16" => Ty::I16,
         "i32" | "int" | "rune" => Ty::I32,
@@ -462,6 +563,10 @@ struct Signature {
     /// An extern or generic function: the arguments are not checkable yet,
     /// but the call still has a result type.
     check_arguments: bool,
+    /// The declaration came from C, where a `char *` is what a string
+    /// crosses as: the argument types meet at the boundary, not in the
+    /// lattice.
+    external: bool,
 }
 
 /// A `struct` written with type parameters. Its fields are source types that
@@ -665,7 +770,10 @@ impl<'a> Checker<'a> {
         Signature {
             params,
             result,
-            check_arguments: !external && function.type_params.is_empty(),
+            // A C declaration checks the arguments it declares; only what
+            // comes past the written list — the `...` of it — goes unchecked.
+            check_arguments: function.type_params.is_empty(),
+            external,
         }
     }
 
@@ -2404,7 +2512,13 @@ impl<'a> Checker<'a> {
                 _ => Ty::IntConst(*value as i128),
             },
             Expr::Str { kind, .. } => match kind {
-                dux_ast::StrKind::CString => Ty::Ptr,
+                // A C string literal is an address the program wrote down:
+                // in a slot that names a pointer, it takes that pointer's
+                // shape, exactly as an integer literal takes a `c_int`.
+                dux_ast::StrKind::CString => match expected {
+                    Some(want) if want.is_pointer() || option_of_pointer(want) => want.clone(),
+                    _ => Ty::Ptr,
+                },
                 _ => Ty::Str,
             },
             Expr::Ident { name, span } => match self.lookup(name).map(|context| context.ty.clone()) {
@@ -2967,6 +3081,7 @@ impl<'a> Checker<'a> {
                 params,
                 result: result.clone(),
                 check_arguments: true,
+                external: false,
             },
             args,
             span,
@@ -2984,9 +3099,35 @@ impl<'a> Checker<'a> {
     }
 
     fn call_signature(&mut self, signature: &Signature, args: &[Expr], span: Span) -> Ty {
-        if signature.check_arguments && signature.params.len() == args.len() {
+        if signature.check_arguments {
+            // The zip stops at the shorter side: an arity miss is reported
+            // where the arity lives, and arguments past a C declaration's
+            // written list are the callee's to interpret.
             for (argument, param) in args.iter().zip(&signature.params) {
+                if signature.external {
+                    // A C slot adopts what literals bring to it — an integer
+                    // takes the `c_int`, a `c".."` takes the pointer shape —
+                    // and a `string` crosses to any pointer slot: that is
+                    // what the boundary converts, not the lattice.
+                    let want = if param.is_pointer()
+                        || option_of_pointer(param)
+                        || param.is_integral()
+                    {
+                        Some(param)
+                    } else {
+                        None
+                    };
+                    let got = self.typed(argument, want);
+                    if got == Ty::Str && (param.is_pointer() || option_of_pointer(param)) {
+                        continue;
+                    }
+                    self.coerce(got, param, argument.span());
+                    continue;
+                }
                 self.expect(argument, param);
+            }
+            for argument in args.iter().skip(signature.params.len()) {
+                let _ = self.infer(argument);
             }
         } else {
             for argument in args {

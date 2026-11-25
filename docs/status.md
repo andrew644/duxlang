@@ -15,7 +15,7 @@ each remaining gap is waiting for. A gap is a milestone, never a verdict.
 | `sum_types.dux` | compiles, runs; variants, payloads, guards, or-patterns, ranges and exhaustiveness all reach machine code, and the dispatch is the `switch` on the tag | — |
 | `option_result.dux` | the predeclared `Option`/`Result` lower and match today, and `std/prelude` now hands every program `unwrap_or`, `is_some` and `is_none` | `std/fs` (file reading over `extern`), `.bytes()`, `.trim()`, and `unwrap`, which stops the program (the panic runtime) |
 | `generics.dux` | compiles, runs — `max<i32>`, `Pair<i32, string>`, `Either<string, i32>` matched, `zeros<4>()`, `sum(&[1, 2, 3])`, and `HashMap<string, i32>` with `insert`, `get(..).unwrap_or(..)` and `len`, the table and the method being prelude Dux | — |
-| `c_interop.dux` | parses | libclang importer (M6) |
+| `c_interop.dux` | the hand-written half runs today — `extern "C"` with distinct `c_long` and `c_int`, `#[c_name]` symbol overrides, varargs called directly, `std/c` turning C text back into a `string` | the `#[c_include]` importer, `std/c.to_cstr`, `c_long_double` (M6) |
 
 ## Deliberate runtime gaps today
 
@@ -66,6 +66,20 @@ each remaining gap is waiting for. A gap is a milestone, never a verdict.
   borrows that; `"dux".len()` and `"dux".bytes()` do the same to a view that
   would otherwise live in registers. The temporary lives as long as the block
   that made it, which is where the value would have lived anyway.
+- **The C ladder is its own rung (D18).** `c_int`..`c_ulong_long` and `c_bool`
+  are distinct from Dux's integers: an untyped literal adopts them, `as`
+  crosses to them and from them, and nothing else crosses for free — an
+  `i32` is not a `c_int` where the widths agree, because an LLP64 build must
+  not typecheck like an LP64 one. `c_float` and `c_double` are spelled
+  straight to `f32` and `f64`. A C declaration checks the arguments it wrote
+  down and lets the ones past them pass unchecked, setting `%al` the System V
+  way for the `...`; a `string` and a `c".."` cross into pointer slots at the
+  boundary and nowhere else; and a niche `Option<*T>` *is* its pointer, so a
+  C `T *` arrives as "maybe nothing" with no wrapping tax.
+  `#[c_name("symbol")]` fixes a link name in place, two declarations of one
+  symbol share one function, and `std/c` turns C text into a `string` with
+  `to_string` and `to_string_lossy`. The importer (`#[c_include]`), the
+  owned-copy `to_cstr`, and `c_long_double` are still M6 ahead.
 - **A library is named by the declaration that needs it.** `#[link(name = "m")]
   extern "C" { fn sqrtf(x: f32) -> f32 }` is how `std/math` says where its
   symbol lives, and the link line carries `-l m` because of it. A name a C

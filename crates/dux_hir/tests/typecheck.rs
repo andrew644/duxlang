@@ -1247,3 +1247,107 @@ fn hash_answers_an_integer_and_nothing_else_adopts_it_for_free() {
         vec![dux_diag::code::LOSSY_CONVERSION]
     );
 }
+
+#[test]
+fn c_integers_are_their_own_types() {
+    let source = "package main
+extern \"C\" {
+    fn take(n: c_int) -> c_int
+}
+fn main() {
+    w: c_long = 40000
+    plain: i32 = 1
+    take(plain)
+    big: i64 = w as i64
+    back: c_ulong = big as c_ulong
+}";
+    let found = codes(source);
+    assert!(
+        found.contains(&dux_diag::code::LOSSY_CONVERSION),
+        "an `i32` is not a `c_int` for free, even where widths agree (D18): {found:?}"
+    );
+}
+
+#[test]
+fn untyped_literals_adopt_the_c_type_the_declaration_names() {
+    let adopting = "package main
+extern \"C\" {
+    fn take(n: c_int) -> c_int
+    fn byte(b: c_uchar) -> c_uchar
+}
+fn main() {
+    take(7)
+    byte(255)
+}";
+    assert!(codes(adopting).is_empty(), "in-range literals fit: {:?}", codes(adopting));
+
+    let beyond = "package main
+extern \"C\" {
+    fn byte(b: c_uchar) -> c_uchar
+}
+fn main() { byte(256) }";
+    assert!(
+        codes(beyond).contains(&dux_diag::code::LITERAL_OUT_OF_RANGE),
+        "256 does not reach a `c_uchar`"
+    );
+}
+
+#[test]
+fn c_text_literals_take_the_pointer_shape_the_slot_asks_for() {
+    let source = "package main
+extern \"C\" {
+    fn open(path: *c_char) -> c_int
+    fn time(what: Option<*c_long>) -> c_long
+}
+fn main() {
+    open(c\"slot.bin\")
+    time(None)
+    time(c\"not a pointer slot\")
+}";
+    let found = codes(source);
+    assert!(
+        !found.contains(&dux_diag::code::LOSSY_CONVERSION)
+            && !found.contains(&dux_diag::code::TYPE_MISMATCH),
+        "`c\"..\"` is an address the program wrote down: {found:?}"
+    );
+}
+
+#[test]
+fn strings_cross_to_c_pointers_but_not_to_dux_ones() {
+    let to_c = "package main
+extern \"C\" {
+    fn strlen(s: *c_char) -> usize
+}
+fn main() { text := \"dux\"; strlen(text) }";
+    assert!(codes(to_c).is_empty(), "a `string` crosses as its bytes: {:?}", codes(to_c));
+
+    let to_dux = "package main
+fn takes(p: *c_char) { }
+fn main() { text := \"dux\"; takes(text) }";
+    assert!(
+        codes(to_dux).contains(&dux_diag::code::TYPE_MISMATCH),
+        "away from the boundary a `string` is not a pointer"
+    );
+}
+
+#[test]
+fn arguments_past_a_c_declaration_are_the_callees_to_interpret() {
+    let source = "package main
+extern \"C\" {
+    fn printf(fmt: *c_char) -> c_int
+}
+fn main() {
+    printf(c\"%d %s\", 42, \"word\")
+    printf(42)
+}";
+    let found = codes(source);
+    assert!(
+        !found.contains(&dux_diag::code::WRONG_ARITY),
+        "the written list is a floor, not a ceiling: {found:?}"
+    );
+    assert!(
+        found.contains(&dux_diag::code::LOSSY_CONVERSION)
+            || found.contains(&dux_diag::code::TYPE_MISMATCH),
+        "a fixed slot still checks: {found:?}"
+    );
+}

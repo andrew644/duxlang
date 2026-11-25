@@ -1,0 +1,17 @@
+// `std/c`. The two directions a C string crosses the boundary, written in
+// Dux. C says "no string" with NULL, and the import convention spells that
+// `Option<*c_char>`: the address is a word in both languages, and the null
+// one is the variant that carries nothing. `p as string` measures through
+// the bytes to the terminator, which is all the length Dux undertakes to
+// know about memory it does not own (DESIGN 5.2).
+
+fn to_string(text: Option<*c_char>) -> Option<string> {
+    match text {
+        Some(address) => return Some(address as string),
+        None => return None,
+    }
+}
+
+fn to_string_lossy(text: Option<*c_char>) -> string {
+    return to_string(text).unwrap_or("")
+}
