@@ -1,10 +1,10 @@
 use dux_ast::{AttributeArgument, Decl, Ident, Import, ModuleDecl, Program};
 use dux_codegen::{CompiledModule, OptLevel, Options};
 use dux_diag::{code, render, Diagnostic, Severity};
-use std::collections::HashSet;
-use std::path::{Path, PathBuf};
 use dux_parser::parse;
 use dux_source::FileId;
+use std::collections::HashSet;
+use std::path::{Path, PathBuf};
 
 pub use dux_codegen::OptLevel as Optimization;
 pub use dux_source::SourceMap;
@@ -17,6 +17,19 @@ pub struct Analyzed {
     pub file: FileId,
     pub program: Program,
     pub diagnostics: Vec<Diagnostic>,
+    /// The C translation units the program asked for, ready to compile.
+    pub c_units: Vec<CUnit>,
+}
+
+/// One `#[c_include]` namespace's translation unit: the source (include
+/// plus the wrappers that give `static inline` definitions a name), and
+/// everything the compiler needs to make bitcode of it.
+#[derive(Clone, Debug)]
+pub struct CUnit {
+    pub header: String,
+    pub source: String,
+    pub flags: Vec<String>,
+    pub include_paths: Vec<String>,
 }
 
 impl Analyzed {
@@ -82,7 +95,7 @@ pub fn analyze(path: &std::path::Path) -> Result<Analyzed, Failure> {
     // header is read here, once, and the namespace fills with the Dux
     // declarations the mapping table writes. From this point the importer's
     // output travels the same road as any other module body, because it is.
-    fill_c_modules(path, &mut sources, &mut program, &mut diagnostics);
+    let c_units = fill_c_modules(path, &mut sources, &mut program, &mut diagnostics);
     let syntax_clean = diagnostics
         .iter()
         .all(|d| d.severity != Severity::Error || d.code == code::UNSUPPORTED_IN_BUILD);
@@ -102,6 +115,7 @@ pub fn analyze(path: &std::path::Path) -> Result<Analyzed, Failure> {
         file,
         program,
         diagnostics,
+        c_units,
     })
 }
 
@@ -192,7 +206,10 @@ fn load_imports(
             let diagnostic = if import.path.starts_with("std/") {
                 Diagnostic::error(
                     code::UNSUPPORTED_IN_BUILD,
-                    format!("the standard library does not ship `{}` in this build yet", import.path),
+                    format!(
+                        "the standard library does not ship `{}` in this build yet",
+                        import.path
+                    ),
                 )
             } else {
                 Diagnostic::error(code::UNDECLARED, missing)
@@ -308,23 +325,23 @@ fn compile(request: &BuildRequest) -> Result<(Analyzed, CompiledModule, BuiltArt
             diagnostics: analyzed.diagnostics,
         });
     }
+    let bitcode = build_c_bitcode(&analyzed.c_units, &request.out_dir)?;
     let options = Options {
         debug_allocator: request.opt_level == dux_codegen::OptLevel::None,
         opt_level: request.opt_level,
+        bitcode,
     };
-    let module = match CompiledModule::build_with_line_tables(
-        &analyzed.program,
-        options,
-        &analyzed.sources,
-    ) {
-        Ok(module) => module,
-        Err(diagnostics) => {
-            return Err(Failure {
-                sources: analyzed.sources,
-                diagnostics,
-            })
-        }
-    };
+    let module =
+        match CompiledModule::build_with_line_tables(&analyzed.program, options, &analyzed.sources)
+        {
+            Ok(module) => module,
+            Err(diagnostics) => {
+                return Err(Failure {
+                    sources: analyzed.sources,
+                    diagnostics,
+                })
+            }
+        };
     std::fs::create_dir_all(&request.out_dir).map_err(|e| {
         Failure::bare(vec![Diagnostic::error(
             code::SOURCE_IO,
@@ -401,9 +418,11 @@ fn emit_ast(
             format!("cannot create {}: {e}", request.out_dir.display()),
         )])
     })?;
-    let path = out_override
-        .map(|p| p.to_path_buf())
-        .unwrap_or_else(|| request.out_dir.join(format!("{}.ast", output_stem(request.source))));
+    let path = out_override.map(|p| p.to_path_buf()).unwrap_or_else(|| {
+        request
+            .out_dir
+            .join(format!("{}.ast", output_stem(request.source)))
+    });
     write_file(&path, dux_ast::dump::dump(&analyzed.program).as_bytes())?;
     Ok(BuiltArtifact {
         object: path.clone(),
@@ -436,6 +455,105 @@ pub fn run(
     Ok(output.status.code().unwrap_or(-1))
 }
 
+/// Compile every C translation unit to bitcode, or point at the cached
+/// one. The cache key is the content of everything that feeds clang —
+/// the generated source, the flags, the include paths, the header file
+/// itself and the compiler's version line — so an edit to a header, a new
+/// `-D` or a toolchain upgrade each miss the cache exactly once.
+fn build_c_bitcode(units: &[CUnit], out_dir: &Path) -> Result<Vec<PathBuf>, Failure> {
+    if units.is_empty() {
+        return Ok(Vec::new());
+    }
+    let compiler = std::env::var("DUX_CC").unwrap_or_else(|_| "clang".to_string());
+    let version = cc_version(&compiler)?;
+    let cache = out_dir.join("cimport");
+    std::fs::create_dir_all(&cache).map_err(|e| {
+        Failure::bare(vec![Diagnostic::error(
+            code::SOURCE_IO,
+            format!("cannot create {}: {e}", cache.display()),
+        )])
+    })?;
+    let mut paths = Vec::new();
+    for unit in units {
+        let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+        let mut mix = |bytes: &[u8]| {
+            for byte in bytes {
+                hash ^= *byte as u64;
+                hash = hash.wrapping_mul(0x100_0000_01b3);
+            }
+        };
+        mix(unit.source.as_bytes());
+        mix(version.as_bytes());
+        mix(unit.header.as_bytes());
+        for part in unit.flags.iter().chain(unit.include_paths.iter()) {
+            mix(part.as_bytes());
+        }
+        // The header the source names, if it is a file on disk: an edit to
+        // a project header misses the cache; a system header is the
+        // toolchain's own business (and its version is in the hash).
+        for dir in &unit.include_paths {
+            let file = PathBuf::from(dir).join(&unit.header);
+            if let Ok(text) = std::fs::read(&file) {
+                mix(&text);
+                break;
+            }
+        }
+        let bitcode = cache.join(format!("{hash:016x}.bc"));
+        if bitcode.is_file() {
+            paths.push(bitcode);
+            continue;
+        }
+        let source_path = cache.join(format!("{hash:016x}.c"));
+        std::fs::write(&source_path, &unit.source).map_err(|e| io_failure(&source_path, e))?;
+        let output = std::process::Command::new(&compiler)
+            .arg("-c")
+            .arg("-emit-llvm")
+            .arg("-w")
+            .args(&unit.flags)
+            .args(unit.include_paths.iter().map(|dir| format!("-I{dir}")))
+            .arg("-o")
+            .arg(&bitcode)
+            .arg(&source_path)
+            .stderr(std::process::Stdio::piped())
+            .output()
+            .map_err(|e| {
+                Failure::bare(vec![Diagnostic::error(
+                    code::LINK_FAILED,
+                    format!("cannot run `{compiler}` for `{}`: {e}", unit.header),
+                )])
+            })?;
+        if !output.status.success() {
+            return Err(Failure::bare(vec![Diagnostic::error(
+                code::LINK_FAILED,
+                format!(
+                    "`{compiler}` could not compile `{}`: {}",
+                    unit.header,
+                    String::from_utf8_lossy(&output.stderr).trim()
+                ),
+            )]));
+        }
+        paths.push(bitcode);
+    }
+    Ok(paths)
+}
+
+fn cc_version(compiler: &str) -> Result<String, Failure> {
+    let output = std::process::Command::new(compiler)
+        .arg("--version")
+        .output()
+        .map_err(|e| {
+            Failure::bare(vec![Diagnostic::error(
+                code::LINK_FAILED,
+                format!("cannot run `{compiler}`: {e}"),
+            )])
+        })?;
+    Ok(String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .next()
+        .unwrap_or_default()
+        .to_string())
+}
+
 fn write_file(path: &std::path::Path, bytes: &[u8]) -> Result<(), Failure> {
     std::fs::write(path, bytes).map_err(|e| io_failure(path, e))
 }
@@ -464,14 +582,15 @@ fn link(artifact: &BuiltArtifact, libraries: &[String]) -> Result<(), Failure> {
     for library in libraries {
         command.arg(format!("-l{library}"));
     }
-    let status = command
-        .status()
-        .map_err(|e| {
-            Failure::bare(vec![
-                Diagnostic::error(code::LINK_FAILED, format!("cannot run the linker `{linker}`: {e}"))
-                    .with_note("set DUX_LINKER to pick a linker; DESIGN.md 6.3 expects clang"),
-            ])
-        })?;
+    let status = command.status().map_err(|e| {
+        Failure::bare(vec![Diagnostic::error(
+            code::LINK_FAILED,
+            format!("cannot run the linker `{linker}`: {e}"),
+        )
+        .with_note(
+            "set DUX_LINKER to pick a linker; DESIGN.md 6.3 expects clang",
+        )])
+    })?;
     if !status.success() {
         return Err(Failure::bare(vec![Diagnostic::error(
             code::LINK_FAILED,
@@ -518,11 +637,12 @@ fn fill_c_modules(
     sources: &mut SourceMap,
     program: &mut Program,
     diagnostics: &mut Vec<Diagnostic>,
-) {
+) -> Vec<CUnit> {
     let home = entry
         .parent()
         .map(|dir| dir.to_path_buf())
         .unwrap_or_else(|| PathBuf::from("."));
+    let mut units: Vec<CUnit> = Vec::new();
     for decl in &mut program.decls {
         let Decl::Module(module) = decl else {
             continue;
@@ -563,11 +683,12 @@ fn fill_c_modules(
                 Err(diagnostic) => diagnostics.push(diagnostic),
             }
         }
-        match dux_cinterop::import(&dux_cinterop::Import {
+        let request = dux_cinterop::Import {
             header: header.clone(),
             flags,
             include_paths,
-        }) {
+        };
+        match dux_cinterop::import(&request) {
             Ok(declarations) => {
                 let text = dux_cinterop::spell(&declarations);
                 let id = sources.add(format!("<c_import {header}>"), text);
@@ -576,10 +697,17 @@ fn fill_c_modules(
                 let parsed = parse(sources, &lexed.tokens);
                 diagnostics.extend(parsed.diagnostics);
                 module.decls = parsed.program.decls;
+                units.push(CUnit {
+                    source: dux_cinterop::c_source(&header, &declarations),
+                    header: request.header,
+                    flags: request.flags,
+                    include_paths: request.include_paths,
+                });
             }
             Err(failure) => diagnostics.extend(failure),
         }
     }
+    units
 }
 
 /// The libraries the program's `extern` blocks asked for, in the order they

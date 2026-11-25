@@ -12,9 +12,11 @@
 //! knowing libclang exists.
 
 mod spell;
+mod unit;
 mod walk;
 
 pub use spell::spell;
+pub use unit::{c_source, wrapper_name};
 pub use walk::import;
 
 /// A C type, as clang saw it. `Typedef` keeps the name the program will use

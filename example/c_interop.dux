@@ -50,8 +50,8 @@ fn main() {
     match f {
         Some(h) => {
             cs.fprintf(h, c"saved at {} seconds\n", secs)     // varargs, callable directly
-            cs.fclose(h)
-            ()
+            closed := cs.fclose(h)
+            println($"slot saved, close said {}", closed)
         }
         None => println("could not open slot.txt"),
     }

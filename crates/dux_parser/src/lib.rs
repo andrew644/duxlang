@@ -1442,6 +1442,13 @@ impl<'a> Parser<'a> {
     fn postfix(&mut self, mut expr: Expr) -> Expr {
         loop {
             let token = self.peek().clone();
+            // A newline ends a statement (DESIGN 3.4), and a postfix tail
+            // never walks back across one: the `(` opening the next
+            // statement's expression is not this call's second argument
+            // list, and `[` is not an index.
+            if token.newline_before {
+                break expr;
+            }
             match token.kind {
                 TokenKind::Punct(Punct::LParen) => {
                     self.bump();
@@ -2773,6 +2780,22 @@ mod tests {
             assert!(diagnostics.is_empty(), "{source}: {diagnostics:?}");
             assert_eq!(program.find_function("f").unwrap().body.stmts.len(), 2);
         }
+    }
+
+    #[test]
+    fn a_line_beginning_parenthesis_never_continues_a_call() {
+        let (program, diagnostics) = parse_text("fn f() { close(h)\n(g)\n}");
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        let function = program.find_function("f").unwrap();
+        assert_eq!(function.body.stmts.len(), 2);
+        let Stmt::Expr { expr, .. } = &function.body.stmts[0] else {
+            panic!("expected expression statements");
+        };
+        let Expr::Call { callee, args, .. } = expr else {
+            panic!("`close(h)` is one call");
+        };
+        assert!(matches!(callee.as_ref(), Expr::Ident { .. }));
+        assert_eq!(args.len(), 1);
     }
 
     #[test]

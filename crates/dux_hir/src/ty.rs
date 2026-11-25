@@ -316,9 +316,13 @@ impl Ty {
         }
         // A pointer fits into its own `Option` through the null niche: every
         // address stays an address, and NULL newly means "nothing". That is
-        // the whole reason `Option<*T>` is the C pointer shape.
-        if *self == Ty::Ptr && option_of_pointer(to) {
-            return true;
+        // the whole reason `Option<*T>` is the C pointer shape — and C says
+        // `T *`, which is `Option<*T>` to the last letter.
+        if self.is_pointer() && option_of_pointer(to) {
+            if let Ty::Enum { args, .. } = to {
+                let inner = args.first();
+                return inner.is_some_and(|inner| self == inner);
+            }
         }
         // An array is a slice that knows its own length, so borrowing its
         // elements as a view loses nothing.

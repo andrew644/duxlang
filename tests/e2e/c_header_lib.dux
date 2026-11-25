@@ -1,0 +1,14 @@
+package main
+//@stderr_empty
+// The compiled translation unit: `static inline` definitions and the
+// state behind them arrive with the program, not with a library someone
+// has to remember to link. The header *is* the library.
+
+#[c_include("cedge.h")]
+mod edge;
+
+fn main() {
+    println($"service={}", edge.cedge_service(2))
+    println($"first={}", edge.cedge_visit())
+    println($"second={}", edge.cedge_visit())
+}

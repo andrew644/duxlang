@@ -1,0 +1,27 @@
+package main
+//@stderr_empty
+// The header *is* the library. stb_image's implementation — selected with
+// the same `#define` a C build would use — compiles into this program's
+// module as bitcode, no archive to link and nothing to install beyond the
+// header. A 73-byte PNG lives in a fixed array; the decoded pixels come
+// back through the same pointer door the C documentation describes.
+
+#[c_include("stb_image.h")]
+#[c_flag("-DSTB_IMAGE_IMPLEMENTATION")]
+#[c_link("m")]
+mod stb;
+
+fn main() {
+    png: [u8; 73] = [137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13, 73, 72, 68, 82, 0, 0, 0, 2, 0, 0, 0, 2, 8, 2, 0, 0, 0, 253, 212, 154, 115, 0, 0, 0, 16, 73, 68, 65, 84, 120, 218, 99, 224, 18, 145, 3, 34, 6, 8, 5, 0, 6, 78, 0, 241, 208, 98, 157, 14, 0, 0, 0, 0, 73, 69, 78, 68, 174, 66, 96, 130]
+    w: c_int = 0
+    h: c_int = 0
+    found: c_int = 0
+    img := stb.stbi_load_from_memory((&png[0]) as *c_uchar, png.len() as c_int, &w, &h, &found, 4)
+    match img {
+        Some(pixels) => {
+            println($"{}x{} channels={} pixel={} {} {} {}", w, h, found, *pixels, *(pixels + 1), *(pixels + 2), *(pixels + 3))
+            stb.stbi_image_free(pixels as rawptr)
+        }
+        None => println("stb could not decode")
+    }
+}

@@ -87,10 +87,14 @@ fn release_runs_the_new_pass_manager_without_losing_the_program() {
         .expect("debug builds")
         .ir_text();
     let release =
-        CompiledModule::build(&parsed.program, Options {
-        opt_level: OptLevel::Balanced,
-        debug_allocator: true,
-    })
+        CompiledModule::build(
+            &parsed.program,
+            Options {
+                opt_level: OptLevel::Balanced,
+                debug_allocator: true,
+                ..Options::default()
+            },
+        )
             .expect("release builds")
             .ir_text();
     assert!(debug.contains("@fwrite") && release.contains("@fwrite"));
@@ -275,6 +279,19 @@ fn an_extern_inside_a_module_is_called_by_module_and_links_by_symbol() {
     assert!(
         !ir.contains("c.strlen"),
         "the module path must not leak into the symbol:\n{ir}"
+    );
+}
+
+#[test]
+fn an_alias_in_a_module_signature_reads_as_the_type_it_names() {
+    let ir = build(
+        "package main\nmod c {\n    type byte = c_uchar\n    extern \"C\" {\n        fn give() -> Option<*byte>\n    }\n}\nfn main() {\n    p := c.give()\n    match p {\n        Some(q) => {\n            n := *q\n            println($\"{}\", n)\n        }\n    }\n}",
+    )
+    .expect("builds")
+    .ir_text();
+    assert!(
+        ir.contains("load i8"),
+        "the aliased pointee keeps its type through the boundary:\n{ir}"
     );
 }
 
@@ -1081,6 +1098,7 @@ fn a_release_build_drops_the_debug_bookkeeping() {
         Options {
             opt_level: OptLevel::Balanced,
             debug_allocator: false,
+            ..Options::default()
         },
     )
     .expect("builds")

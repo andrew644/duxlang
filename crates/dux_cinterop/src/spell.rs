@@ -3,7 +3,7 @@
 //! road as any other module body, so the importer's output is exactly the
 //! declarations a program could have written by hand — because they are.
 
-use crate::{CDecl, CEnum, CFunction, CStruct, CType, CTypedef, MacroValue};
+use crate::{wrapper_name, CDecl, CEnum, CFunction, CStruct, CType, CTypedef, MacroValue};
 
 /// Spell a namespace's worth of C declarations as Dux. A declaration the
 /// table cannot cross today is left out, silently for now and loudly for
@@ -28,12 +28,7 @@ pub fn spell(decls: &[CDecl]) -> String {
             }
             CDecl::Typedef(definition) => {
                 if let Some(text) = spell_typedef(&ctx, definition) {
-                    keep(
-                        &mut emitted,
-                        &mut types,
-                        safe(&definition.name),
-                        text,
-                    );
+                    keep(&mut emitted, &mut types, safe(&definition.name), text);
                 }
             }
             CDecl::Enum(enumeration) => {
@@ -64,11 +59,23 @@ pub fn spell(decls: &[CDecl]) -> String {
     if !externals.is_empty() {
         out.push_str("extern \"C\" {\n");
         for function in externals {
-            if let Some(text) = spell_function(&ctx, function) {
-                out.push_str("    ");
-                out.push_str(&text);
-                out.push('\n');
-            }
+            let Some(text) = spell_function(&ctx, function) else {
+                continue;
+            };
+            // A `static inline` definition is called through the wrapper
+            // the compiled translation unit hands it: the symbol a Dux
+            // declaration binds to is the doorway, not the private name.
+            let text = if function.header_definition {
+                match wrapper_name(function) {
+                    Some(wrapper) => format!("#[c_name(\"{wrapper}\")] {text}"),
+                    None => continue,
+                }
+            } else {
+                text
+            };
+            out.push_str("    ");
+            out.push_str(&text);
+            out.push('\n');
         }
         out.push_str("}\n\n");
     }
@@ -201,14 +208,68 @@ fn is_plain_name(name: &str) -> bool {
         && !name.starts_with(|c: char| c.is_ascii_digit())
 }
 
+fn record_crosses(
+    name: &str,
+    bodies: &std::collections::HashMap<&str, &CStruct>,
+    underlying: &std::collections::HashMap<&str, &CType>,
+    decided: &mut std::collections::HashMap<String, bool>,
+    trail: &mut Vec<String>,
+) -> bool {
+    if let Some(known) = decided.get(name) {
+        return *known;
+    }
+    if trail.iter().any(|seen| seen == name) {
+        return false;
+    }
+    trail.push(name.to_string());
+    let yes = match bodies.get(name) {
+        None => false,
+        Some(record) => {
+            record.size.is_some()
+                && record.fields.iter().all(|field| {
+                    field.bits.is_none()
+                        && field_crosses(&field.ty, bodies, underlying, decided, trail)
+                })
+        }
+    };
+    trail.pop();
+    decided.insert(name.to_string(), yes);
+    yes
+}
+
+fn field_crosses(
+    ty: &CType,
+    bodies: &std::collections::HashMap<&str, &CStruct>,
+    underlying: &std::collections::HashMap<&str, &CType>,
+    decided: &mut std::collections::HashMap<String, bool>,
+    trail: &mut Vec<String>,
+) -> bool {
+    match ty {
+        // A pointer needs no shape from what it points at, unless what it
+        // points at is a function: no Dux type names one yet, so no field
+        // may hold one.
+        CType::FuncPtr { .. } => false,
+        CType::Pointer(target) => !matches!(resolve(target), CType::FuncPtr { .. }),
+        CType::Array(element, _) => field_crosses(element, bodies, underlying, decided, trail),
+        CType::Struct(name) | CType::Union(name) => {
+            bodies.contains_key(name.as_str())
+                && record_crosses(name, bodies, underlying, decided, trail)
+        }
+        CType::Typedef(_, target) => field_crosses(target, bodies, underlying, decided, trail),
+        CType::Opaque(_) | CType::Void | CType::LongDouble => false,
+        _ => true,
+    }
+}
+
 fn spell_struct(ctx: &Ctx, record: &CStruct) -> Option<String> {
     if record.union || !is_plain_name(&record.name) {
         return None;
     }
     // An opaque forward declaration gets an empty body. It exists only
     // behind a pointer; Dux needs the name to exist so `*FILE` can mean
-    // something, and nobody may ask the body for its size.
-    if record.size.is_none() {
+    // something, and nobody may ask the body for its size. A record whose
+    // fields cannot cross is given the same body for the same reason.
+    if record.size.is_none() || ctx.opaque.contains(&record.name) {
         return Some(format!("struct {} {{}}", record.name));
     }
     let mut body = String::new();
@@ -262,18 +323,19 @@ fn spell_macro(macro_value: &crate::CMacro) -> Option<String> {
             } else {
                 return None;
             };
-            Some(format!("const {}: {int} = {value}", safe(&macro_value.name)))
+            Some(format!(
+                "const {}: {int} = {value}",
+                safe(&macro_value.name)
+            ))
         }
         MacroValue::Float(value) => {
             Some(format!("const {}: f64 = {value}", safe(&macro_value.name)))
         }
-        MacroValue::Text(text) => {
-            Some(format!(
-                "const {}: string = \"{}\"",
-                safe(&macro_value.name),
-                text
-            ))
-        }
+        MacroValue::Text(text) => Some(format!(
+            "const {}: string = \"{}\"",
+            safe(&macro_value.name),
+            text
+        )),
     }
 }
 
@@ -286,6 +348,11 @@ struct Ctx {
     enums: Vec<CEnum>,
     records: std::collections::HashSet<String>,
     typedefs: std::collections::HashSet<String>,
+    /// Records a body cannot be written for: one of their fields holds a
+    /// union, an anonymous record, or another record with the same trouble.
+    /// They cross by name with an empty body, the promise `FILE` makes:
+    /// pointers travel, shapes do not.
+    opaque: std::collections::HashSet<String>,
 }
 
 impl Ctx {
@@ -294,13 +361,12 @@ impl Ctx {
             enums: Vec::new(),
             records: std::collections::HashSet::new(),
             typedefs: std::collections::HashSet::new(),
+            opaque: std::collections::HashSet::new(),
         };
         for decl in decls {
             match decl {
                 CDecl::Enum(enumeration) => ctx.enums.push(enumeration.clone()),
-                CDecl::Struct(record)
-                    if !record.union && is_plain_name(&record.name) =>
-                {
+                CDecl::Struct(record) if !record.union && is_plain_name(&record.name) => {
                     ctx.records.insert(record.name.clone());
                 }
                 _ => {}
@@ -308,15 +374,32 @@ impl Ctx {
         }
         for decl in decls {
             if let CDecl::Typedef(definition) = decl {
-                if is_plain_name(&definition.name)
-                    && !is_exact_width(&definition.name)
-                    && {
-                        let base = resolve(&definition.underlying);
-                        is_primitive(base) || ctx.has_record(base)
-                    }
-                {
+                if is_plain_name(&definition.name) && !is_exact_width(&definition.name) && {
+                    let base = resolve(&definition.underlying);
+                    is_primitive(base) || ctx.has_record(base)
+                } {
                     ctx.typedefs.insert(definition.name.clone());
                 }
+            }
+        }
+        let mut bodies = std::collections::HashMap::new();
+        let mut underlying = std::collections::HashMap::new();
+        for decl in decls {
+            match decl {
+                CDecl::Struct(record) if !record.union => {
+                    bodies.insert(record.name.as_str(), record);
+                }
+                CDecl::Typedef(definition) => {
+                    underlying.insert(definition.name.as_str(), &definition.underlying);
+                }
+                _ => {}
+            }
+        }
+        for name in ctx.records.iter() {
+            let mut decided = std::collections::HashMap::new();
+            let mut trail = Vec::new();
+            if !record_crosses(name, &bodies, &underlying, &mut decided, &mut trail) {
+                ctx.opaque.insert(name.clone());
             }
         }
         ctx

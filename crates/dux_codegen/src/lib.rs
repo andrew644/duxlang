@@ -38,12 +38,17 @@ impl OptLevel {
     }
 }
 
-#[derive(Copy, Clone, Debug)]
+#[derive(Clone, Debug)]
 pub struct Options {
     pub opt_level: OptLevel,
     /// Head every allocation with bookkeeping so a double free is trapped and
     /// unreleased memory is reported at exit. Off in a release build.
     pub debug_allocator: bool,
+    /// Compiled C translation units, as LLVM bitcode, linked into the module
+    /// before lowering begins. The `#[c_include]` road delivers definitions
+    /// this way: what clang compiled is part of the program, not something
+    /// the linker has to go find.
+    pub bitcode: Vec<std::path::PathBuf>,
 }
 
 impl Default for Options {
@@ -51,6 +56,7 @@ impl Default for Options {
         Self {
             opt_level: OptLevel::None,
             debug_allocator: true,
+            bitcode: Vec::new(),
         }
     }
 }
@@ -105,6 +111,24 @@ impl CompiledModule {
         let machine = target_machine(options.opt_level)?;
         module.set_triple(&machine.get_triple());
         module.set_data_layout(&machine.get_target_data().get_data_layout());
+
+        // C's definitions arrive before Dux's: a header-only library lives
+        // in the module itself, and the extern declarations the lowering
+        // writes find the definitions already waiting for them.
+        for path in &options.bitcode {
+            let bitcode = Module::parse_bitcode_from_path(path, context).map_err(|e| {
+                vec![Diagnostic::error(
+                    code::CODEGEN_FAILED,
+                    format!("`{}` is not readable bitcode: {e}", path.display()),
+                )]
+            })?;
+            module.link_in_module(bitcode).map_err(|e| {
+                vec![Diagnostic::error(
+                    code::CODEGEN_FAILED,
+                    format!("cannot link `{}`: {e}", path.display()),
+                )]
+            })?;
+        }
 
         select_main(program)?;
         let mut emitter = Emitter::new(context, sources.clone());

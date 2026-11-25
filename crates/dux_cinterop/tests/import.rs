@@ -141,7 +141,10 @@ fn the_mapping_table_crosses_what_it_promises() {
     );
     assert!(text.contains("type time_like = c_long"), "{text}");
     assert!(text.contains("struct point {"), "{text}");
-    assert!(!text.contains("struct bits"), "bitfields wait:\n{text}");
+    assert!(
+        text.contains("struct bits {}"),
+        "a record with a bitfield crosses by name and keeps its body to itself:\n{text}"
+    );
     assert!(!text.contains("union score"), "unions wait:\n{text}");
     assert!(
         text.contains("struct hidden {}"),
@@ -154,6 +157,25 @@ fn the_mapping_table_crosses_what_it_promises() {
     assert!(
         !text.contains("dux_counter"),
         "extern variables wait:\n{text}"
+    );
+}
+
+#[test]
+fn static_inline_reaches_the_module_through_a_wrapper() {
+    let decls = mini();
+    let text = spell(&decls);
+    assert!(
+        text.contains("#[c_name(\"__duxw_dux_twice\")] fn dux_twice(x: c_int) -> c_int"),
+        "the declaration binds to the doorway, not the private name:\n{text}"
+    );
+    let source = dux_cinterop::c_source("mini.h", &decls);
+    assert!(
+        source.contains("int __duxw_dux_twice(int __p0) { return (dux_twice)(__p0); }"),
+        "the wrapper is what clang compiles:\n{source}"
+    );
+    assert!(
+        !source.contains("__duxw_dux_add"),
+        "a function with a library behind it needs no doorway:\n{source}"
     );
 }
 

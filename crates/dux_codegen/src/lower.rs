@@ -789,6 +789,11 @@ pub(crate) struct Emitter {
     /// Where each `extern` function was written: a module's `sqrt` is called
     /// as `ns.sqrt` and links as `sqrt`.
     extern_home: HashMap<String, String>,
+    /// Every `type` alias the program wrote, under its written name and the
+    /// module-qualified one: `stbi_uc` and `stb.stbi_uc` stand for the same
+    /// C typedef, and the signature text may say either.
+    aliases: HashMap<String, &'static dux_ast::Type>,
+    alias_depth: usize,
     /// Generic `fn` declarations, by name: the code each instantiation copies.
     generic_fns: HashMap<String, &'static FnDecl>,
     /// Methods of a generic `impl`, by `Pair.first`: the code each receiver
@@ -894,6 +899,8 @@ impl Emitter {
             home: String::new(),
             home_of: HashMap::new(),
             extern_home: HashMap::new(),
+            aliases: HashMap::new(),
+            alias_depth: 0,
             generic_methods: HashMap::new(),
             impl_params: HashMap::new(),
             generic_structs: HashMap::new(),
@@ -1058,7 +1065,12 @@ impl Emitter {
                             .get(&function.name.name)
                             .cloned()
                             .unwrap_or_default();
+                        // The signature is read in the module the block was
+                        // written in: `Option<*stbi_uc>` means the alias the
+                        // namespace holds, not a name from out here.
+                        self.home = home.clone();
                         self.declare(module, &Unit::imported(function, &home));
+                        self.home = String::new();
                     }
                 }
                 _ => {}
@@ -1125,6 +1137,15 @@ impl Emitter {
                 continue;
             }
             self.remember_home(&entry.home, entry.decl);
+            if let Decl::TypeAlias(alias) = entry.decl {
+                if alias.type_params.is_empty() {
+                    let stood = Box::leak(Box::new(alias.aliased.clone()));
+                    self.aliases
+                        .entry(format!("{}{}", entry.home, alias.name.name))
+                        .or_insert(stood);
+                    self.aliases.entry(alias.name.name.clone()).or_insert(stood);
+                }
+            }
             decls.push(named_in(&entry.home, entry.decl));
         }
         decls
@@ -1191,6 +1212,18 @@ impl Emitter {
             Type::Named { name, args, .. } if args.is_empty() => {
                 match self.stands_for(name) {
                     Some(Stood::Ty(ty)) => Some(ty),
+                    _ if self.alias_depth < 32 && self.stands_for_alias(name) => {
+                        let key = self.aliases_key(name);
+                        match self.aliases.get(&key).copied() {
+                            Some(target) => {
+                                self.alias_depth += 1;
+                                let stood = self.type_of(target);
+                                self.alias_depth -= 1;
+                                stood
+                            }
+                            None => None,
+                        }
+                    }
                     _ => match DuxType::named(name) {
                         Some(primitive) => Some(primitive),
                         None => {
@@ -9156,6 +9189,20 @@ impl Emitter {
             .iter()
             .find(|(param, _)| param == name)
             .map(|(_, stood)| *stood)
+    }
+
+    /// Whether a name written here is a `type` alias, in this module or
+    /// anywhere the bare spelling can still reach.
+    fn stands_for_alias(&self, name: &str) -> bool {
+        self.aliases.contains_key(&self.aliases_key(name)) || self.aliases.contains_key(name)
+    }
+
+    fn aliases_key(&self, name: &str) -> String {
+        if self.home.is_empty() {
+            name.to_string()
+        } else {
+            format!("{}{name}", self.home)
+        }
     }
 
     /// An array length the lowering can count: a literal, or the value a
