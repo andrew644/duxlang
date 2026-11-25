@@ -335,13 +335,18 @@ pub enum Expr {
         len: Box<Expr>,
         span: Span,
     },
+    /// A name, possibly qualified (`Shape::Rect`), possibly with the type
+    /// arguments written out (`max<i64>`, `HashMap<string, i32>`). An empty
+    /// qualifier means the name stands alone.
     Path {
         qualifier: String,
         name: String,
+        args: Vec<Type>,
         span: Span,
     },
     StructLiteral {
         name: String,
+        args: Vec<Type>,
         fields: Vec<(Ident, Expr)>,
         span: Span,
     },

@@ -5192,7 +5192,7 @@ impl Emitter {
             Expr::Cast { value, target, .. } => self.cast(module, value, target),
             Expr::Call { callee, args, span } => self.call(module, callee, args, *span, expected),
             Expr::Path {
-                qualifier, name, span,
+                qualifier, name, span, ..
             } => {
                 if self.shapes.contains_key(qualifier) {
                     self.variant_value(module, qualifier, name, &[], &[], *span, expected)
@@ -5235,7 +5235,7 @@ impl Emitter {
             Expr::Field { base, name, span } => {
                 self.field_expr(module, base, &name.name, name.span, *span)
             }
-            Expr::StructLiteral { name, fields, span } => {
+            Expr::StructLiteral { name, fields, span, .. } => {
                 if self.structs.contains_key(name.as_str()) || !name.contains("::") {
                     return self.struct_literal(module, name, fields, *span);
                 }

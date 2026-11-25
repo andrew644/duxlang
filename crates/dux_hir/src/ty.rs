@@ -612,6 +612,27 @@ impl<'a> Checker<'a> {
         }
     }
 
+    /// Type arguments written at a use are the one part of generics this build
+    /// does not read yet (M5). The arguments are still walked, so a fault inside
+    /// one is not lost, and the answer is the type the name has without them —
+    /// which is why the build has to say so rather than carry on.
+    fn waits_for_generics(&mut self, args: &[Type], span: Span) {
+        if args.is_empty() {
+            return;
+        }
+        for arg in args {
+            let _ = self.resolve_type(arg);
+        }
+        self.report(
+            span,
+            Diagnostic::error(
+                code::UNSUPPORTED_IN_BUILD,
+                "generic arguments at a use are not supported by this compiler build yet",
+            )
+            .with_note("monomorphisation is milestone M5, not a language question"),
+        );
+    }
+
     fn report(&mut self, span: Span, diagnostic: Diagnostic) {
         self.diagnostics.push(diagnostic.with_span(span));
     }
@@ -1994,8 +2015,22 @@ impl<'a> Checker<'a> {
                 let _ = span;
                 Ty::Array(Box::new(element.defaulted()))
             }
-            Expr::Path { qualifier, name, span } => self.nullary_variant_of(qualifier, name, *span, expected),
-            Expr::StructLiteral { name, fields, span } => {
+            Expr::Path {
+                qualifier,
+                name,
+                args,
+                span,
+            } => {
+                self.waits_for_generics(args, *span);
+                self.nullary_variant_of(qualifier, name, *span, expected)
+            }
+            Expr::StructLiteral {
+                name,
+                args,
+                fields,
+                span,
+            } => {
+                self.waits_for_generics(args, *span);
                 if !self.structs.contains_key(name.as_str()) {
                     if let Some(owner) = self.owner_of_variant(variant_of_name(name)) {
                         return self.named_constructor(&owner, name, fields, *span, expected);
@@ -2205,6 +2240,8 @@ impl<'a> Checker<'a> {
                 return self.call_signature(&signature, args, span);
             }
         }
+        // The type arguments a path carries are read where the path itself is
+        // checked, so a call says nothing about them and nothing is said twice.
         if let Expr::Path { qualifier, name, .. } = callee {
             if self.enums.contains_key(qualifier) {
                 return self.constructor(qualifier, name, args, span, expected);

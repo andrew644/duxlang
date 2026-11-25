@@ -645,11 +645,18 @@ fn the_normative_corpus_typechecks_without_a_single_diagnostic() {
             continue;
         }
         let diagnostics = check(&parsed.program);
-        if !diagnostics.is_empty() {
+        // A milestone gap is not a verdict (DESIGN: `E0007` is valid Dux this
+        // build cannot compile yet), so the same rule the parse is given below
+        // holds here: a file that only says "not yet" is silent.
+        let blocking: Vec<&Diagnostic> = diagnostics
+            .iter()
+            .filter(|d| d.code != dux_diag::code::UNSUPPORTED_IN_BUILD)
+            .collect();
+        if !blocking.is_empty() {
             offenders.push(format!(
                 "{}: {:?}",
                 path.file_stem().unwrap().to_string_lossy(),
-                diagnostics
+                blocking
                     .iter()
                     .map(|d| (d.code, d.message.clone()))
                     .collect::<Vec<_>>()

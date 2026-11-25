@@ -74,6 +74,25 @@ fn path_qualifier(expr: &Expr) -> String {
     }
 }
 
+/// A path as its two halves and, when it already carries them, its type
+/// arguments: `Shape::Rect` is `("Shape", "Rect")` and `max` alone is `("", "max")`.
+fn path_parts(expr: &Expr) -> (String, String) {
+    match expr {
+        Expr::Ident { name, .. } => (String::new(), name.clone()),
+        Expr::Path {
+            qualifier, name, ..
+        } => (qualifier.clone(), name.clone()),
+        _ => (String::new(), String::new()),
+    }
+}
+
+fn path_spelling(qualifier: &str, name: &str) -> String {
+    match qualifier.is_empty() {
+        true => name.to_string(),
+        false => format!("{qualifier}::{name}"),
+    }
+}
+
 fn wrap(name: &str) -> String {
     if name.starts_with('`') {
         name.to_string()
@@ -1413,27 +1432,32 @@ impl<'a> Parser<'a> {
                     expr = Expr::Path {
                         qualifier: path_qualifier(&expr),
                         name: name.name,
+                        args: Vec::new(),
                         span,
                     };
                 }
                 TokenKind::Punct(Punct::Lt) if self.at_type_argument_list() => {
+                    // A name written with its type arguments — `max<i64>(9, 4)`,
+                    // `Pair<i32, string> { .. }`, `HashMap<string, i32>.new()` —
+                    // is the same path with more said about it.
                     let start = expr.span();
-                    let base = path_name(&expr);
-                    self.type_argument_list();
+                    let (qualifier, name) = path_parts(&expr);
+                    let args = self.type_argument_list();
                     let end = self.last_span;
-                    self.diagnostics.push(
-                        Diagnostic::error(
-                            CODE_UNSUPPORTED_YET,
-                            "generic arguments on a call path are not supported by this compiler build yet",
-                        )
-                        .with_span(start.merge(end))
-                        .with_note("generics are milestone M5, not a language question"),
-                    );
-                    if self.at_struct_literal() {
-                        expr = self.struct_literal(base, start);
+                    expr = if self.at_struct_literal() {
+                        let mut literal = self.struct_literal(path_spelling(&qualifier, &name), start);
+                        if let Expr::StructLiteral { args: slot, .. } = &mut literal {
+                            *slot = args;
+                        }
+                        literal
                     } else {
-                        expr = Expr::Error { span: start.merge(end) };
-                    }
+                        Expr::Path {
+                            qualifier,
+                            name,
+                            args,
+                            span: start.merge(end),
+                        }
+                    };
                 }
                 TokenKind::Punct(Punct::LBracket) => {
                     self.bump();
@@ -1551,6 +1575,7 @@ impl<'a> Parser<'a> {
                     let path = Expr::Path {
                         qualifier: name,
                         name: member.name,
+                        args: Vec::new(),
                         span,
                     };
                     if self.at_struct_literal() {
@@ -1681,10 +1706,11 @@ impl<'a> Parser<'a> {
         false
     }
 
-    fn type_argument_list(&mut self) {
+    fn type_argument_list(&mut self) -> Vec<Type> {
         self.bump();
+        let mut args = Vec::new();
         while !self.at_punct(Punct::Gt) && !self.at_end() {
-            self.type_or_const_argument();
+            args.push(self.type_or_const_argument());
             if self.at_punct(Punct::Comma) {
                 self.bump();
             } else {
@@ -1692,6 +1718,7 @@ impl<'a> Parser<'a> {
             }
         }
         self.last_span = self.expect_punct(Punct::Gt, "expected `>` to close the type arguments");
+        args
     }
 
     fn type_or_const_argument(&mut self) -> Type {
@@ -1738,6 +1765,7 @@ impl<'a> Parser<'a> {
         let end = self.expect_punct(Punct::RBrace, "expected `}` to close the struct value");
         Expr::StructLiteral {
             name,
+            args: Vec::new(),
             fields,
             span: start.merge(end),
         }
@@ -2522,10 +2550,24 @@ mod tests {
         let (program, diagnostics) = parse_text(
             "fn f(cb: fn(i32) -> i32, stream: Option<*cs.FILE>) { }\nfn g() { grid := zeros<4>() }\n",
         );
+        assert!(
+            diagnostics.is_empty(),
+            "a type argument written at a use is the parser's business, and it parses: {diagnostics:?}"
+        );
+        let g = program.find_function("g").unwrap();
+        let Stmt::Binding { value, .. } = &g.body.stmts[0] else {
+            panic!("a binding")
+        };
+        let Expr::Call { callee, .. } = value.as_ref().unwrap() else {
+            panic!("a call")
+        };
+        let Expr::Path { name, args, .. } = callee.as_ref() else {
+            panic!("a path with its type arguments")
+        };
         assert_eq!(
-            diagnostics.iter().map(|d| d.code).collect::<Vec<_>>(),
-            vec![CODE_UNSUPPORTED_YET],
-            "only the M5 generic call path is unimplemented, the types themselves parse"
+            (name.as_str(), args.len()),
+            ("zeros", 1),
+            "`zeros<4>` keeps the argument it was written with"
         );
         let f = program.find_function("f").unwrap();
         assert!(matches!(f.params[0].ty, Type::Function { .. }));
@@ -2772,6 +2814,70 @@ mod tests {
             panic!("expected named type")
         };
         assert_eq!((name.as_str(), args.len()), ("HashMap", 2));
+    }
+
+    #[test]
+    fn type_arguments_written_at_a_use_are_kept() {
+        let (program, diagnostics) = parse_text(
+            "fn main() { a := max<i64>(9, 4); p := Pair<i32, string> { first: 1, second: \"x\" }; b := HashMap<string, i32>.new(); c := zeros<4>() }",
+        );
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        let main = program.find_function("main").unwrap();
+        let Stmt::Binding { value, .. } = &main.body.stmts[0] else {
+            panic!("a binding")
+        };
+        let Expr::Call { callee, .. } = value.as_ref().unwrap() else {
+            panic!("a call")
+        };
+        let Expr::Path {
+            qualifier, name, args, ..
+        } = callee.as_ref()
+        else {
+            panic!("a path written with its type arguments")
+        };
+        assert_eq!(
+            (qualifier.as_str(), name.as_str(), args.len()),
+            ("", "max", 1),
+            "`max<i64>` is the bare name with one argument said about it"
+        );
+        let Stmt::Binding { value, .. } = &main.body.stmts[1] else {
+            panic!("a binding")
+        };
+        let Expr::StructLiteral { name, args, .. } = value.as_ref().unwrap() else {
+            panic!("a struct value")
+        };
+        assert_eq!((name.as_str(), args.len()), ("Pair", 2));
+        let Stmt::Binding { value, .. } = &main.body.stmts[2] else {
+            panic!("a binding")
+        };
+        let Expr::Call { callee, .. } = value.as_ref().unwrap() else {
+            panic!("a method call")
+        };
+        let Expr::Field { base, name, .. } = callee.as_ref() else {
+            panic!("a member walked off a type")
+        };
+        let Expr::Path { qualifier, args, .. } = base.as_ref() else {
+            panic!("the type the call walks off")
+        };
+        assert_eq!(
+            (qualifier.as_str(), name.name.as_str(), args.len()),
+            ("", "new", 2),
+            "the arguments belong to the type, not to the member walked off it"
+        );
+        let Stmt::Binding { value, .. } = &main.body.stmts[3] else {
+            panic!("a binding")
+        };
+        let Expr::Call { callee, .. } = value.as_ref().unwrap() else {
+            panic!("a call")
+        };
+        let Expr::Path { name, args, .. } = callee.as_ref() else {
+            panic!("a path")
+        };
+        assert_eq!((name.as_str(), args.len()), ("zeros", 1));
+        assert!(
+            matches!(&args[0], Type::ConstArgument { .. }),
+            "`zeros<4>` gives a value, not a type: {args:?}"
+        );
     }
 
     #[test]

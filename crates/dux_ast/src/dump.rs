@@ -184,6 +184,16 @@ fn dump_type_params(params: &[TypeParam]) -> String {
     format!("<{inner}>")
 }
 
+fn dump_type_arguments(args: &[Type]) -> String {
+    if args.is_empty() {
+        return String::new();
+    }
+    format!(
+        "<{}>",
+        args.iter().map(dump_type).collect::<Vec<_>>().join(", ")
+    )
+}
+
 fn dump_type(ty: &Type) -> String {
     match ty {
         Type::Named { name, args, .. } => {
@@ -404,16 +414,30 @@ fn dump_expr(expr: &Expr) -> String {
         Expr::RepeatedArray { value, len, .. } => {
             format!("[{}; {}]", dump_expr(value), dump_expr(len))
         }
-        Expr::Path { qualifier, name, .. } => format!("{qualifier}::{name}"),
-        Expr::StructLiteral { name, fields, .. } => format!(
-            "{} {{ {} }}",
+        Expr::Path {
+            qualifier,
             name,
-            fields
+            args,
+            ..
+        } => {
+            let spelled = if qualifier.is_empty() {
+                name.clone()
+            } else {
+                format!("{qualifier}::{name}")
+            };
+            format!("{spelled}{}", dump_type_arguments(args))
+        }
+        Expr::StructLiteral {
+            name, args, fields, ..
+        } => {
+            let head = format!("{name}{}", dump_type_arguments(args));
+            let body = fields
                 .iter()
                 .map(|(f, v)| format!("{}: {}", f.name, dump_expr(v)))
                 .collect::<Vec<_>>()
-                .join(", ")
-        ),
+                .join(", ");
+            format!("{head} {{ {body} }}")
+        }
         Expr::CondBinding { pattern, value, .. } => {
             format!("({} := {})", dump_pattern(pattern), dump_expr(value))
         }

@@ -649,13 +649,28 @@ impl Printer {
             Expr::RepeatedArray { value, len, .. } => {
                 format!("[{}; {}]", self.expr(value, level), self.expr(len, level))
             }
-            Expr::Path { qualifier, name, .. } => format!("{qualifier}::{name}"),
-            Expr::StructLiteral { name, fields, .. } => {
+            Expr::Path {
+                qualifier,
+                name,
+                args,
+                ..
+            } => {
+                let spelled = if qualifier.is_empty() {
+                    name.clone()
+                } else {
+                    format!("{qualifier}::{name}")
+                };
+                format!("{spelled}{}", type_arguments(args))
+            }
+            Expr::StructLiteral {
+                name, args, fields, ..
+            } => {
+                let head = format!("{name}{}", type_arguments(args));
                 if fields.is_empty() {
-                    return format!("{name} {{ }}");
+                    return format!("{head} {{ }}");
                 }
                 format!(
-                    "{name} {{ {} }}",
+                    "{head} {{ {} }}",
                     fields
                         .iter()
                         .map(|(field, value)| format!("{}: {}", field.name, self.expr(value, level)))
