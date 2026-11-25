@@ -497,6 +497,10 @@ struct Context {
 
 pub(crate) struct Checker<'a> {
     program: &'a Program,
+    /// The module whose declaration is being read, written the way a use would
+    /// write it. Inside `mod math` a bare name means the module's own first,
+    /// which is how `sqrt` gets to be `math.sqrt` without the file saying so.
+    home: String,
     diagnostics: Vec<Diagnostic>,
     functions: HashMap<String, Signature>,
     methods: HashMap<(String, String), Signature>,
@@ -526,6 +530,7 @@ impl<'a> Checker<'a> {
     fn new(program: &'a Program) -> Self {
         let mut checker = Checker {
             program,
+            home: String::new(),
             diagnostics: Vec::new(),
             functions: HashMap::new(),
             methods: HashMap::new(),
@@ -551,8 +556,10 @@ impl<'a> Checker<'a> {
     }
 
     fn collect_types(&mut self) {
-        let decls: &[Decl] = self.program.decls.as_slice();
-        for decl in decls {
+        for scoped in self.program.scoped() {
+            self.home = scoped.home.clone();
+            let decl = scoped.decl;
+            let named = |name: &str| format!("{}{}", scoped.home, name);
             match decl {
                 Decl::Struct(decl) => {
                     let fields = decl
@@ -560,11 +567,12 @@ impl<'a> Checker<'a> {
                         .iter()
                         .map(|field| (field.name.name.clone(), field.ty.clone()))
                         .collect();
+                    let name = named(&decl.name.name);
                     if decl.type_params.is_empty() {
-                        self.structs.insert(decl.name.name.clone(), fields);
+                        self.structs.insert(name, fields);
                     } else {
                         self.generic_structs.insert(
-                            decl.name.name.clone(),
+                            name,
                             GenericRecord {
                                 params: decl
                                     .type_params
@@ -578,21 +586,28 @@ impl<'a> Checker<'a> {
                 }
                 Decl::TypeAlias(TypeAliasDecl { name, type_params, aliased, .. }) => {
                     if type_params.is_empty() {
-                        self.aliases.insert(name.name.clone(), aliased.clone());
+                        self.aliases.insert(named(&name.name), aliased.clone());
                     }
                 }
                 Decl::Enum(decl) => {
-                    let shape = Shape::from_decl(decl);
+                    let mut shape = Shape::from_decl(decl);
+                    shape.name = named(&shape.name);
                     self.enums.insert(shape.name.clone(), shape);
                 }
                 _ => {}
             }
         }
+        self.home.clear();
     }
 
     fn collect_functions(&mut self) {
-        let functions: Vec<&dux_ast::FnDecl> = self.program.functions().collect();
-        for function in functions {
+        let scoped = self.program.scoped();
+        for entry in scoped.iter() {
+            let Decl::Fn(function) = entry.decl else {
+                continue;
+            };
+            self.home = entry.home.clone();
+            let named = format!("{}{}", entry.home, function.name.name);
             let signature = self.signature(function, false);
             if !function.type_params.is_empty() {
                 let mut type_params = Vec::new();
@@ -605,7 +620,7 @@ impl<'a> Checker<'a> {
                     }
                 }
                 self.generic_functions.insert(
-                    function.name.name.clone(),
+                    named.clone(),
                     GenericFunction {
                         type_params,
                         const_params,
@@ -614,18 +629,21 @@ impl<'a> Checker<'a> {
                     },
                 );
             }
-            self.functions
-                .insert(function.name.name.clone(), signature);
+            self.functions.insert(named, signature);
         }
-        let decls: &[Decl] = self.program.decls.as_slice();
-        for decl in decls {
-            if let Decl::Extern(extern_block) = decl {
-                for function in &extern_block.functions {
-                    let signature = self.signature(function, true);
-                    self.functions.insert(function.name.name.clone(), signature);
-                }
+        self.home.clear();
+        for entry in scoped.iter() {
+            let Decl::Extern(extern_block) = entry.decl else {
+                continue;
+            };
+            self.home = entry.home.clone();
+            for function in &extern_block.functions {
+                let signature = self.signature(function, true);
+                self.functions
+                    .insert(format!("{}{}", entry.home, function.name.name), signature);
             }
         }
+        self.home.clear();
     }
 
     fn signature(&self, function: &dux_ast::FnDecl, external: bool) -> Signature {
@@ -653,6 +671,16 @@ impl<'a> Checker<'a> {
     /// A source type, with the enclosing enum's parameters replaced by the
     /// arguments of an instantiation. A parameter name is only a type while
     /// that substitution is in hand, which is why it travels as a binding.
+    /// The name a written name answers to. A module's own declarations are
+    /// known by where they live, and are written bare from inside it.
+    fn at_home(&self, name: &str, known: impl Fn(&str) -> bool) -> String {
+        let named = format!("{}{name}", self.home);
+        if !self.home.is_empty() && known(&named) {
+            return named;
+        }
+        name.to_string()
+    }
+
     fn resolve_type_in(&self, ty: &Type, depth: u32, params: &[(String, Ty)]) -> Ty {
         if depth > 8 {
             return Ty::Opaque;
@@ -667,6 +695,13 @@ impl<'a> Checker<'a> {
                 if let Some(primitive) = primitive(name) {
                     return primitive;
                 }
+                let named = self.at_home(name, |spelling| {
+                    self.enums.contains_key(spelling)
+                        || self.structs.contains_key(spelling)
+                        || self.generic_structs.contains_key(spelling)
+                        || self.aliases.contains_key(spelling)
+                });
+                let name: &str = named.as_str();
                 if let Some(shape) = self.enums.get(name) {
                     let resolved: Vec<Ty> = args
                         .iter()
@@ -678,7 +713,7 @@ impl<'a> Checker<'a> {
                         return Ty::Opaque;
                     }
                     return Ty::Enum {
-                        name: name.clone(),
+                        name: name.to_string(),
                         args: resolved,
                     };
                 }
@@ -688,7 +723,7 @@ impl<'a> Checker<'a> {
                             return Ty::Opaque;
                         }
                         return Ty::Instance {
-                            name: name.clone(),
+                            name: name.to_string(),
                             args: args
                                 .iter()
                                 .map(|arg| self.resolve_type_in(arg, depth + 1, params))
@@ -697,8 +732,8 @@ impl<'a> Checker<'a> {
                     }
                     return Ty::Opaque;
                 }
-                if self.structs.contains_key(name.as_str()) {
-                    return Ty::Struct(name.clone());
+                if self.structs.contains_key(name) {
+                    return Ty::Struct(name.to_string());
                 }
                 match self.aliases.get(name) {
                     Some(target) => self.resolve_type_in(target, depth + 1, params),
@@ -1039,7 +1074,14 @@ impl<'a> Checker<'a> {
             .rev()
             .flat_map(|scope| scope.iter().rev())
             .find(|context| context.name == name)
-            .or_else(|| self.globals.get(name))
+            .or_else(|| {
+                if !self.home.is_empty() {
+                    if let Some(found) = self.globals.get(&format!("{}{name}", self.home)) {
+                        return Some(found);
+                    }
+                }
+                self.globals.get(name)
+            })
     }
 
     fn error(&mut self, c: &'static str, message: impl Into<String>, span: Span) {
@@ -2687,6 +2729,17 @@ impl<'a> Checker<'a> {
                     };
                 }
             }
+            let named = self.at_home(name, |spelling| {
+                self.functions.contains_key(spelling) || self.generic_functions.contains_key(spelling)
+            });
+            if named != *name {
+                if let Some(generic) = self.generic_functions.get(named.as_str()).cloned() {
+                    return self.generic_call(&named, &generic, &[], args, span);
+                }
+                if let Some(signature) = self.functions.get(named.as_str()).cloned() {
+                    return self.call_signature(&signature, args, span);
+                }
+            }
             if !self.functions.contains_key(name) {
                 if let Some(result) = builtin_result(name) {
                     for arg in args {
@@ -2726,8 +2779,34 @@ impl<'a> Checker<'a> {
             if self.enums.contains_key(qualifier) {
                 return self.constructor(qualifier, name, args, span, expected);
             }
+            // `math.sqrt(x)`: a name written through the module it lives in.
+            if !qualifier.is_empty() {
+                let named = format!("{qualifier}.{name}");
+                if let Some(generic) = self.generic_functions.get(named.as_str()).cloned() {
+                    return self.generic_call(&named, &generic, written, args, span);
+                }
+                if let Some(signature) = self.functions.get(named.as_str()).cloned() {
+                    return self.call_signature(&signature, args, span);
+                }
+            }
         }
         if let Expr::Field { base, name, .. } = callee {
+            // `math.sqrt(x)`: what walks off the dot is a module, not a value,
+            // and a module's members are known by where they live.
+            if let Expr::Ident {
+                name: qualifier, ..
+            } = base.as_ref()
+            {
+                if self.lookup(qualifier).is_none() {
+                    let named = format!("{qualifier}.{}", name.name);
+                    if let Some(generic) = self.generic_functions.get(named.as_str()).cloned() {
+                        return self.generic_call(&named, &generic, &[], args, span);
+                    }
+                    if let Some(signature) = self.functions.get(named.as_str()).cloned() {
+                        return self.call_signature(&signature, args, span);
+                    }
+                }
+            }
             let base = self.infer(base);
             if name.name == "len" && args.is_empty() {
                 match &base {
@@ -3268,8 +3347,11 @@ impl<'a> Checker<'a> {
     // ---------------------------------------------------------------- driver
 
     fn run(mut self) -> Vec<Diagnostic> {
-        let decls: &[Decl] = self.program.decls.as_slice();
-        for decl in decls {
+        for entry in self.program.scoped().iter() {
+            let home = entry.home.clone();
+            self.home = home.clone();
+            let decl = entry.decl;
+            let named = |name: &str| format!("{home}{name}");
             match decl {
                 Decl::Const(decl) => {
                     let declared = decl.ty.as_ref().map(|ty| self.resolve_type(ty));
@@ -3280,9 +3362,10 @@ impl<'a> Checker<'a> {
                         }
                         None => self.infer(&decl.value),
                     };
+                    let name = named(&decl.name.name);
                     self.globals.insert(
-                        decl.name.name.clone(),
-                        Context { name: decl.name.name.clone(), ty: bound, is_const: true },
+                        name.clone(),
+                        Context { name, ty: bound, is_const: true },
                     );
                 }
                 Decl::Global(decl) => {
@@ -3296,16 +3379,20 @@ impl<'a> Checker<'a> {
                         (None, Some(value)) => self.infer(value).defaulted(),
                         (None, None) => Ty::Opaque,
                     };
+                    let name = named(&decl.name.name);
                     self.globals.insert(
-                        decl.name.name.clone(),
-                        Context { name: decl.name.name.clone(), ty: bound, is_const: false },
+                        name.clone(),
+                        Context { name, ty: bound, is_const: false },
                     );
                 }
                 _ => {}
             }
         }
-        for block in decls {
-            if let Decl::Impl(block) = block {
+        for entry in self.program.scoped().iter() {
+            let home = entry.home.clone();
+            self.home = home.clone();
+            if let Decl::Impl(block) = entry.decl {
+                let owner = named_owner(&home, &block.type_name.name);
                 let saved = std::mem::take(&mut self.instantiation);
                 self.instantiation = block
                     .type_params
@@ -3323,7 +3410,7 @@ impl<'a> Checker<'a> {
                     };
                     if !block.type_params.is_empty() {
                         self.generic_methods.insert(
-                            (block.type_name.name.clone(), method.name.name.clone()),
+                            (owner.clone(), method.name.name.clone()),
                             GenericMethod {
                                 params: block
                                     .type_params
@@ -3337,23 +3424,27 @@ impl<'a> Checker<'a> {
                             },
                         );
                     }
-                    self.methods.insert(
-                        (block.type_name.name.clone(), method.name.name.clone()),
-                        signature,
-                    );
+                    self.methods.insert((owner.clone(), method.name.name.clone()), signature);
                 }
                 self.instantiation = saved;
             }
         }
-        for decl in decls {
-            match decl {
+        for entry in self.program.scoped().iter() {
+            self.home = entry.home.clone();
+            match entry.decl {
                 Decl::Fn(function) => self.function(function, None),
                 Decl::Impl(block) => self.impl_block(block),
                 _ => {}
             }
         }
+        self.home.clear();
         self.diagnostics
     }
+}
+
+/// The name a `struct` is known by from outside the module it lives in.
+fn named_owner(home: &str, name: &str) -> String {
+    format!("{home}{name}")
 }
 
 /// Untyped constants keep their untyped-ness through arithmetic (D17), so a

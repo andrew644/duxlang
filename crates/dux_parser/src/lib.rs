@@ -1520,6 +1520,18 @@ impl<'a> Parser<'a> {
                     self.bump();
                     let name = self.expect_ident("field name");
                     let span = expr.span().merge(name.span);
+                    // `mathx.Size { w: 3 }`: a name written through the module
+                    // it lives in is still the name of a record.
+                    if let (Some(qualifier), true) = (
+                        match &expr {
+                            Expr::Ident { name, .. } => Some(name.clone()),
+                            _ => None,
+                        },
+                        self.at_struct_literal(),
+                    ) {
+                        let spelled = format!("{qualifier}.{}", name.name);
+                        return self.struct_literal(spelled, expr.span().merge(name.span));
+                    }
                     expr = Expr::Field {
                         base: Box::new(expr),
                         name,

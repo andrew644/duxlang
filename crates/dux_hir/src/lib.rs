@@ -9,7 +9,9 @@
 //! annotation. Silence is the contract: no normative example may gain a
 //! diagnostic here, because `--emit=ast` and `check` run on the whole corpus.
 
-use dux_ast::{Block, Decl, Expr, FnDecl, ForKind, InterpolationPart, Program, Stmt, Type};
+use dux_ast::{
+    Block, Decl, Expr, FnDecl, ForKind, InterpolationPart, Program, Scoped, Stmt, Type,
+};
 use dux_diag::{code, Diagnostic};
 use dux_source::Span;
 use std::collections::HashMap;
@@ -54,6 +56,10 @@ struct Resolver<'a> {
     top_level: HashMap<String, Item>,
     scopes: Vec<Vec<String>>,
     diagnostics: Vec<Diagnostic>,
+    /// The module whose body is being read, written the way a use would write
+    /// it. Inside `mod math` a name means the module's own first, which is how
+    /// `sqrt` gets to be `math.sqrt` without the file saying so every time.
+    home: String,
 }
 
 impl<'a> Resolver<'a> {
@@ -63,14 +69,16 @@ impl<'a> Resolver<'a> {
             top_level: HashMap::new(),
             scopes: Vec::new(),
             diagnostics: Vec::new(),
+            home: String::new(),
         }
     }
 
     fn run(mut self) -> Resolution {
         self.collect();
         self.check_main();
-        for decl in &self.program.decls {
-            match decl {
+        for scoped in self.program.scoped() {
+            self.home = scoped.home.clone();
+            match scoped.decl {
                 Decl::Fn(function) => self.function(function),
                 Decl::Impl(impl_block) => {
                     for method in &impl_block.methods {
@@ -86,6 +94,7 @@ impl<'a> Resolver<'a> {
                 _ => {}
             }
         }
+        self.home.clear();
         Resolution {
             diagnostics: self.diagnostics,
         }
@@ -104,28 +113,30 @@ impl<'a> Resolver<'a> {
                 self.namespace(namespace);
             }
         }
-        for decl in &self.program.decls {
+        for scoped in self.program.scoped() {
+            let Scoped { home, decl } = &scoped;
+            let named = |name: &str| format!("{home}{name}");
             match decl {
                 Decl::Fn(function) => self.declare(
-                    &function.name.name,
+                    &named(&function.name.name),
                     Item::Callable(Callable::Function {
                         params: function.params.len(),
                     }),
                 ),
                 Decl::Extern(block) => {
                     for function in &block.functions {
-                        self.declare(&function.name.name, Item::Callable(Callable::Opaque));
+                        self.declare(&named(&function.name.name), Item::Callable(Callable::Opaque));
                     }
                 }
-                Decl::Struct(decl) => self.declare(&decl.name.name, Item::Namespace),
-                Decl::Enum(decl) => self.declare(&decl.name.name, Item::Namespace),
-                Decl::TypeAlias(decl) => self.declare(&decl.name.name, Item::Namespace),
-                Decl::Module(decl) => self.namespace(&decl.name.name),
+                Decl::Struct(decl) => self.declare(&named(&decl.name.name), Item::Namespace),
+                Decl::Enum(decl) => self.declare(&named(&decl.name.name), Item::Namespace),
+                Decl::TypeAlias(decl) => self.declare(&named(&decl.name.name), Item::Namespace),
+                Decl::Module(decl) => self.namespace(&named(&decl.name.name)),
                 Decl::Const(decl) => {
-                    self.declare(&decl.name.name, Item::Callable(Callable::Opaque))
+                    self.declare(&named(&decl.name.name), Item::Callable(Callable::Opaque))
                 }
                 Decl::Global(decl) => {
-                    self.declare(&decl.name.name, Item::Callable(Callable::Opaque))
+                    self.declare(&named(&decl.name.name), Item::Callable(Callable::Opaque))
                 }
                 Decl::Impl(_) | Decl::Error { .. } => {}
             }
@@ -466,6 +477,11 @@ impl<'a> Resolver<'a> {
                 return Some(Item::Callable(Callable::Opaque));
             }
         }
+        if !self.home.is_empty() {
+            if let Some(item) = self.top_level.get(&format!("{}{name}", self.home)) {
+                return Some(*item);
+            }
+        }
         self.top_level.get(name).copied()
     }
 
@@ -475,7 +491,12 @@ impl<'a> Resolver<'a> {
                 return Callable::Opaque;
             }
         }
-        match self.top_level.get(name) {
+        let home = format!("{}{name}", self.home);
+        match self
+            .top_level
+            .get(if self.home.is_empty() { name } else { &home })
+            .or_else(|| self.top_level.get(name))
+        {
             Some(Item::Callable(callable)) => *callable,
             _ => Callable::Opaque,
         }

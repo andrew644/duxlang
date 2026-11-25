@@ -731,7 +731,51 @@ pub struct Program {
     pub decls: Vec<Decl>,
 }
 
+/// A declaration and the module it lives in, if any. `home` is written the way
+/// a use would write it — `math.`, `std/io.`, or nothing at all for the file
+/// that was named on the command line — so a name and its `home` say the one
+/// name everything else knows the declaration by.
+#[derive(Clone, Debug)]
+pub struct Scoped<'a> {
+    pub home: String,
+    pub decl: &'a Decl,
+}
+
 impl Program {
+    /// Every declaration in the program, including the ones a module body
+    /// holds, each with the place it must be named from to be reached.
+    pub fn scoped(&self) -> Vec<Scoped<'_>> {
+        let mut out = Vec::new();
+        Program::collect_scoped(&self.decls, "", &mut out);
+        out
+    }
+
+    fn collect_scoped<'a>(decls: &'a [Decl], home: &str, out: &mut Vec<Scoped<'a>>) {
+        for decl in decls {
+            match decl {
+                Decl::Module(module) => {
+                    // The module itself is a declaration too: `mod c;` says
+                    // nothing else, and a module with a body still names the
+                    // place its contents live.
+                    out.push(Scoped {
+                        home: home.to_string(),
+                        decl,
+                    });
+                    let nested = if home.is_empty() {
+                        format!("{}.", module.name.name)
+                    } else {
+                        format!("{home}{}.", module.name.name)
+                    };
+                    Program::collect_scoped(&module.decls, &nested, out);
+                }
+                other => out.push(Scoped {
+                    home: home.to_string(),
+                    decl: other,
+                }),
+            }
+        }
+    }
+
     pub fn functions(&self) -> impl Iterator<Item = &FnDecl> {
         self.decls.iter().filter_map(|decl| match decl {
             Decl::Fn(function) => Some(function),
