@@ -2,6 +2,120 @@
 // and `Result` are the two predeclared enums; everything else the language
 // uses through them is written here, in the language.
 
+// `HashMap<K, V>` is the prelude's open-addressing table: three parallel
+// views from the context — keys, values, and the `used` bits that say which
+// slots hold a key — probed by the builtin `hash` and doubled when they fill
+// past half.
+struct HashMap<K, V> {
+    keys: []K,
+    values: []V,
+    used: []bool,
+    count: usize,
+}
+
+impl HashMap<K, V> {
+    fn new() -> HashMap<K, V> {
+        return HashMap<K, V> {
+            keys: make(K, 16),
+            values: make(V, 16),
+            used: make(bool, 16),
+            count: 0,
+        }
+    }
+
+    fn len(self) -> usize {
+        return self.count
+    }
+
+    fn is_empty(self) -> bool {
+        return self.count == 0
+    }
+
+    fn get(self, key: K) -> Option<V> {
+        at := self.probe(key)
+        if self.used[at] {
+            return Some(self.values[at])
+        }
+        return None
+    }
+
+    fn has(self, key: K) -> bool {
+        return self.used[self.probe(key)]
+    }
+
+    fn insert(self: *HashMap<K, V>, key: K, value: V) {
+        if (self.count + 1) * 2 > self.used.len() {
+            self.rehash(self.used.len() * 2)
+        }
+        self.place(key, value)
+    }
+
+    fn clear(self: *HashMap<K, V>) {
+        at: usize = 0
+        while at < self.used.len() {
+            self.used[at] = false
+            at += 1
+        }
+        self.count = 0
+    }
+
+    fn destroy(self: *HashMap<K, V>) {
+        del(self.keys)
+        del(self.values)
+        del(self.used)
+        self.keys = self.keys[0..0]
+        self.values = self.values[0..0]
+        self.used = self.used[0..0]
+        self.count = 0
+    }
+
+    // The slot where this key lives, or the first empty slot where it would
+    // be placed. Probing stops at an empty slot because that is where the
+    // key's own probe would have stopped too.
+    fn probe(self, key: K) -> usize {
+        span := self.used.len()
+        at := hash(key) % span
+        while self.used[at] && self.keys[at] != key {
+            at = (at + 1) % span
+        }
+        return at
+    }
+
+    fn place(self: *HashMap<K, V>, key: K, value: V) {
+        at := self.probe(key)
+        if self.used[at] {
+            self.values[at] = value
+            return
+        }
+        self.used[at] = true
+        self.keys[at] = key
+        self.values[at] = value
+        self.count += 1
+    }
+
+    // A fresh span, and every live key placed again into it: the old slots
+    // are released once the new ones hold copies of them.
+    fn rehash(self: *HashMap<K, V>, span: usize) {
+        keys := self.keys
+        values := self.values
+        used := self.used
+        self.keys = make(K, span)
+        self.values = make(V, span)
+        self.used = make(bool, span)
+        self.count = 0
+        at: usize = 0
+        while at < used.len() {
+            if used[at] {
+                self.place(keys[at], values[at])
+            }
+            at += 1
+        }
+        del(keys)
+        del(values)
+        del(used)
+    }
+}
+
 // `Vec<T>` is a growable array written against the context, as DESIGN D13
 // asks: the storage comes from `make` and goes back with `del`, and nothing
 // here is a builtin.

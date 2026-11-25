@@ -1,0 +1,46 @@
+package main
+
+// The prelude's `HashMap<K, V>`: an open-addressing table in three views from
+// the context — keys, values, `used` bits — probed by the builtin `hash`,
+// doubled past half-full, written in Dux and nowhere in the builtins.
+
+fn main() {
+    bag := HashMap<string, i32>.new()
+    println($"fresh={} {}", bag.len(), bag.is_empty())
+    bag.insert("hp", 30)
+    bag.insert("mp", 10)
+    bag.insert("hp", 44)
+    println(
+        $"len={} hp={} mp={} missing={}",
+        bag.len(),
+        bag.get("hp").unwrap_or(0),
+        bag.get("mp").unwrap_or(0),
+        bag.get("xp").unwrap_or(-1))
+    println($"has={} {}", bag.has("mp"), bag.has("xp"))
+
+    many := HashMap<i32, i32>.new()
+    at: i32 = 0
+    while at < 100 {
+        many.insert(at, 1000 + at)
+        at += 1
+    }
+    println($"grown={}", many.len())
+    bad: i32 = 0
+    probe: i32 = 0
+    while probe < 100 {
+        if Some(v) := many.get(probe) {
+            if v != 1000 + probe {
+                bad += 1
+            }
+        } else {
+            bad += 1
+        }
+        probe += 1
+    }
+    println($"all_there={} missing={}", bad == 0, many.get(100).is_none())
+
+    bag.clear()
+    println($"cleared={} {}", bag.len(), bag.has("hp"))
+    bag.destroy()
+    many.destroy()
+}

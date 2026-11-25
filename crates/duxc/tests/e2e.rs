@@ -325,6 +325,30 @@ fn duxc_check(path: &Path) -> Run {
 }
 
 #[test]
+fn the_generics_example_is_the_m5_proof_that_runs() {
+    let path = Path::new(EXAMPLE_DIR).join("generics.dux");
+    let scratch = Path::new(SCRATCH_DIR).join("generics-example");
+    let _ = std::fs::remove_dir_all(&scratch);
+    let output = Command::new(env!("CARGO_BIN_EXE_duxc"))
+        .arg("run")
+        .arg(&path)
+        .arg("--out-dir")
+        .arg(&scratch)
+        .output()
+        .expect("duxc is runnable");
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "7\n2.5\n9\npair=1 one grid0=0\nright 42\nsum=6 hp=30 mp=10 keys=2\n"
+    );
+}
+
+#[test]
 fn no_example_hangs_or_panics_the_compiler() {
     for entry in std::fs::read_dir(EXAMPLE_DIR).expect("example/ exists") {
         let path = entry.expect("readable entry").path();
