@@ -415,6 +415,30 @@ impl Typed {
     }
 }
 
+/// The subject a `match` is taking apart, whether its arms make a value, and
+/// where those arms meet.
+struct Matching<'a> {
+    ty: DuxType,
+    place: PointerValue<'a>,
+    value: bool,
+    join: Join<'a>,
+}
+
+/// One arm a `switch` reaches: the tag that lands here, the arm it belongs to,
+/// and the names its pattern binds, with where each sits in the payload.
+struct Case {
+    tag: u64,
+    arm: usize,
+    bindings: Vec<(String, DuxType, u64)>,
+}
+
+/// A whole `match` as one `switch` on the tag.
+struct Dispatch {
+    cases: Vec<Case>,
+    /// The `_` or `else` arm, when the `match` has one.
+    default: Option<usize>,
+}
+
 /// Where the arms of a `match` meet: the block they branch to, the type they
 /// agreed on, and the values that arrive there.
 struct Join<'a> {
@@ -2090,48 +2114,22 @@ impl Emitter {
         let place = self.alloca(ty, "match");
         self.put_in(place, held, span)?;
 
-        let mut join = Join {
-            block: self.new_block("match.end"),
-            agreed: expected,
-            carried: Vec::new(),
-            broken: false,
+        let mut work = Matching {
+            ty,
+            place,
+            value,
+            join: Join {
+                block: self.new_block("match.end"),
+                agreed: expected,
+                carried: Vec::new(),
+                broken: false,
+            },
         };
-        let mut rest = self.new_block("match.test");
-        self.br(rest);
-        for arm in arms {
-            self.builder.position_at_end(rest);
-            self.dead = false;
-            let body = self.new_block("match.arm");
-            let next = self.new_block("match.next");
-            let entered = if arm.guard.is_some() {
-                self.new_block("match.guard")
-            } else {
-                body
-            };
-            let mut bound = Vec::new();
-            self.pattern_holds(module, &arm.pattern, ty, place, entered, next, &mut bound);
-            self.builder.position_at_end(entered);
-            self.dead = false;
-            self.scopes.push(HashMap::new());
-            self.declare_bindings(&bound);
-            if let Some(guard) = &arm.guard {
-                let mut bound = bound.clone();
-                let test = self.condition_bound(module, guard, &mut bound);
-                self.declare_bindings(&bound);
-                let _ = self.builder.build_conditional_branch(test, body, next);
-                self.builder.position_at_end(body);
-                self.dead = false;
-            }
-            self.arm_arrives(module, arm, value, &mut join);
-            rest = next;
+        match self.dispatch_for(arms, ty) {
+            Some(dispatch) => self.arms_by_switch(module, &dispatch, arms, &mut work)?,
+            None => self.arms_by_chain(module, arms, &mut work)?,
         }
-
-        // DESIGN 4.4: a `match` that is not exhaustive is an error, so an arm
-        // always matches and the chain never runs out. A hole in that rule is a
-        // compiler bug, and a bug should say so rather than run on.
-        self.builder.position_at_end(rest);
-        self.dead = false;
-        self.trap(module, "dux: no `match` arm matched\n");
+        let join = work.join;
 
         self.builder.position_at_end(join.block);
         self.dead = false;
@@ -2173,6 +2171,250 @@ impl Emitter {
         Some(typed_of(phi.as_basic_value(), common))
     }
 
+    /// Plan the `switch` DESIGN asks the backend for, when a `switch` can say
+    /// this `match`: every arm is one variant of the subject's own enum, named
+    /// once, and nothing below the variant tests anything — the tag has already
+    /// answered, so the arm only has names to fill. A guard, a literal, a
+    /// range, an alternative, a second arm for the same variant, or a variant
+    /// taken apart beyond the names it binds is beyond a `switch`, and such a
+    /// `match` is the chain of tests instead.
+    fn dispatch_for(&self, arms: &[dux_ast::MatchArm], ty: DuxType) -> Option<Dispatch> {
+        let info = self.enum_of(ty)?;
+        if info.niche.is_some() {
+            return None;
+        }
+        let mut cases: Vec<Case> = Vec::new();
+        let mut default: Option<usize> = None;
+        for (position, arm) in arms.iter().enumerate() {
+            if arm.guard.is_some() {
+                return None;
+            }
+            match &arm.pattern {
+                dux_ast::Pattern::Wildcard { .. } | dux_ast::Pattern::Else { .. } => {
+                    if position + 1 != arms.len() {
+                        return None;
+                    }
+                    default = Some(position);
+                }
+                other => {
+                    let (qualifier, name) = match other {
+                        dux_ast::Pattern::Name { name, .. } => (None, name.name.as_str()),
+                        dux_ast::Pattern::Path { qualifier, name, .. } => {
+                            (Some(qualifier.as_str()), name.as_str())
+                        }
+                        dux_ast::Pattern::Tuple { qualifier, name, .. } => {
+                            (qualifier.as_deref(), name.as_str())
+                        }
+                        dux_ast::Pattern::Struct { qualifier, name, .. } => {
+                            (qualifier.as_deref(), name.as_str())
+                        }
+                        _ => return None,
+                    };
+                    let (index, variant) = self.variant_of(ty, qualifier, name)?;
+                    if cases.iter().any(|case| case.tag == index as u64) {
+                        return None;
+                    }
+                    let bindings = self.names_below(other, variant)?;
+                    cases.push(Case {
+                        tag: index as u64,
+                        arm: position,
+                        bindings,
+                    });
+                }
+            }
+        }
+        Some(Dispatch { cases, default })
+    }
+
+    /// The names a `switch` arm binds, each with the type it binds and where it
+    /// sits. `None` says the pattern reaches past a name — a variant inside a
+    /// variant, a literal, a range — and that is a test, which a `switch` arm
+    /// does not make.
+    fn names_below(
+        &self,
+        pattern: &dux_ast::Pattern,
+        variant: &VariantInfo,
+    ) -> Option<Vec<(String, DuxType, u64)>> {
+        let field_at = |name: &str| -> Option<(DuxType, u64)> {
+            let position = variant.fields.iter().position(|(known, _)| *known == name)?;
+            let (_, ty) = variant.fields[position];
+            Some((ty, *variant.offsets.get(position)?))
+        };
+        match pattern {
+            dux_ast::Pattern::Wildcard { .. } | dux_ast::Pattern::Else { .. } => Some(Vec::new()),
+            dux_ast::Pattern::Name { .. } | dux_ast::Pattern::Path { .. }
+                if variant.fields.is_empty() =>
+            {
+                Some(Vec::new())
+            }
+            dux_ast::Pattern::Tuple { elements, .. } if elements.len() == variant.fields.len() => {
+                let mut names = Vec::new();
+                for (position, element) in elements.iter().enumerate() {
+                    let (_, ty) = variant.fields[position];
+                    let offset = *variant.offsets.get(position)?;
+                    names.extend(self.names_under(element, ty, offset)?);
+                }
+                Some(names)
+            }
+            dux_ast::Pattern::Struct { fields, rest, .. } => {
+                if !fields.is_empty() && !*rest && fields.len() != variant.fields.len() {
+                    return None;
+                }
+                let mut names = Vec::new();
+                for field in fields {
+                    match field {
+                        dux_ast::FieldPattern::Shorthand { name, .. } => {
+                            let (ty, offset) = field_at(name.name.as_str())?;
+                            names.push((name.name.clone(), ty, offset));
+                        }
+                        dux_ast::FieldPattern::Nested { name, pattern, .. } => {
+                            let (ty, offset) = field_at(name.name.as_str())?;
+                            names.extend(self.names_under(pattern, ty, offset)?);
+                        }
+                    }
+                }
+                Some(names)
+            }
+            _ => None,
+        }
+    }
+
+    /// One pattern under a field: a name, or nothing.
+    fn names_under(
+        &self,
+        pattern: &dux_ast::Pattern,
+        ty: DuxType,
+        offset: u64,
+    ) -> Option<Vec<(String, DuxType, u64)>> {
+        match pattern {
+            dux_ast::Pattern::Wildcard { .. } | dux_ast::Pattern::Else { .. } => Some(Vec::new()),
+            dux_ast::Pattern::Name { name, .. }
+                if self.variant_of(ty, None, &name.name).is_none() =>
+            {
+                Some(vec![(name.name.clone(), ty, offset)])
+            }
+            _ => None,
+        }
+    }
+
+    /// The arms, tested one after another in the order they are written. This
+    /// is the general lowering: it can say whatever a pattern says.
+    fn arms_by_chain(
+        &mut self,
+        module: &Module<'static>,
+        arms: &[dux_ast::MatchArm],
+        work: &mut Matching<'static>,
+    ) -> Option<()> {
+        let mut rest = self.new_block("match.test");
+        self.br(rest);
+        for arm in arms {
+            self.builder.position_at_end(rest);
+            self.dead = false;
+            let body = self.new_block("match.arm");
+            let next = self.new_block("match.next");
+            let entered = if arm.guard.is_some() {
+                self.new_block("match.guard")
+            } else {
+                body
+            };
+            let mut bound = Vec::new();
+            self.pattern_holds(module, &arm.pattern, work.ty, work.place, entered, next, &mut bound);
+            self.builder.position_at_end(entered);
+            self.dead = false;
+            self.scopes.push(HashMap::new());
+            self.declare_bindings(&bound);
+            if let Some(guard) = &arm.guard {
+                let mut bound = bound.clone();
+                let test = self.condition_bound(module, guard, &mut bound);
+                self.declare_bindings(&bound);
+                let _ = self.builder.build_conditional_branch(test, body, next);
+                self.builder.position_at_end(body);
+                self.dead = false;
+            }
+            self.arm_arrives(module, arm, work);
+            rest = next;
+        }
+
+        // DESIGN 4.4: a `match` that is not exhaustive is an error, so an arm
+        // always matches and the chain never runs out. A hole in that rule is a
+        // compiler bug, and a bug should say so rather than run on.
+        self.builder.position_at_end(rest);
+        self.dead = false;
+        self.trap(module, "dux: no `match` arm matched\n");
+        Some(())
+    }
+
+    /// Read the tag once, jump to the arm its value names, and bind the fields
+    /// that arm asked for. Where the tags are dense LLVM answers with a jump
+    /// table, which is what a command loop with thirty variants is for. A tag
+    /// no case names is the trap the chain ends in, because the checker said
+    /// there is no such tag.
+    fn arms_by_switch(
+        &mut self,
+        module: &Module<'static>,
+        dispatch: &Dispatch,
+        arms: &[dux_ast::MatchArm],
+        work: &mut Matching<'static>,
+    ) -> Option<()> {
+        let info = self.enum_of(work.ty)?;
+        let here = self.builder.get_insert_block()?;
+        let mut blocks = Vec::new();
+        for _ in &dispatch.cases {
+            blocks.push(self.new_block("match.arm"));
+        }
+        let default = match dispatch.default {
+            Some(arm) => (self.new_block("match.arm"), Some(arm)),
+            None => {
+                let block = self.new_block("match.trap");
+                self.builder.position_at_end(block);
+                self.dead = false;
+                self.trap(module, "dux: no `match` arm matched\n");
+                self.builder.position_at_end(here);
+                (block, None)
+            }
+        };
+        let tag = self
+            .builder
+            .build_load(info.tag, self.byte_at(work.place, info.tag_at), "tag")
+            .ok()?
+            .into_int_value();
+        let cases: Vec<(IntValue<'static>, BasicBlock<'static>)> = dispatch
+            .cases
+            .iter()
+            .zip(&blocks)
+            .map(|(case, block)| (info.tag.const_int(case.tag, false), *block))
+            .collect();
+        let _ = self.builder.build_switch(tag, default.0, &cases).ok()?;
+        for (case, block) in dispatch.cases.iter().zip(&blocks) {
+            self.enter_arm(module, *block, &arms[case.arm], &case.bindings, work);
+        }
+        if let Some(arm) = default.1 {
+            self.enter_arm(module, default.0, &arms[arm], &[], work);
+        }
+        Some(())
+    }
+
+    /// The arm a `switch` jumped to: its names, then its body.
+    fn enter_arm(
+        &mut self,
+        module: &Module<'static>,
+        block: BasicBlock<'static>,
+        arm: &dux_ast::MatchArm,
+        bindings: &[(String, DuxType, u64)],
+        work: &mut Matching<'static>,
+    ) {
+        self.builder.position_at_end(block);
+        self.dead = false;
+        self.scopes.push(HashMap::new());
+        let mut bound = Vec::new();
+        for (name, field, offset) in bindings {
+            let at = self.byte_at(work.place, *offset);
+            self.bind_pattern(name, *field, at, &mut bound);
+        }
+        self.declare_bindings(&bound);
+        self.arm_arrives(module, arm, work);
+    }
+
     /// Run the arm that matched, and bring whatever it produces to the place
     /// where the arms meet. The arm's scope is pushed and its names bound
     /// before this runs; an arm that leaves by `return` brings nothing.
@@ -2180,9 +2422,10 @@ impl Emitter {
         &mut self,
         module: &Module<'static>,
         arm: &dux_ast::MatchArm,
-        value: bool,
-        join: &mut Join<'static>,
+        work: &mut Matching<'static>,
     ) {
+        let value = work.value;
+        let join = &mut work.join;
         let outcome = self.match_body(module, &arm.body, join.agreed);
         let ended = self.builder.get_insert_block();
         self.scopes.pop();

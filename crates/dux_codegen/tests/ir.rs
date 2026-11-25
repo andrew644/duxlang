@@ -1270,13 +1270,18 @@ fn a_match_switches_on_the_tag_and_meets_its_arms_at_one_phi() {
     let ir = build(SHAPES).expect("builds").ir_text();
     assert!(
         ir.contains("%tag = load i16"),
-        "the first arm tests the tag:\n{ir}"
+        "the tag is read once, and it decides everything:\n{ir}"
     );
     assert!(
-        ir.contains("icmp eq i16 %tag, 0")
-            && ir.contains("icmp eq i16 %tag5, 1")
-            && ir.contains("icmp eq i16 %tag16, 2"),
-        "the arms are tried in the order they are written:\n{ir}"
+        ir.contains("switch i16 %tag, label %match.trap [")
+            && ir.contains("i16 0, label %match.arm")
+            && ir.contains("i16 1, label %match.arm1")
+            && ir.contains("i16 2, label %match.arm2"),
+        "DESIGN 4.4: one switch on the tag, one block per arm:\n{ir}"
+    );
+    assert!(
+        !ir.contains("icmp eq i16"),
+        "and no arm asks the tag whether it is its own:\n{ir}"
     );
     assert!(
         ir.contains("%matchtmp = phi float"),
@@ -1284,7 +1289,41 @@ fn a_match_switches_on_the_tag_and_meets_its_arms_at_one_phi() {
     );
     assert!(
         ir.contains("call void @dux.runtime.trap("),
-        "and the chain that cannot run out says so where it could:\n{ir}"
+        "and the tag no arm names — which the checker forbids — says so:\n{ir}"
+    );
+}
+
+#[test]
+fn an_arm_a_switch_cannot_say_is_still_tried_in_its_order() {
+    let ir = build(
+        "package main
+enum Shape {
+    Circle(f32),
+    Rect { w: f32, h: f32 },
+    Empty,
+}
+fn side(s: Shape) -> f32 {
+    return match s {
+        Shape::Rect { w, h } if w > h => w,
+        Shape::Rect { w, h } => h,
+        Shape::Circle(r) => r,
+        Shape::Empty => 0.0,
+    }
+}
+fn main() {
+    s := Shape::Rect { w: 3.0, h: 4.0 }
+    println($\"{}\", side(s))
+}",
+    )
+    .expect("builds")
+    .ir_text();
+    assert!(
+        ir.matches("icmp eq i16").count() >= 4 && ir.contains("br i1 %holds"),
+        "a guard, or the same variant twice, is beyond a switch:\n{ir}"
+    );
+    assert!(
+        !ir.contains("switch i16"),
+        "so every arm tests the tag in the order it is written:\n{ir}"
     );
 }
 
