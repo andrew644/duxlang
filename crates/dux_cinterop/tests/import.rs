@@ -144,8 +144,12 @@ fn the_mapping_table_crosses_what_it_promises() {
     assert!(!text.contains("struct bits"), "bitfields wait:\n{text}");
     assert!(!text.contains("union score"), "unions wait:\n{text}");
     assert!(
-        !text.contains("struct hidden"),
-        "opaque has no body to write:\n{text}"
+        text.contains("struct hidden {}"),
+        "an opaque record gets the empty body it deserves:\n{text}"
+    );
+    assert!(
+        text.contains("type hidden_t = hidden"),
+        "the typedef names a record that now exists:\n{text}"
     );
     assert!(
         !text.contains("dux_counter"),

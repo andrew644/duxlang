@@ -74,6 +74,7 @@ name = "dux_driver"
 version = "0.1.0"
 dependencies = [
  "dux_ast",
+ "dux_cinterop",
  "dux_codegen",
  "dux_diag",
  "dux_hir",

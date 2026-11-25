@@ -1,6 +1,6 @@
 fn main() {
     let decls = dux_cinterop::import(&dux_cinterop::Import {
-        header: "mini.h".to_string(),
+        header: std::env::args().nth(1).unwrap_or_else(|| "mini.h".to_string()),
         flags: Vec::new(),
         include_paths: vec![format!(
             "{}/tests/fixtures",

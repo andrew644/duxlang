@@ -42,3 +42,13 @@ extern int dux_counter;
 #define DUX_TAG "dux"
 #define DUX_PAGES (4 * 1024)
 #define DUX_DOUBLED(x) ((x) * 2)
+
+int dux_anon(int, int);
+
+union counter {
+    struct {
+        int low;
+        int high;
+    };
+    long whole;
+};

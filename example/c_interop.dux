@@ -51,6 +51,7 @@ fn main() {
         Some(h) => {
             cs.fprintf(h, c"saved at {} seconds\n", secs)     // varargs, callable directly
             cs.fclose(h)
+            ()
         }
         None => println("could not open slot.txt"),
     }

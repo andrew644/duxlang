@@ -314,6 +314,12 @@ impl Ty {
         if *self == Ty::Ptr && *to == Ty::Str {
             return true;
         }
+        // A pointer fits into its own `Option` through the null niche: every
+        // address stays an address, and NULL newly means "nothing". That is
+        // the whole reason `Option<*T>` is the C pointer shape.
+        if *self == Ty::Ptr && option_of_pointer(to) {
+            return true;
+        }
         // An array is a slice that knows its own length, so borrowing its
         // elements as a view loses nothing.
         if let (Ty::Array(element), Ty::Slice(want)) = (self, to) {
@@ -1261,6 +1267,7 @@ impl<'a> Checker<'a> {
                 let on_the_numeric_lattice = (from.is_numeric() && to.is_numeric())
                     || (from == Ty::Ptr && *to == Ty::Str)
                     || (from.is_pointer() && to.is_pointer())
+                    || (from.is_pointer() && option_of_pointer(to))
                     || matches!((&from, to), (Ty::Array(element), Ty::Slice(want)) if element == want);
                 if !on_the_numeric_lattice {
                     self.mismatch(span, to, &value);

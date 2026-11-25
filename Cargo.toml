@@ -30,4 +30,5 @@ dux_ast = { path = "crates/dux_ast" }
 dux_parser = { path = "crates/dux_parser" }
 dux_hir = { path = "crates/dux_hir" }
 dux_codegen = { path = "crates/dux_codegen" }
+dux_cinterop = { path = "crates/dux_cinterop" }
 inkwell = { version = "0.11.0", default-features = false, features = ["llvm23-1"] }

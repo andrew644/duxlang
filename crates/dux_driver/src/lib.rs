@@ -78,6 +78,11 @@ pub fn analyze(path: &std::path::Path) -> Result<Analyzed, Failure> {
     // wrote, so `import "std/math"` makes `math.sqrt` mean something.
     let mut imported = load_imports(path, &mut sources, &mut program, &mut diagnostics);
     program.decls.append(&mut imported);
+    // A `#[c_include("...")] mod ns;` keeps its promise the slow way: the
+    // header is read here, once, and the namespace fills with the Dux
+    // declarations the mapping table writes. From this point the importer's
+    // output travels the same road as any other module body, because it is.
+    fill_c_modules(path, &mut sources, &mut program, &mut diagnostics);
     let syntax_clean = diagnostics
         .iter()
         .all(|d| d.severity != Severity::Error || d.code == code::UNSUPPORTED_IN_BUILD);
@@ -476,6 +481,107 @@ fn link(artifact: &BuiltArtifact, libraries: &[String]) -> Result<(), Failure> {
     Ok(())
 }
 
+/// The libraries a `#[c_pkgconfig("name")]` asks pkg-config for. The flags
+/// are the tool's answer, not ours to invent; a missing pkg-config or a
+/// missing package is the diagnostic, not a silent shrug.
+fn pkg_config(package: &str, mode: &str) -> Result<Vec<String>, Diagnostic> {
+    let tool = std::env::var("DUX_PKG_CONFIG").unwrap_or_else(|_| "pkg-config".to_string());
+    let output = std::process::Command::new(&tool)
+        .arg(format!("--{mode}"))
+        .arg(package)
+        .output()
+        .map_err(|e| {
+            Diagnostic::error(
+                code::LINK_FAILED,
+                format!("cannot run `{tool}` for `{package}`: {e}"),
+            )
+        })?;
+    if !output.status.success() {
+        return Err(Diagnostic::error(
+            code::LINK_FAILED,
+            format!(
+                "`{tool} --{mode} {package}` failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            ),
+        ));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout)
+        .split_whitespace()
+        .map(|token| token.to_string())
+        .collect())
+}
+
+/// Every `#[c_include]` namespace in the program, filled with the Dux the
+/// C mapping table writes for its header.
+fn fill_c_modules(
+    entry: &Path,
+    sources: &mut SourceMap,
+    program: &mut Program,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    let home = entry
+        .parent()
+        .map(|dir| dir.to_path_buf())
+        .unwrap_or_else(|| PathBuf::from("."));
+    for decl in &mut program.decls {
+        let Decl::Module(module) = decl else {
+            continue;
+        };
+        let header = module
+            .attributes
+            .iter()
+            .find(|attribute| attribute.name == "c_include")
+            .and_then(|attribute| attribute.string_argument())
+            .map(|header| header.to_string());
+        let Some(header) = header else {
+            continue;
+        };
+        let mut flags: Vec<String> = module
+            .attributes
+            .iter()
+            .filter(|attribute| attribute.name == "c_flag")
+            .filter_map(|attribute| attribute.string_argument())
+            .map(|flag| flag.to_string())
+            .collect();
+        let mut include_paths = vec![home.to_string_lossy().into_owned()];
+        for package in module
+            .attributes
+            .iter()
+            .filter(|attribute| attribute.name == "c_pkgconfig")
+            .filter_map(|attribute| attribute.string_argument())
+        {
+            match pkg_config(package, "cflags") {
+                Ok(tokens) => {
+                    for token in tokens {
+                        if let Some(dir) = token.strip_prefix("-I") {
+                            include_paths.push(dir.to_string());
+                        } else if token.starts_with("-D") {
+                            flags.push(token);
+                        }
+                    }
+                }
+                Err(diagnostic) => diagnostics.push(diagnostic),
+            }
+        }
+        match dux_cinterop::import(&dux_cinterop::Import {
+            header: header.clone(),
+            flags,
+            include_paths,
+        }) {
+            Ok(declarations) => {
+                let text = dux_cinterop::spell(&declarations);
+                let id = sources.add(format!("<c_import {header}>"), text);
+                let lexed = dux_lexer::lex(sources, id);
+                diagnostics.extend(lexed.diagnostics);
+                let parsed = parse(sources, &lexed.tokens);
+                diagnostics.extend(parsed.diagnostics);
+                module.decls = parsed.program.decls;
+            }
+            Err(failure) => diagnostics.extend(failure),
+        }
+    }
+}
+
 /// The libraries the program's `extern` blocks asked for, in the order they
 /// were declared and named once each.
 fn libraries(program: &Program) -> Vec<String> {
@@ -494,6 +600,33 @@ fn libraries(program: &Program) -> Vec<String> {
                 };
                 if key == "name" && !named.iter().any(|known| known == value) {
                     named.push(value.clone());
+                }
+            }
+        }
+    }
+    for entry in program.scoped() {
+        let Decl::Module(module) = entry.decl else {
+            continue;
+        };
+        for attribute in &module.attributes {
+            if attribute.name == "c_link" {
+                if let Some(library) = attribute.string_argument() {
+                    if !named.iter().any(|known| known == library) {
+                        named.push(library.to_string());
+                    }
+                }
+            }
+            if attribute.name == "c_pkgconfig" {
+                if let Some(package) = attribute.string_argument() {
+                    if let Ok(tokens) = pkg_config(package, "libs") {
+                        for token in tokens {
+                            if let Some(library) = token.strip_prefix("-l") {
+                                if !named.iter().any(|known| known == library) {
+                                    named.push(library.to_string());
+                                }
+                            }
+                        }
+                    }
                 }
             }
         }

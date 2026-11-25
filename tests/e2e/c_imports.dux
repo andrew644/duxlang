@@ -1,0 +1,27 @@
+package main
+//@stderr_empty
+// The importer, wired: `#[c_include] mod ns;` asks libclang what a header
+// says, and the namespace fills with the Dux the mapping table writes.
+// `math.h` speaks `c_double`, which is not `f64` (D18) until `as` says so;
+// the local demo header brings a typedef, a struct, an enum and a constant
+// across the same road.
+
+#[c_include("math.h")]
+#[c_link("m")]
+mod cm;
+
+#[c_include("stdlib.h")]
+mod cs;
+
+#[c_include("cdemo.h")]
+mod demo;
+
+fn main() {
+    root: f64 = cm.sqrt(16.0) as f64
+    println($"sqrt={}", root)
+    println($"abs={}", cs.abs(-7))
+    println($"limit={}", demo.CDEMO_LIMIT)
+    println($"green={}", demo.SH_GREEN)
+    p := demo.pair { a: 3, b: 4 }
+    println($"pair={}", p.a + p.b)
+}

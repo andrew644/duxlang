@@ -15,7 +15,7 @@ each remaining gap is waiting for. A gap is a milestone, never a verdict.
 | `sum_types.dux` | compiles, runs; variants, payloads, guards, or-patterns, ranges and exhaustiveness all reach machine code, and the dispatch is the `switch` on the tag | — |
 | `option_result.dux` | the predeclared `Option`/`Result` lower and match today, and `std/prelude` now hands every program `unwrap_or`, `is_some` and `is_none` | `std/fs` (file reading over `extern`), `.bytes()`, `.trim()`, and `unwrap`, which stops the program (the panic runtime) |
 | `generics.dux` | compiles, runs — `max<i32>`, `Pair<i32, string>`, `Either<string, i32>` matched, `zeros<4>()`, `sum(&[1, 2, 3])`, and `HashMap<string, i32>` with `insert`, `get(..).unwrap_or(..)` and `len`, the table and the method being prelude Dux | — |
-| `c_interop.dux` | the hand-written half runs today — `extern "C"` with distinct `c_long` and `c_int`, `#[c_name]` symbol overrides, varargs called directly, `std/c` turning C text back into a `string` | the `#[c_include]` importer, `std/c.to_cstr`, `c_long_double` (M6) |
+| `c_interop.dux` | parses and checks today — the hand-written half runs (`extern "C"`, distinct `c_long` and `c_int`, `#[c_name]`, varargs, `std/c`), and `#[c_include]` now really reads: `stdio.h`, `time.h` and `stb_image.h` fill their namespaces through libclang, `#[c_link]` and `#[c_pkgconfig]` reach the linker | the translation unit compiled with clang (`static inline` and header-only definitions, M6), `c_long_double` |
 
 ## Deliberate runtime gaps today
 

@@ -262,6 +262,23 @@ fn a_string_crosses_the_boundary_as_its_bytes() {
 }
 
 #[test]
+fn an_extern_inside_a_module_is_called_by_module_and_links_by_symbol() {
+    let ir = build(
+        "package main\nmod c {\n    extern \"C\" {\n        fn strlen(s: *c_char) -> usize\n    }\n}\nfn main() {\n    text := \"dux\"\n    n := c.strlen(text)\n    println($\"{}\", n)\n}",
+    )
+    .expect("builds")
+    .ir_text();
+    assert!(
+        ir.contains("@strlen(ptr %view.data)"),
+        "the module qualifies the name in Dux, never in the object file:\n{ir}"
+    );
+    assert!(
+        !ir.contains("c.strlen"),
+        "the module path must not leak into the symbol:\n{ir}"
+    );
+}
+
+#[test]
 fn untyped_arithmetic_adopts_the_type_the_call_asks_for() {
     let ir = build(
         "package main\nfn take(n: usize) -> usize { return n }\nfn main() { page := take(4 * 1024) }",

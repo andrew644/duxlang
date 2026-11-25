@@ -711,7 +711,7 @@ impl<'a> Unit<'a> {
         }
     }
 
-    fn imported(decl: &'a FnDecl) -> Self {
+    fn imported(decl: &'a FnDecl, home: &str) -> Self {
         // `#[c_name("real_c_symbol")]` is the in-place fix for the symbol the
         // importer — or a linking scheme — would otherwise get wrong.
         let symbol = decl
@@ -724,6 +724,7 @@ impl<'a> Unit<'a> {
             })
             .unwrap_or_else(|| decl.name.name.clone());
         Self {
+            key: format!("{home}{}", decl.name.name),
             symbol,
             external: true,
             ..Self::function(decl)
@@ -785,6 +786,9 @@ pub(crate) struct Emitter {
     /// Where each function was declared, so lowering its body knows the module
     /// it was written in.
     home_of: HashMap<String, String>,
+    /// Where each `extern` function was written: a module's `sqrt` is called
+    /// as `ns.sqrt` and links as `sqrt`.
+    extern_home: HashMap<String, String>,
     /// Generic `fn` declarations, by name: the code each instantiation copies.
     generic_fns: HashMap<String, &'static FnDecl>,
     /// Methods of a generic `impl`, by `Pair.first`: the code each receiver
@@ -889,6 +893,7 @@ impl Emitter {
             generic_fns: HashMap::new(),
             home: String::new(),
             home_of: HashMap::new(),
+            extern_home: HashMap::new(),
             generic_methods: HashMap::new(),
             impl_params: HashMap::new(),
             generic_structs: HashMap::new(),
@@ -1048,7 +1053,12 @@ impl Emitter {
                 Decl::Global(decl) => self.declare_global(module, decl),
                 Decl::Extern(block) => {
                     for function in &block.functions {
-                        self.declare(module, &Unit::imported(function));
+                        let home = self
+                            .extern_home
+                            .get(&function.name.name)
+                            .cloned()
+                            .unwrap_or_default();
+                        self.declare(module, &Unit::imported(function, &home));
                     }
                 }
                 _ => {}
@@ -1130,6 +1140,17 @@ impl Emitter {
                 let owner = format!("{home}{}", block.type_name.name);
                 for method in &block.methods {
                     let key = format!("{owner}.{}", method.name.name);
+                    self.home_of.insert(key, home.to_string());
+                }
+            }
+            Decl::Extern(block) => {
+                // An extern block inside a module answers to the module from
+                // outside and to the C symbol itself at the link: the name
+                // lives in two places at once, so both get recorded.
+                for function in &block.functions {
+                    let key = format!("{home}{}", function.name.name);
+                    self.extern_home
+                        .insert(function.name.name.clone(), home.to_string());
                     self.home_of.insert(key, home.to_string());
                 }
             }
