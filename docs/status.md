@@ -65,9 +65,11 @@ each remaining gap is waiting for. A gap is a milestone, never a verdict.
   `dux.max.f64` — and not at all for a generic no call asked for. A parameter
   the call cannot say is said at the call, since nothing vaguer can be
   emitted in its place.
-- **An `impl` is for a named record.** `impl Pair<A, B> { … }` does not parse:
-  a method on a generic record needs its own instantiation story, and no
-  example asks for one yet.
+- **A method's own parameters are not there yet.** `impl Pair<A, B> { … }`
+  parses and each receiver that calls for a method gets that method emitted
+  in its own types (`dux.Cell.i32.shown`, `dux.Cell.string.shown`), but a
+  method written over parameters of its own, and an `impl` of a generic
+  `enum`, report E0007.
 - **Ranges are loop-only.** `0..3` exists as a `for .. in` iterable, not as a
   value.
 - **An interpolated hole holds no quotes.** `{f("x")}` does not lex; `{x}` and

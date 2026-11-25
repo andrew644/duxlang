@@ -562,6 +562,7 @@ impl<'a> Parser<'a> {
         let start = self.peek().span;
         self.bump();
         let type_name = self.expect_ident("the type an impl block extends");
+        let type_params = self.type_params();
         self.expect_punct(Punct::LBrace, "expected `{` to open the impl block");
         let mut methods = Vec::new();
         while !self.at_punct(Punct::RBrace) && !self.at_end() {
@@ -581,6 +582,7 @@ impl<'a> Parser<'a> {
         let end = self.expect_punct(Punct::RBrace, "expected `}` to close the impl block");
         ImplDecl {
             type_name,
+            type_params,
             methods,
             span: start.merge(end),
         }
@@ -2814,6 +2816,28 @@ mod tests {
             panic!("expected named type")
         };
         assert_eq!((name.as_str(), args.len()), ("HashMap", 2));
+    }
+
+    #[test]
+    fn an_impl_block_can_be_written_over_parameters() {
+        let (program, diagnostics) = parse_text(
+            "struct Pair<A, B> { first: A, second: B }\nimpl Pair<A, B> { fn first(self: Pair<A, B>) -> A { return self.first } }",
+        );
+        assert!(
+            diagnostics.is_empty(),
+            "an impl of a generic record is the same syntax it always was, plus its parameters: {diagnostics:?}"
+        );
+        let Decl::Impl(decl) = &program.decls[1] else {
+            panic!("an impl block")
+        };
+        assert_eq!(
+            (
+                decl.type_name.name.as_str(),
+                decl.type_params.len(),
+                decl.methods.len()
+            ),
+            ("Pair", 2, 1)
+        );
     }
 
     #[test]

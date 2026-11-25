@@ -190,8 +190,9 @@ impl Printer {
                 self.ty(&decl.aliased)
             ),
             Decl::Impl(decl) => {
+                let params = self.type_params(&decl.type_params);
                 if decl.methods.is_empty() {
-                    return format!("impl {} {{ }}", decl.type_name.name);
+                    return format!("impl {}{params} {{ }}", decl.type_name.name);
                 }
                 let body = decl
                     .methods
@@ -199,7 +200,10 @@ impl Printer {
                     .map(|method| self.function(method, level + 1, false))
                     .collect::<Vec<_>>()
                     .join("\n\n");
-                format!("impl {} {{\n{body}\n{p}}}", decl.type_name.name)
+                format!(
+                    "impl {}{params} {{\n{body}\n{p}}}",
+                    decl.type_name.name
+                )
             }
             Decl::Module(decl) => format!(
                 "{}mod {};",

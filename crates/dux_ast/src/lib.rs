@@ -653,6 +653,10 @@ pub struct TypeAliasDecl {
 #[derive(Clone, Debug, PartialEq)]
 pub struct ImplDecl {
     pub type_name: Ident,
+    /// The parameters of the type being extended: `impl Pair<A, B>`. A method
+    /// of such an impl is code that means something once a record says what
+    /// `A` and `B` are.
+    pub type_params: Vec<TypeParam>,
     pub methods: Vec<FnDecl>,
     pub span: Span,
 }

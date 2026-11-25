@@ -3,4 +3,7 @@ fact=120
 pair=1 one swapped=one 1
 tally=21 10
 head=top
+cell=9 1
+top=top hops=3
+only=1
 hops=3

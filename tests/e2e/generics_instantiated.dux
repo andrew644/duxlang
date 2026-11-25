@@ -40,6 +40,30 @@ fn head<T>(c: Cell<T>) -> T {
     return c.value
 }
 
+// A method of a generic `impl` is code the receiver completes: the `impl`
+// carries the parameters, and each receiver that calls for it says them.
+impl Cell<T> {
+    fn value(self: Cell<T>) -> T {
+        return self.value
+    }
+
+    fn hops(self: Cell<T>) -> i32 {
+        count: i32 = 1
+        cursor: Option<*Cell<T>> = self.next
+        while Some(cell) := cursor {
+            count += 1
+            cursor = cell.next
+        }
+        return count
+    }
+}
+
+impl Pair<A, B> {
+    fn only(self: Pair<A, B>) -> A {
+        return self.first
+    }
+}
+
 fn main() {
     println($"max={} {} {}", max(3, 7), max(2.5, 1.5), max<i64>(9, 4))
     println($"fact={}", fact<i64>(5))
@@ -49,10 +73,14 @@ fn main() {
     println($"pair={} {} swapped={} {}", p.first, p.second, q.first, q.second)
     println($"tally={} {}", tally<3>(7), tally<5>(2))
 
+    n := Cell<i32> { value: 9, next: None }
     tail := Cell<string> { value: "last", next: None }
     mid := Cell<string> { value: "mid", next: Some(&tail) }
     top := Cell<string> { value: "top", next: Some(&mid) }
     println($"head={}", head(top))
+    println($"cell={} {}", n.value(), n.hops())
+    println($"top={} hops={}", top.value(), top.hops())
+    println($"only={}", p.only())
     cursor: Option<*Cell<string>> = Some(&top)
     hops: i32 = 0
     while Some(cell) := cursor {

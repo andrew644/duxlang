@@ -1546,3 +1546,45 @@ fn main() {
         "and the function that exists is the one that was asked for:\n{ir}"
     );
 }
+
+#[test]
+fn a_method_of_a_generic_record_is_emitted_once_per_receiver() {
+    let ir = build(
+        r#"struct Cell<T> {
+    value: T,
+    next: Option<*Cell<T>>,
+}
+
+impl Cell<T> {
+    fn shown(self: Cell<T>, extra: T) -> T {
+        return self.value
+    }
+}
+
+fn main() {
+    n := Cell<i32> { value: 9, next: None }
+    s := Cell<string> { value: "nine", next: None }
+    a := n.shown(1)
+    b := s.shown("x")
+    println($"{a}")
+    println($"{b}")
+}
+"#,
+    )
+    .expect("a method of a generic impl is emitted at its receivers")
+    .ir_text();
+    assert!(
+        ir.contains(r#"define i32 @dux.Cell.i32.shown(%"Cell<i32>" %0, i32 %1)"#),
+        "the `i32` receiver gets an `i32` method: {ir}"
+    );
+    assert!(
+        ir.contains(
+            r#"define { ptr, i64 } @dux.Cell.string.shown(%"Cell<string>" %0, { ptr, i64 } %1)"#
+        ),
+        "the `string` receiver gets a `string` method, which is a different function: {ir}"
+    );
+    assert!(
+        !ir.contains("define i32 @dux.Cell.shown"),
+        "the method as written is code, not a function: {ir}"
+    );
+}

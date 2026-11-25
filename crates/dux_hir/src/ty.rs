@@ -12,7 +12,7 @@ use std::collections::{HashMap, HashSet};
 
 use dux_ast::{
     AssignOp, BinaryOp, Block, Decl, Expr, FieldPattern, ForKind, ImplDecl, MatchArm, Pattern,
-    Program, Stmt, Type, TypeAliasDecl, UnaryOp,
+    Param, Program, Stmt, Type, TypeAliasDecl, UnaryOp,
 };
 use crate::sums::{self, Payload, Shape};
 
@@ -124,6 +124,17 @@ impl Ty {
 
     /// The record a method call reaches through: a record itself, or the
     /// record a pointer aims at.
+    /// The record a value is, with the arguments it was made of. A record
+    /// written without arguments — which is all an `impl` of a generic record
+    /// can say — has none.
+    fn record(&self) -> Option<(&String, &[Ty])> {
+        match self {
+            Ty::Struct(name) => Some((name, &[])),
+            Ty::Instance { name, args } => Some((name, args)),
+            _ => None,
+        }
+    }
+
     fn record_owner(&self) -> Option<&String> {
         match self {
             Ty::Struct(name) | Ty::Instance { name, .. } => Some(name),
@@ -455,6 +466,19 @@ struct GenericRecord {
     fields: Vec<(String, Type)>,
 }
 
+/// A method of a generic `impl`. The `impl` carries the parameters, so the
+/// method's own signature only means something once a receiver says them.
+#[derive(Clone)]
+struct GenericMethod {
+    params: Vec<String>,
+    /// How the receiver was written, when there was one.
+    receiver: Option<Param>,
+    /// How the parameters after the receiver were written.
+    declared: Vec<Param>,
+    result: Option<Type>,
+    body: Block,
+}
+
 /// A `fn` written with type parameters, kept as it was written so every call
 /// can be read again with the arguments that call brought.
 #[derive(Clone)]
@@ -482,6 +506,8 @@ pub(crate) struct Checker<'a> {
     generic_structs: HashMap<String, GenericRecord>,
     /// Every generic `fn`, by name, as written.
     generic_functions: HashMap<String, GenericFunction>,
+    /// Methods of a generic `impl`, by the record they extend and their name.
+    generic_methods: HashMap<(String, String), GenericMethod>,
     /// The instantiation the body being checked is read under: a type
     /// parameter name means whatever this says it means.
     instantiation: Vec<(String, Ty)>,
@@ -506,6 +532,7 @@ impl<'a> Checker<'a> {
             structs: HashMap::new(),
             generic_structs: HashMap::new(),
             generic_functions: HashMap::new(),
+            generic_methods: HashMap::new(),
             instantiation: Vec::new(),
             read_instantiations: HashSet::new(),
             aliases: HashMap::new(),
@@ -924,23 +951,39 @@ impl<'a> Checker<'a> {
             .collect::<Vec<_>>()
             .join(", ");
         let asked = format!("{name}<{arguments}>");
-        if !self.read_instantiations.insert(asked.clone()) {
-            return;
-        }
         let program = self.program;
         let Some(declaration) = program.find_function(name) else {
             return;
         };
-        let mut locals = Vec::new();
-        for param in &declaration.params {
-            let ty = self.resolve_type(&param.ty);
-            locals.push((param.name.name.clone(), ty));
-        }
         let result = declaration
             .return_ty
             .as_ref()
             .map(|ty| self.resolve_type(ty))
             .unwrap_or(Ty::Unit);
+        self.read_body(&declaration.params, &result, &declaration.body, &asked, name, span);
+    }
+
+    /// Read a body once in the types one thing asked it to be, so a body that
+    /// does not work out for them is said where they were asked for. The
+    /// parameters are already read through the substitution in hand.
+    fn read_body(
+        &mut self,
+        declared: &[Param],
+        result: &Ty,
+        body: &Block,
+        asked: &str,
+        name: &str,
+        span: Span,
+    ) {
+        if !self.read_instantiations.insert(asked.to_string()) {
+            return;
+        }
+        let mut locals = Vec::new();
+        for param in declared {
+            let ty = self.resolve_type(&param.ty);
+            locals.push((param.name.name.clone(), ty));
+        }
+        let result = result.clone();
         let said: Vec<(&'static str, String, u32)> = self
             .diagnostics
             .iter()
@@ -959,7 +1002,7 @@ impl<'a> Checker<'a> {
                 });
             }
         }
-        self.block(&declaration.body);
+        self.block(body);
         self.scopes.pop();
         self.result = saved_result;
         self.in_main = saved_main;
@@ -1157,27 +1200,60 @@ impl<'a> Checker<'a> {
                 let other = other.clone();
                 self.coerce(Ty::FloatConst(*literal), &other, span)
             }
+            (left, right) if left.record().is_some() && right.record().is_some() => {
+                let (Some((left_name, left_args)), Some((right_name, right_args))) =
+                    (a.record(), b.record())
+                else {
+                    return self.disagree(&a, &b, span, what);
+                };
+                if left_name != right_name || left_args.len() != right_args.len() {
+                    return self.disagree(&a, &b, span, what);
+                }
+                // `impl Pair<A, B>` can only ever say `Pair`, so a record
+                // whose arguments were never said takes whatever the other
+                // side says it was made of.
+                if left_args.is_empty() {
+                    return b;
+                }
+                if right_args.is_empty() {
+                    return a;
+                }
+                let mut args = Vec::new();
+                for (left, right) in left_args.iter().zip(right_args) {
+                    let (left, right) = (left.clone(), right.clone());
+                    args.push(self.meet(left, right, span, what));
+                }
+                Ty::Instance {
+                    name: left_name.clone(),
+                    args,
+                }
+            }
             _ => {
                 let a = a.defaulted();
                 let b = b.defaulted();
                 if a == b {
                     a
                 } else {
-                    self.report(
-                        span,
-                        Diagnostic::error(
-                            code::TYPE_MISMATCH,
-                            format!(
-                                "the arms of {what} must agree: `{}` vs `{}`",
-                                a.name(),
-                                b.name()
-                            ),
-                        ),
-                    );
-                    Ty::Opaque
+                    self.disagree(&a, &b, span, what)
                 }
             }
         }
+    }
+
+    /// Two things that were asked to agree and did not.
+    fn disagree(&mut self, a: &Ty, b: &Ty, span: Span, what: &str) -> Ty {
+        self.report(
+            span,
+            Diagnostic::error(
+                code::TYPE_MISMATCH,
+                format!(
+                    "the arms of {what} must agree: `{}` vs `{}`",
+                    a.name(),
+                    b.name()
+                ),
+            ),
+        );
+        Ty::Opaque
     }
 
     // ------------------------------------------------------------- operators
@@ -2660,6 +2736,10 @@ impl<'a> Checker<'a> {
                 }
             }
             if let Some(owner) = base.record_owner() {
+                let key = (owner.clone(), name.name.clone());
+                if let Some(generic) = self.generic_methods.get(&key).cloned() {
+                    return self.generic_method(&base, &key, &generic, args, span);
+                }
                 if let Some(signature) = self
                     .methods
                     .get(&(owner.clone(), name.name.clone()))
@@ -2709,6 +2789,68 @@ impl<'a> Checker<'a> {
         Ty::Opaque
     }
 
+    /// A method of a generic `impl`, at the receiver that called for it. The
+    /// receiver says what the parameters are, and the signature the call sees
+    /// is the one that was written with those answers put in their place.
+    fn generic_method(
+        &mut self,
+        base: &Ty,
+        key: &(String, String),
+        generic: &GenericMethod,
+        args: &[Expr],
+        span: Span,
+    ) -> Ty {
+        // The receiver may arrive as a value or as a pointer to one; either
+        // way it is a record and it says what the parameters are.
+        let seen = base.target().unwrap_or(base);
+        let Some((_, given)) = seen.record() else {
+            for argument in args {
+                let _ = self.infer(argument);
+            }
+            return Ty::Opaque;
+        };
+        if given.len() != generic.params.len() {
+            return Ty::Opaque;
+        }
+        let saved = std::mem::take(&mut self.instantiation);
+        self.instantiation = generic
+            .params
+            .iter()
+            .zip(given)
+            .map(|(param, given)| (param.clone(), given.clone()))
+            .collect();
+        let arguments = given.iter().map(|ty| ty.name()).collect::<Vec<_>>().join(", ");
+        let asked = format!("{}<{arguments}>.{}", key.0, key.1);
+        let mut params = Vec::new();
+        for param in &generic.declared {
+            params.push(self.resolve_type(&param.ty));
+        }
+        let result = generic
+            .result
+            .as_ref()
+            .map(|ty| self.resolve_type(ty))
+            .unwrap_or(Ty::Unit);
+        let outcome = self.call_signature(
+            &Signature {
+                params,
+                result: result.clone(),
+                check_arguments: true,
+            },
+            args,
+            span,
+        );
+        // The body reads the receiver by name, so the reading of it starts
+        // with the receiver bound, as `function` does.
+        let mut read = Vec::new();
+        if let Some(receiver) = &generic.receiver {
+            read.push(receiver.clone());
+        }
+        read.extend(generic.declared.iter().cloned());
+        self.read_body(&read, &result, &generic.body, &asked, &format!("{}.{}", key.0, key.1), span);
+        self.instantiation = saved;
+        outcome
+    }
+
     fn call_signature(&mut self, signature: &Signature, args: &[Expr], span: Span) -> Ty {
         if signature.check_arguments && signature.params.len() == args.len() {
             for (argument, param) in args.iter().zip(&signature.params) {
@@ -2756,9 +2898,16 @@ impl<'a> Checker<'a> {
     }
 
     fn impl_block(&mut self, block: &ImplDecl) {
+        let saved = std::mem::take(&mut self.instantiation);
+        self.instantiation = block
+            .type_params
+            .iter()
+            .map(|param| (param.name.name.clone(), Ty::Opaque))
+            .collect();
         for method in &block.methods {
             self.function(method, Some(&block.type_name.name));
         }
+        self.instantiation = saved;
     }
 
     fn block(&mut self, block: &Block) {
@@ -3157,16 +3306,43 @@ impl<'a> Checker<'a> {
         }
         for block in decls {
             if let Decl::Impl(block) = block {
+                let saved = std::mem::take(&mut self.instantiation);
+                self.instantiation = block
+                    .type_params
+                    .iter()
+                    .map(|param| (param.name.name.clone(), Ty::Opaque))
+                    .collect();
                 for method in &block.methods {
                     let mut signature = self.signature(method, false);
-                    if !method.params.is_empty() && method.params[0].name.name == "self" {
+                    let mut written = method.params.clone();
+                    let receiver = if !written.is_empty() && written[0].name.name == "self" {
                         signature.params.remove(0);
+                        Some(written.remove(0))
+                    } else {
+                        None
+                    };
+                    if !block.type_params.is_empty() {
+                        self.generic_methods.insert(
+                            (block.type_name.name.clone(), method.name.name.clone()),
+                            GenericMethod {
+                                params: block
+                                    .type_params
+                                    .iter()
+                                    .map(|param| param.name.name.clone())
+                                    .collect(),
+                                receiver,
+                                declared: written,
+                                result: method.return_ty.clone(),
+                                body: method.body.clone(),
+                            },
+                        );
                     }
                     self.methods.insert(
                         (block.type_name.name.clone(), method.name.name.clone()),
                         signature,
                     );
                 }
+                self.instantiation = saved;
             }
         }
         for decl in decls {

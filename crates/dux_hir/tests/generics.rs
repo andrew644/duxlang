@@ -241,3 +241,76 @@ fn main() {
         "`Right` carries the `i32` the arguments said, not anything else"
     );
 }
+
+const CELL: &str = "struct Cell<T> {
+    value: T,
+    next: Option<*Cell<T>>,
+}
+
+impl Cell<T> {
+    fn value(self: Cell<T>) -> T {
+        return self.value
+    }
+
+    fn shown(self: Cell<T>, extra: T) -> T {
+        return self.value
+    }
+}
+";
+
+#[test]
+fn a_method_of_a_generic_record_sees_what_its_receiver_said() {
+    let clean = said(&format!(
+        r#"{CELL}fn main() {{
+    n := Cell<i32> {{ value: 9, next: None }}
+    s := Cell<string> {{ value: "s", next: None }}
+    a := n.shown(1)
+    b := s.shown("x")
+    println(1)
+    println(a)
+    println(b)
+}}"#
+    ));
+    assert_eq!(
+        clean,
+        Vec::<&str>::new(),
+        "one method, two receivers, each in its own types: {clean:?}"
+    );
+
+    let wrong = codes(&format!(
+        r#"{CELL}fn main() {{
+    s := Cell<string> {{ value: "s", next: None }}
+    s.shown(1)
+}}"#
+    ));
+    assert_eq!(
+        wrong,
+        vec![dux_diag::code::TYPE_MISMATCH],
+        "the receiver says `T` is `string`, and the argument has to fit that: {wrong:?}"
+    );
+}
+
+#[test]
+fn a_method_body_that_does_not_fit_a_receiver_is_said_at_the_call() {
+    let body = CELL.replace(
+        "return self.value\n    }\n\n    fn shown",
+        "return self.next\n    }\n\n    fn shown",
+    );
+    let program = format!(
+        r#"{body}fn main() {{
+    s := Cell<string> {{ value: "s", next: None }}
+    s.value()
+}}"#
+    );
+    let reported = reported(&program);
+    assert_eq!(
+        reported.len(),
+        1,
+        "the body is read again for the receiver that called it: {reported:?}"
+    );
+    let note = reported[0].note.as_deref().unwrap_or_default();
+    assert!(
+        note.contains("Cell<string>.value"),
+        "the complaint says which filling it was read in: {note}"
+    );
+}

@@ -108,7 +108,11 @@ fn dump_decl(decl: &Decl, level: usize) -> String {
             dump_type(&decl.aliased)
         ),
         Decl::Impl(decl) => {
-            let mut out = format!("{pad}impl {} {{\n", decl.type_name.name);
+            let mut out = format!(
+                "{pad}impl {}{} {{\n",
+                decl.type_name.name,
+                dump_type_params(&decl.type_params)
+            );
             for method in &decl.methods {
                 out.push_str(&dump_fn(method, level + 1));
             }

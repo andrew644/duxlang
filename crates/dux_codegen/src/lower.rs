@@ -316,6 +316,20 @@ impl DuxType {
         }
     }
 
+    /// The type named down to its arguments, so two fillings of one generic
+    /// make two keys: `*Cell<string>` and `*Cell<i32>` are not the same type
+    /// and must not be asked for under one name.
+    fn key(self) -> String {
+        match self {
+            DuxType::Pointer(target) => format!("*{}", target.key()),
+            DuxType::Array(info) => format!("[{}; {}]", info.elem.key(), info.len),
+            DuxType::Slice(element) => format!("[]{}", element.key()),
+            DuxType::Struct(info) => info.spelled.clone(),
+            DuxType::Enum(info) => info.spelled.clone(),
+            other => other.name(),
+        }
+    }
+
     fn fits(self, value: u128, negated: bool) -> bool {
         let limit: u128 = match self {
             DuxType::Bool => 1,
@@ -532,6 +546,8 @@ enum Stood {
 struct Instance {
     key: String,
     symbol: String,
+    /// The record a method of a generic `impl` belongs to.
+    owner: Option<&'static str>,
     decl: &'static FnDecl,
     bound: Vec<(String, Stood)>,
 }
@@ -631,6 +647,11 @@ pub(crate) struct Emitter {
     structs: HashMap<String, &'static StructInfo>,
     /// Generic `fn` declarations, by name: the code each instantiation copies.
     generic_fns: HashMap<String, &'static FnDecl>,
+    /// Methods of a generic `impl`, by `Pair.first`: the code each receiver
+    /// instantiation copies.
+    generic_methods: HashMap<String, &'static FnDecl>,
+    /// The parameters of a generic `impl`, by record name.
+    impl_params: HashMap<String, Vec<String>>,
     /// Generic `struct` declarations, by name.
     generic_structs: HashMap<String, &'static dux_ast::StructDecl>,
     /// A generic record at one instantiation, by the name it spells.
@@ -720,6 +741,8 @@ impl Emitter {
             struct_decls: Vec::new(),
             structs: HashMap::new(),
             generic_fns: HashMap::new(),
+            generic_methods: HashMap::new(),
+            impl_params: HashMap::new(),
             generic_structs: HashMap::new(),
             instances: HashMap::new(),
             substituting: Vec::new(),
@@ -815,6 +838,26 @@ impl Emitter {
             if !decl.type_params.is_empty() {
                 self.generic_structs
                     .insert(decl.name.name.clone(), Box::leak(Box::new(decl.clone())));
+            }
+        }
+        for decl in &program.decls {
+            if let Decl::Impl(block) = decl {
+                if block.type_params.is_empty() {
+                    continue;
+                }
+                let params = block
+                    .type_params
+                    .iter()
+                    .map(|param| param.name.name.clone())
+                    .collect();
+                self.impl_params
+                    .insert(block.type_name.name.clone(), params);
+                for method in &block.methods {
+                    self.generic_methods.insert(
+                        format!("{}.{}", block.type_name.name, method.name.name),
+                        Box::leak(Box::new(method.clone())),
+                    );
+                }
             }
         }
         for decl in program.functions() {
@@ -1881,6 +1924,13 @@ impl Emitter {
 
     fn declare(&mut self, module: &Module<'static>, unit: &Unit) {
         let key = unit.key.clone();
+        // A method of a generic `impl` is not a function: only a receiver that
+        // says its types makes one. The call naming such a receiver emits it,
+        // under a key carrying the types.
+        if !unit.instantiated && self.generic_methods.contains_key(&key) {
+            self.skipped.insert(key);
+            return;
+        }
         let external = unit.external;
         let function = unit.decl;
         if self.skipped.contains(&key) || self.functions.contains_key(&key) {
@@ -2012,7 +2062,7 @@ impl Emitter {
         let Some(owner) = unit.owner else {
             return self.type_of(&param.ty);
         };
-        if !first || param.name.name != "self" {
+        if !first || param.name.name != "self" || unit.instantiated {
             return self.type_of(&param.ty);
         }
         let record = self.struct_type_of(owner)?;
@@ -6086,9 +6136,9 @@ impl Emitter {
                 code::LOSSY_CONVERSION,
                 format!(
                     "a `{}` does not fit a `{}` for free; write `as {}` for the explicit conversion",
-                    value.ty.name(),
-                    to.name(),
-                    to.name()
+                    value.ty.key(),
+                    to.key(),
+                    to.key()
                 ),
             )
             .with_span(span)
@@ -6414,6 +6464,17 @@ impl Emitter {
             return None;
         };
         let key = format!("{}.{}", record.name, name.name);
+        // A method of a generic `impl` is code that means something once a
+        // receiver says what its parameters are. The call has that, so this is
+        // where the method becomes a function.
+        let key = if record.args.is_empty() {
+            key
+        } else {
+            match self.instantiate_method(module, record, &name.name) {
+                Some(key) => key,
+                None => return Some(Typed::error()),
+            }
+        };
         if self.skipped.contains(&key) {
             return Some(Typed::error());
         }
@@ -8174,7 +8235,7 @@ impl Emitter {
             None => None,
             Some(bound) => {
                 self.substituting = bound.clone();
-                self.declare_instance(module, decl, name, spelled(name, &bound), bound)
+                self.declare_instance(module, decl, None, name, spelled(name, &bound), bound)
             }
         };
         self.substituting = saved;
@@ -8356,6 +8417,7 @@ impl Emitter {
         &mut self,
         module: &Module<'static>,
         decl: &'static FnDecl,
+        owner: Option<&'static str>,
         name: &str,
         spelled: String,
         bound: Vec<(String, Stood)>,
@@ -8369,20 +8431,14 @@ impl Emitter {
         let instance = Instance {
             symbol: symbol_of(&spelled),
             key: spelled,
+            owner,
             decl,
             bound,
         };
         if self.functions.contains_key(&instance.key) {
             return Some(instance);
         }
-        let unit = Unit {
-            key: instance.key.clone(),
-            symbol: instance.symbol.clone(),
-            owner: None,
-            external: false,
-            instantiated: true,
-            decl: instance.decl,
-        };
+        let unit = instance.unit();
         self.declare(module, &unit);
         if !self.functions.contains_key(&instance.key) {
             return None;
@@ -8391,6 +8447,43 @@ impl Emitter {
             self.pending.push(instance.clone());
         }
         Some(instance)
+    }
+
+    /// A method of a generic `impl`, at the instantiation the receiver says.
+    /// `Pair<i32, string>.first` is a function; `Pair.first` is only code.
+    fn instantiate_method(
+        &mut self,
+        module: &Module<'static>,
+        record: &'static StructInfo,
+        method: &str,
+    ) -> Option<String> {
+        let plain = format!("{}.{}", record.name, method);
+        let decl = self.generic_methods.get(&plain).copied()?;
+        let params = self.impl_params.get(record.name)?.clone();
+        if params.len() != record.args.len() {
+            self.unsupported(
+                decl.name.span,
+                &format!("`{plain}`: its `impl` and its record do not agree on the number of parameters"),
+            );
+            return None;
+        }
+        let bound: Vec<(String, Stood)> = params
+            .iter()
+            .zip(&record.args)
+            .map(|(param, arg)| (param.clone(), Stood::Ty(*arg)))
+            .collect();
+        let spelled = format!("{}.{}", record.spelled, method);
+        self.substituting = bound.clone();
+        let instance = self.declare_instance(
+            module,
+            decl,
+            Some(record.name),
+            &plain,
+            spelled,
+            bound,
+        );
+        self.substituting = Vec::new();
+        instance.map(|instance| instance.key)
     }
 
     /// The other half of an instantiation: the body, in the types the call
@@ -8403,16 +8496,22 @@ impl Emitter {
         self.emitted.insert(instance.key.clone());
         let saved = std::mem::take(&mut self.substituting);
         self.substituting = instance.bound.clone();
-        let unit = Unit {
-            key: instance.key.clone(),
-            symbol: instance.symbol.clone(),
-            owner: None,
-            external: false,
-            instantiated: true,
-            decl: instance.decl,
-        };
+        let unit = instance.unit();
         self.lower_body(module, &unit);
         self.substituting = saved;
+    }
+}
+
+impl Instance {
+    fn unit(&self) -> Unit<'static> {
+        Unit {
+            key: self.key.clone(),
+            symbol: self.symbol.clone(),
+            owner: self.owner,
+            external: false,
+            instantiated: true,
+            decl: self.decl,
+        }
     }
 }
 
@@ -8434,15 +8533,21 @@ fn spelled(name: &str, bound: &[(String, Stood)]) -> String {
 /// A symbol LLVM will print without quoting it: `<`, `>` and the commas
 /// between arguments become dots.
 fn symbol_of(key: &str) -> String {
-    let mut symbol = String::from("dux.");
+    let mut symbol = String::new();
     for letter in key.chars() {
         match letter {
-            '<' | ',' | ' ' => symbol.push('.'),
+            // `max<i32, f64>` and `Pair<i32, string>.first` both name a
+            // function once the arguments are said; the dots say so.
+            '<' | ',' | ' ' | '.' => {
+                if !symbol.ends_with('.') {
+                    symbol.push('.');
+                }
+            }
             '>' => {}
             other => symbol.push(other),
         }
     }
-    symbol
+    format!("dux.{symbol}")
 }
 
 fn instantiation(name: &str, args: &[DuxType]) -> String {
@@ -8452,7 +8557,7 @@ fn instantiation(name: &str, args: &[DuxType]) -> String {
     format!(
         "{name}<{}>",
         args.iter()
-            .map(|arg| arg.name())
+            .map(|arg| arg.key())
             .collect::<Vec<_>>()
             .join(", ")
     )
