@@ -717,8 +717,8 @@ fn main() {
 }
 
 #[test]
-fn a_pointer_receiver_needs_a_place_to_borrow() {
-    let errors = build(
+fn a_receiver_a_call_built_stands_where_a_method_can_borrow_it() {
+    let ir = build(
         "package main
 struct Vec3 {
     x: f32,
@@ -730,14 +730,26 @@ impl Vec3 {
     fn scale(self: *Vec3, k: f32) {
         self.x *= k
     }
+    fn shown(self: Vec3) -> f32 {
+        return self.x
+    }
 }
 fn main() {
     make().scale(2.0)
+    println($\"{}\", make().shown())
+    println($\"{}\", \"dux\".len())
 }",
     )
-    .unwrap_err();
-    assert_eq!(errors[0].code, dux_diag::code::TYPE_MISMATCH, "{errors:?}");
-    assert!(errors[0].message.contains("no address"), "{errors:?}");
+    .expect("a receiver that lives in registers gets a place of its own")
+    .ir_text();
+    assert!(
+        ir.contains("alloca %Vec3"),
+        "the record a call built stands in a slot: {ir}"
+    );
+    assert!(
+        ir.contains("@dux.Vec3.scale(ptr %recv"),
+        "and the method borrows that slot: {ir}"
+    );
 }
 
 #[test]

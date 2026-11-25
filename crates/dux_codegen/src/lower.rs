@@ -212,6 +212,22 @@ impl DuxType {
         })
     }
 
+    /// Whether this type's methods are the standard library's to write: text,
+    /// a view over elements, a fixed array, an address, a number. A record and
+    /// a sum type carry the methods their own `impl` blocks declared.
+    fn methodless(self) -> bool {
+        matches!(
+            self,
+            DuxType::Bool
+                | DuxType::Str
+                | DuxType::Ptr
+                | DuxType::Pointer(_)
+                | DuxType::Array(_)
+                | DuxType::Slice(_)
+        ) || self.is_integral()
+            || self.is_float()
+    }
+
     fn is_integral(self) -> bool {
         matches!(
             self,
@@ -6612,13 +6628,20 @@ impl Emitter {
             Some((ty, at)) => (ty, Some(at)),
             None => {
                 let value = self.expr(module, base, None)?;
-                (value.ty, value.pointer_value())
+                (value.ty, self.materialize(value, "recv"))
             }
         };
         if name.name == "len" && args.is_empty() {
             if let Some(len) = self.length_of(module, base_ty, base_at, base.span()) {
                 return Some(len);
             }
+        }
+        // `s.bytes()` is the view the string already is: the same address and
+        // the same count, over `u8`.
+        if name.name == "bytes" && args.is_empty() && base_ty == DuxType::Str {
+            let bytes = DuxType::Slice(Box::leak(Box::new(DuxType::U8)));
+            let at = base_at?;
+            return Some(Typed::pointer(at, bytes));
         }
         // A receiver is a record or a sum type, and either may be the one an
         // `impl` extends.
@@ -6636,6 +6659,18 @@ impl Emitter {
                 as_ty: DuxType::Enum(shape),
             },
             _ => {
+                // The methods a primitive is used through belong to the
+                // standard library (DESIGN 3.1), so a name that is not there
+                // yet is a gap in this build rather than a verdict on the
+                // program. A record with no such method is the program's own
+                // mistake, and stays one.
+                if base_ty != DuxType::Error && base_ty.methodless() {
+                    self.unsupported(
+                        name.span,
+                        &format!("a `.{}` on a `{}`", name.name, base_ty.name()),
+                    );
+                    return None;
+                }
                 self.diagnostics.push(
                     Diagnostic::error(
                         code::UNDECLARED,
@@ -7315,6 +7350,19 @@ impl Emitter {
 }
 
 impl Emitter {
+    /// A value put somewhere: a method reads a receiver's length and its bytes
+    /// through an address, so a receiver a call built — a string or a view,
+    /// which live in registers — gets a place of its own to stand in.
+    fn materialize(&mut self, value: Typed, name: &str) -> Option<PointerValue<'static>> {
+        if let Some(at) = value.pointer_value() {
+            return Some(at);
+        }
+        let ty = value.ty;
+        let slot = self.alloca(ty, name);
+        let _ = self.builder.build_store(slot, value.basic()?);
+        Some(slot)
+    }
+
     /// What a `return` hands the caller. A fixed array lives at an address but
     /// crosses the boundary whole, so the array is read out of wherever it was
     /// standing.

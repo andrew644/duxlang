@@ -1,0 +1,18 @@
+package main
+
+// The standard library is a directory. `std/math` declares the C name where it
+// is used and says which library holds it; `std/fmt` is ordinary code that
+// walks to what the universe scope already gives; and `.bytes()` says what a
+// `string` is a view of.
+
+import "std/math"
+import "std/fmt"
+
+fn main() {
+    total: i64 = 0
+    for b in "dux".bytes() {
+        total += b as i64
+    }
+    println($"sqrt(9)={} bytes={} len={}", math.sqrt(9.0), total, "dux".len())
+    fmt.println("through std/fmt")
+}

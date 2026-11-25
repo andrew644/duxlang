@@ -1,4 +1,4 @@
-use dux_ast::{Decl, Ident, Import, ModuleDecl, Program};
+use dux_ast::{AttributeArgument, Decl, Ident, Import, ModuleDecl, Program};
 use dux_codegen::{CompiledModule, OptLevel, Options};
 use dux_diag::{code, render, Diagnostic, Severity};
 use std::collections::HashSet;
@@ -349,7 +349,7 @@ pub fn build(
     if request.emit == Emit::Ast {
         return emit_ast(request, out_override);
     }
-    let (_analyzed, _module, artifact) = compile(request)?;
+    let (analyzed, _module, artifact) = compile(request)?;
     match request.emit {
         Emit::LlvmIr => {
             let path = out_override
@@ -363,7 +363,7 @@ pub fn build(
             }
         }
         Emit::Execute => {
-            link(&artifact)?;
+            link(&artifact, &libraries(&analyzed.program))?;
             if let Some(path) = out_override {
                 std::fs::copy(&artifact.executable, path).map_err(|e| io_failure(path, e))?;
             }
@@ -446,13 +446,20 @@ fn io_diagnostic(error: std::io::Error) -> Diagnostic {
     Diagnostic::error(code::SOURCE_IO, format!("cannot write output: {error}"))
 }
 
-fn link(artifact: &BuiltArtifact) -> Result<(), Failure> {
+fn link(artifact: &BuiltArtifact, libraries: &[String]) -> Result<(), Failure> {
     let linker = linker_command();
-    let status = std::process::Command::new(&linker)
+    let mut command = std::process::Command::new(&linker);
+    command
         .arg(&artifact.object)
         .arg("-o")
         .arg(&artifact.executable)
-        .stderr(std::process::Stdio::inherit())
+        .stderr(std::process::Stdio::inherit());
+    // A library is named by the declaration that needs it, never by the link
+    // line as a whole: `#[link(name = "m")]` says where a symbol lives.
+    for library in libraries {
+        command.arg(format!("-l{library}"));
+    }
+    let status = command
         .status()
         .map_err(|e| {
             Failure::bare(vec![
@@ -467,6 +474,31 @@ fn link(artifact: &BuiltArtifact) -> Result<(), Failure> {
         )]));
     }
     Ok(())
+}
+
+/// The libraries the program's `extern` blocks asked for, in the order they
+/// were declared and named once each.
+fn libraries(program: &Program) -> Vec<String> {
+    let mut named: Vec<String> = Vec::new();
+    for entry in program.scoped() {
+        let Decl::Extern(block) = entry.decl else {
+            continue;
+        };
+        for attribute in &block.attributes {
+            if attribute.name != "link" {
+                continue;
+            }
+            for argument in &attribute.arguments {
+                let AttributeArgument::Named(key, value) = argument else {
+                    continue;
+                };
+                if key == "name" && !named.iter().any(|known| known == value) {
+                    named.push(value.clone());
+                }
+            }
+        }
+    }
+    named
 }
 
 fn linker_command() -> String {

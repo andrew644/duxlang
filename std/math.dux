@@ -1,0 +1,15 @@
+// `std/math`. A C name is declared where it is used, and the block says which
+// library it lives in, so the link includes exactly what the program calls.
+//
+// The `f64` root is the C `sqrt`, and `sqrt` here means the `f32` one the
+// language asks for most. Two declarations cannot share a namespace under one
+// name, and `#[c_name]` — which lets a declaration keep a C name while the
+// namespace writes another — is M6.
+#[link(name = "m")]
+extern "C" {
+    fn sqrtf(x: f32) -> f32
+}
+
+fn sqrt(x: f32) -> f32 {
+    return sqrtf(x);
+}

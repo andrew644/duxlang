@@ -1,0 +1,10 @@
+// `std/fmt`. The universe scope already gives a program `print` and `println`;
+// this module is the same two, for when a program would rather say where they
+// come from.
+fn println(text: string) {
+    println(text);
+}
+
+fn print(text: string) {
+    print(text);
+}

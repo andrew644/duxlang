@@ -8,10 +8,10 @@ each remaining gap is waiting for. A gap is a milestone, never a verdict.
 | `hello.dux` | compiles, runs, ships `.debug_line` | — |
 | `control_flow.dux` | compiles, runs; `match` in value position reads ranges, wildcards and guards | — |
 | `types.dux` | parses; fixed arrays now lower | tuples `pair.0` (M3) |
-| `structs.dux` | checks clean; `math.sqrt` and an expression body still run | `math` package (M5), expression bodies |
+| `structs.dux` | compiles, runs, `math.sqrt` and all — `std/math` is a file in this repo now | — |
 | `pointers.dux` | compiles, runs; `Option<*Node>` is one word and the list walk is a pattern condition | — |
 | `memory.dux` | parses | `Vec<string>` on a call path | generics (M5), `mem.Arena` |
-| `strings.dux` | checks clean; runs until `.bytes()` | `string` methods (`.bytes()`, `.runes()`) | the standard library (M5) |
+| `strings.dux` | compiles and runs until `"héllo".runes()`: concatenation, byte slicing, raw and escaped literals, `c".."`, `.len()`, `.bytes()` and `fmt.println` all lower | `.runes()`, which decodes UTF-8 and needs the string a rune prints as |
 | `sum_types.dux` | compiles, runs; variants, payloads, guards, or-patterns, ranges and exhaustiveness all reach machine code, and the dispatch is the `switch` on the tag | — |
 | `option_result.dux` | the predeclared `Option`/`Result` lower and match today, and `std/prelude` now hands every program `unwrap_or`, `is_some` and `is_none` | `std/fs` (file reading over `extern`), `.bytes()`, `.trim()`, and `unwrap`, which stops the program (the panic runtime) |
 | `generics.dux` | checks clean; `max<i32>`, `max<f64>`, `max<i64>`, `Pair<i32, string>`, `Either<string, i32>` matched, `zeros<4>()` returning `[i32; 4]` and `sum(&[1, 2, 3])` all reach machine code | `HashMap<K, V>` and `bag.get("hp").unwrap_or(0)`, which are standard-library code (M5) |
@@ -59,6 +59,16 @@ each remaining gap is waiting for. A gap is a milestone, never a verdict.
   piece at a time: `unwrap` stops the program, which waits on the runtime that
   says why, and a call asking for a method a sum type does not have stays
   silent for that reason.
+- **A method reads its receiver through an address, so a receiver a call built
+  gets one.** `make().scale(2.0)` puts the record in a slot of its own and
+  borrows that; `"dux".len()` and `"dux".bytes()` do the same to a view that
+  would otherwise live in registers. The temporary lives as long as the block
+  that made it, which is where the value would have lived anyway.
+- **A library is named by the declaration that needs it.** `#[link(name = "m")]
+  extern "C" { fn sqrtf(x: f32) -> f32 }` is how `std/math` says where its
+  symbol lives, and the link line carries `-l m` because of it. A name a C
+  header owns and a namespace wants for something else (`sqrt` for `f64` and
+  `f32` both) waits on `#[c_name]` (M6).
 - **A module is a place names live in.** `mod gfx { … }` carries its
   declarations, `import "gfx/shapes"` reads the file beside the one that asked
   (or below it, or in `$DUX_STDLIB`), and what it declares is known as

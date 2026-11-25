@@ -2825,6 +2825,11 @@ impl<'a> Checker<'a> {
                     _ => {}
                 }
             }
+            // A `string` is a view over bytes already: `.bytes()` says what it
+            // is a view of.
+            if name.name == "bytes" && args.is_empty() && matches!(&base, Ty::Str) {
+                return Ty::Slice(Box::new(Ty::U8));
+            }
             // A sum type is a type an `impl` may extend too, and its arguments
             // say what the `impl`'s parameters stand for. A sum type with no
             // method of that name stays silent: the standard library's methods
