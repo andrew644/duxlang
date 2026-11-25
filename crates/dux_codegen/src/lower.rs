@@ -645,6 +645,12 @@ pub(crate) struct Emitter {
     /// `StructInfo` (a nominal LLVM struct type plus resolved field types).
     struct_decls: Vec<dux_ast::StructDecl>,
     structs: HashMap<String, &'static StructInfo>,
+    /// The module whose body is being lowered, written the way a use would
+    /// write it. Inside `mod math` a bare name means the module's own first.
+    home: String,
+    /// Where each function was declared, so lowering its body knows the module
+    /// it was written in.
+    home_of: HashMap<String, String>,
     /// Generic `fn` declarations, by name: the code each instantiation copies.
     generic_fns: HashMap<String, &'static FnDecl>,
     /// Methods of a generic `impl`, by `Pair.first`: the code each receiver
@@ -741,6 +747,8 @@ impl Emitter {
             struct_decls: Vec::new(),
             structs: HashMap::new(),
             generic_fns: HashMap::new(),
+            home: String::new(),
+            home_of: HashMap::new(),
             generic_methods: HashMap::new(),
             impl_params: HashMap::new(),
             generic_structs: HashMap::new(),
@@ -790,6 +798,16 @@ impl Emitter {
         module: &Module<'static>,
         program: &Program,
     ) -> Vec<Diagnostic> {
+        // A declaration inside a module is known by where it lives: a `fn sqrt`
+        // written in `mod math` is `math.sqrt`. The lowering sees one flat
+        // program that says so, and `home_of` remembers where each function was
+        // written — which is what lets a bare name inside a module mean the
+        // module's own.
+        let rewritten = Program {
+            decls: self.scoped_decls(program),
+            ..program.clone()
+        };
+        let program = &rewritten;
         self.allocating = self.allocation_analysis(program);
         if !self.allocating.is_empty() {
             self.runtime = Some(Runtime::emit(
@@ -915,9 +933,12 @@ impl Emitter {
                 }
             }
         }
+        // A declaration's own types are read in the module it was written in.
         for unit in &units {
+            self.home = self.home_of.get(&unit.key).cloned().unwrap_or_default();
             self.declare(module, unit);
         }
+        self.home.clear();
         for unit in &units {
             self.lower_body(module, unit);
         }
@@ -941,6 +962,64 @@ impl Emitter {
 }
 
 impl Emitter {
+    /// Every declaration, under the name it is known by from outside the module
+    /// it lives in. An `extern` block keeps the names it was written with:
+    /// those belong to the C symbols they bind.
+    fn scoped_decls(&mut self, program: &Program) -> Vec<Decl> {
+        let mut decls = Vec::new();
+        for entry in program.scoped() {
+            if entry.home.is_empty() {
+                decls.push(entry.decl.clone());
+                continue;
+            }
+            self.remember_home(&entry.home, entry.decl);
+            decls.push(named_in(&entry.home, entry.decl));
+        }
+        decls
+    }
+
+    fn remember_home(&mut self, home: &str, decl: &Decl) {
+        match decl {
+            Decl::Fn(function) => {
+                let key = format!("{home}{}", function.name.name);
+                self.home_of.insert(key, home.to_string());
+            }
+            Decl::Impl(block) => {
+                let owner = format!("{home}{}", block.type_name.name);
+                for method in &block.methods {
+                    let key = format!("{owner}.{}", method.name.name);
+                    self.home_of.insert(key, home.to_string());
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// The name a written name answers to: a module's own declaration wins over
+    /// a bare name the module does not declare, and everything else — the
+    /// prelude, the rest of the program — stays reachable as it was written.
+    fn named_in_home(&self, name: &str) -> String {
+        if self.home.is_empty() || self.known(name) {
+            return name.to_string();
+        }
+        let named = format!("{}{name}", self.home);
+        if self.known(&named) {
+            return named;
+        }
+        name.to_string()
+    }
+
+    /// Whether a name says a record, a sum type or a function this program has.
+    fn known(&self, name: &str) -> bool {
+        self.consts.contains_key(name)
+            || self.structs.contains_key(name)
+            || self.struct_decls.iter().any(|decl| decl.name.name == name)
+            || self.generic_structs.contains_key(name)
+            || self.shapes.contains_key(name)
+            || self.functions.contains_key(name)
+            || self.generic_fns.contains_key(name)
+    }
+
     /// A source type as the lowering sees it. Primitives, pointers and fixed
     /// arrays come straight from the shared lattice; a `struct` name resolves
     /// to its nominal record.
@@ -951,10 +1030,13 @@ impl Emitter {
                     Some(Stood::Ty(ty)) => Some(ty),
                     _ => match DuxType::named(name) {
                         Some(primitive) => Some(primitive),
-                        None => match self.struct_type_of(name) {
-                            Some(record) => Some(record),
-                            None => self.enum_type_of(name, &[]),
-                        },
+                        None => {
+                            let named = self.named_in_home(name);
+                            match self.struct_type_of(&named) {
+                                Some(record) => Some(record),
+                                None => self.enum_type_of(&named, &[]),
+                            }
+                        }
                     },
                 }
             }
@@ -963,10 +1045,11 @@ impl Emitter {
                 for argument in args {
                     given.push(self.type_of(argument)?);
                 }
-                if self.generic_structs.contains_key(name) {
-                    return self.record_instance_of(name, &given);
+                let named = self.named_in_home(name);
+                if self.generic_structs.contains_key(&named) {
+                    return self.record_instance_of(&named, &given);
                 }
-                self.enum_type_of(name, &given)
+                self.enum_type_of(&named, &given)
             }
             Type::Slice { element, .. } => self
                 .type_of(element)
@@ -2073,6 +2156,14 @@ impl Emitter {
     }
 
     fn lower_body(&mut self, module: &Module<'static>, unit: &Unit) {
+        let saved_home = std::mem::take(&mut self.home);
+        let written = spelled_without_arguments(&unit.key);
+        self.home = self
+            .home_of
+            .get(&unit.key)
+            .or_else(|| self.home_of.get(&written))
+            .cloned()
+            .unwrap_or_else(|| saved_home.clone());
         let key = unit.key.as_str();
         let function = unit.decl;
         if self.skipped.contains(key) || function.body.stmts.is_empty() {
@@ -2152,6 +2243,7 @@ impl Emitter {
         self.context_slot = None;
         self.context_saves.clear();
         self.running_function = None;
+        self.home = saved_home;
     }
 
     fn finish_function(&mut self, function: &FnDecl) {
@@ -5023,6 +5115,16 @@ impl Emitter {
         name_span: Span,
         span: Span,
     ) -> Option<Typed> {
+        // `math.LIMIT`: a name that walks off a module is that module's own,
+        // and a module's constant is read the same way a bare one is.
+        if let Expr::Ident { name: place, .. } = base {
+            if self.slot_of(place).is_none() {
+                let named = format!("{place}.{name}");
+                if let Some(value) = self.consts.get(&named).cloned() {
+                    return Some(self.const_reference(&value, None, span));
+                }
+            }
+        }
         if let Some((ty, at)) = self.place_of_expr(module, base) {
             let Some((info, at)) = self.record_address(ty, at) else {
                 self.unsupported(
@@ -5303,7 +5405,13 @@ impl Emitter {
                 if let Some((ty, slot)) = self.slot_of(name) {
                     return self.load(ty, slot);
                 }
-                if let Some(c) = self.consts.get(name).cloned() {
+                let named = self.named_in_home(name);
+                if let Some(c) = self.consts.get(name).cloned().or_else(|| {
+                    self.consts
+                        .get(named.as_str())
+                        .cloned()
+                        .filter(|_| named != *name)
+                }) {
                     return Some(self.const_reference(&c, expected, *span));
                 }
                 // A `const` parameter is a value the body may name, and this
@@ -5387,11 +5495,12 @@ impl Emitter {
                 self.field_expr(module, base, &name.name, name.span, *span)
             }
             Expr::StructLiteral { name, args, fields, span } => {
-                if let Some(record) = self.generic_structs.get(name.as_str()).copied() {
+                let named = self.named_in_home(name);
+                if let Some(record) = self.generic_structs.get(named.as_str()).copied() {
                     return self.generic_record_value(module, record, args, fields, *span);
                 }
-                if self.structs.contains_key(name.as_str()) || !name.contains("::") {
-                    return self.struct_literal(module, name, fields, *span);
+                if self.structs.contains_key(named.as_str()) || !name.contains("::") {
+                    return self.struct_literal(module, &named, fields, *span);
                 }
                 let (owner, variant) = name.split_once("::").unwrap_or((name.as_str(), ""));
                 let given: Vec<(&str, &Expr)> = fields
@@ -6325,6 +6434,15 @@ impl Emitter {
                 self.generic_call(module, name, written, args, span)
             }
             Expr::Field { base, name, .. } => {
+                // `math.sqrt(x)`: what walks off the dot is a module, and a
+                // module's functions are known by where they live.
+                if let Expr::Ident { name: place, .. } = base.as_ref() {
+                    let named = format!("{place}.{}", name.name);
+                    if self.functions.contains_key(&named) || self.generic_fns.contains_key(&named)
+                    {
+                        return self.call_named(module, &named, args, callee, span, expected);
+                    }
+                }
                 self.call_method(module, base, name, args, span)
             }
             _ => {
@@ -6346,6 +6464,9 @@ impl Emitter {
         if name == "print" || name == "println" {
             return self.write_builtin(module, name, args, span);
         }
+        // Inside a module a bare name means the module's own function first.
+        let named = self.named_in_home(name);
+        let name = named.as_str();
         // The allocation builtins belong to the prelude, so a program that
         // declares its own `make` wins.
         if matches!(name, "new" | "make" | "free" | "del") && !self.functions.contains_key(name) {
@@ -8532,6 +8653,42 @@ fn spelled(name: &str, bound: &[(String, Stood)]) -> String {
 
 /// A symbol LLVM will print without quoting it: `<`, `>` and the commas
 /// between arguments become dots.
+/// The name an instantiation is an instantiation of: `Pair<i32, string>.first`
+/// is an instantiation of `Pair.first`, and `max<i32>` is an instantiation of
+/// `max`. The written name is where a module's home is recorded.
+fn spelled_without_arguments(key: &str) -> String {
+    let mut name = String::new();
+    let mut nested = 0usize;
+    for c in key.chars() {
+        match c {
+            '<' => nested += 1,
+            '>' => nested = nested.saturating_sub(1),
+            _ if nested == 0 => name.push(c),
+            _ => {}
+        }
+    }
+    name
+}
+
+/// A declaration renamed to the name it is known by from outside the module it
+/// lives in. An `extern` block is left exactly as it was written: those names
+/// are the C symbols they bind.
+fn named_in(home: &str, decl: &Decl) -> Decl {
+    let mut decl = decl.clone();
+    match &mut decl {
+        Decl::Fn(function) => function.name.name = format!("{home}{}", function.name.name),
+        Decl::Struct(record) => record.name.name = format!("{home}{}", record.name.name),
+        Decl::Enum(shape) => shape.name.name = format!("{home}{}", shape.name.name),
+        Decl::TypeAlias(alias) => alias.name.name = format!("{home}{}", alias.name.name),
+        Decl::Const(what) => what.name.name = format!("{home}{}", what.name.name),
+        Decl::Global(shared) => shared.name.name = format!("{home}{}", shared.name.name),
+        Decl::Impl(block) => block.type_name.name = format!("{home}{}", block.type_name.name),
+        Decl::Module(namespace) => namespace.name.name = format!("{home}{}", namespace.name.name),
+        _ => {}
+    }
+    decl
+}
+
 fn symbol_of(key: &str) -> String {
     let mut symbol = String::new();
     for letter in key.chars() {

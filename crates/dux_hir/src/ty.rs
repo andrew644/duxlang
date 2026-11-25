@@ -2983,8 +2983,9 @@ impl<'a> Checker<'a> {
             .iter()
             .map(|param| (param.name.name.clone(), Ty::Opaque))
             .collect();
+        let owner = named_owner(&self.home, &block.type_name.name);
         for method in &block.methods {
-            self.function(method, Some(&block.type_name.name));
+            self.function(method, Some(&owner));
         }
         self.instantiation = saved;
     }

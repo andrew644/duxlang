@@ -1,0 +1,23 @@
+struct Size {
+    w: i32,
+    h: i32,
+}
+
+fn area(s: Size) -> i32 {
+    return s.w * s.h;
+}
+
+impl Size {
+    fn doubled(self) -> i32 {
+        return area(self) * 2;
+    }
+}
+
+fn pick(a: i32, b: i32) -> i32 {
+    if a > b {
+        return a;
+    }
+    return b;
+}
+
+const LIMIT: i32 = 40;

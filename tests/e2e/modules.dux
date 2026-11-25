@@ -1,0 +1,15 @@
+package main
+
+import "gfx/shapes"
+
+fn main() {
+    s := shapes.Size { w: 6, h: 7 }
+    println(
+        $"area={} doubled={} pick={} limit={}",
+        shapes.area(s),
+        s.doubled(),
+        shapes.pick(3, 9),
+        shapes.LIMIT,
+    )
+    println("modules ok")
+}
