@@ -10,11 +10,11 @@ each remaining gap is waiting for. A gap is a milestone, never a verdict.
 | `types.dux` | parses; fixed arrays now lower | tuples `pair.0` (M3) |
 | `structs.dux` | compiles, runs, `math.sqrt` and all — `std/math` is a file in this repo now | — |
 | `pointers.dux` | compiles, runs; `Option<*Node>` is one word and the list walk is a pattern condition | — |
-| `memory.dux` | parses | `Vec<string>` on a call path | generics (M5), `mem.Arena` |
+| `memory.dux` | parses | `std/mem` (the arena the context rebinding wants) and `Vec<string>` returning through a call |
 | `strings.dux` | compiles and runs until `"héllo".runes()`: concatenation, byte slicing, raw and escaped literals, `c".."`, `.len()`, `.bytes()` and `fmt.println` all lower | `.runes()`, which decodes UTF-8 and needs the string a rune prints as |
 | `sum_types.dux` | compiles, runs; variants, payloads, guards, or-patterns, ranges and exhaustiveness all reach machine code, and the dispatch is the `switch` on the tag | — |
 | `option_result.dux` | the predeclared `Option`/`Result` lower and match today, and `std/prelude` now hands every program `unwrap_or`, `is_some` and `is_none` | `std/fs` (file reading over `extern`), `.bytes()`, `.trim()`, and `unwrap`, which stops the program (the panic runtime) |
-| `generics.dux` | checks clean; `max<i32>`, `max<f64>`, `max<i64>`, `Pair<i32, string>`, `Either<string, i32>` matched, `zeros<4>()` returning `[i32; 4]` and `sum(&[1, 2, 3])` all reach machine code | `HashMap<K, V>` and `bag.get("hp").unwrap_or(0)`, which are standard-library code (M5) |
+| `generics.dux` | compiles, runs — `max<i32>`, `Pair<i32, string>`, `Either<string, i32>` matched, `zeros<4>()`, `sum(&[1, 2, 3])`, and `HashMap<string, i32>` with `insert`, `get(..).unwrap_or(..)` and `len`, the table and the method being prelude Dux | — |
 | `c_interop.dux` | parses | libclang importer (M6) |
 
 ## Deliberate runtime gaps today
@@ -54,11 +54,13 @@ each remaining gap is waiting for. A gap is a milestone, never a verdict.
 - **The standard library is a directory, not a build.** `std/prelude` is read
   into every program that lives under a tree carrying one — its declarations
   arrive bare, not under a namespace — and `$DUX_STDLIB` names the root for
-  programs elsewhere. `Option::unwrap_or`, `is_some` and `is_none` are written
-  there, in Dux, and they are the first pieces of a library that will grow a
-  piece at a time: `unwrap` stops the program, which waits on the runtime that
-  says why, and a call asking for a method a sum type does not have stays
-  silent for that reason.
+  programs elsewhere. Written there, in Dux: `Option::unwrap_or`, `is_some`
+  and `is_none`; `Vec<T>`, growing through the context; `HashMap<K, V>`, open
+  addressing probed by the builtin `hash`. `std/strings` carries `less`,
+  `starts_with`, `ends_with`, `find`, `contains` and `repeat` under its name.
+  The library grows a piece at a time: `unwrap` stops the program, which
+  waits on the runtime that says why, and a call asking for a method a sum
+  type does not have stays silent for that reason.
 - **A method reads its receiver through an address, so a receiver a call built
   gets one.** `make().scale(2.0)` puts the record in a slot of its own and
   borrows that; `"dux".len()` and `"dux".bytes()` do the same to a view that
@@ -75,7 +77,8 @@ each remaining gap is waiting for. A gap is a milestone, never a verdict.
   `shapes.Size`, `shapes.area`, `shapes.LIMIT` — inside the module the same
   names are bare. What waits: visibility (`pub` is out of scope, OPEN-18),
   `Shape::Circle` of a module's own enum through the module's name, and the
-  `std/..` files themselves, which report E0007 until they are written.
+  `std/..` files, which are ordinary modules now: `math.sqrt`, `fmt.println`
+  and `strings.less` are what an `import "std/.."` brings.
 - **No bounds traps.** `dims[i]` is unchecked; the debug-mode bounds check
   waits on the panic runtime.
 - **`defer` is body-level.** Correct per-path behavior inside nested blocks

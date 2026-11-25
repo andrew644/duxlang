@@ -1,0 +1,23 @@
+//@stderr dux: leaked 2 allocation(s)
+package main
+
+// `std/strings`: the questions a `string` answers, written in Dux against
+// `.len()`, byte indexing, `[a..b]`, `==` and `+`.
+
+import "std/strings"
+
+fn main() {
+    println($"{} {} {}", strings.less("apple", "pear"), strings.less("b", "a"), strings.less("dux", "dux"))
+    println($"{} {}", strings.less("dux", "duxling"), strings.less("duxling", "dux"))
+    println($"{} {}", strings.starts_with("/usr/bin/dux", "/usr"), strings.starts_with("/usr", "/usr/bin"))
+    println($"{} {}", strings.ends_with("/usr/bin/dux", "bin/dux"), strings.ends_with("dux", "duxx"))
+    if Some(at) := strings.find("/usr/bin/dux", "bin") {
+        println($"at={}", at)
+    }
+    println($"empty={} missing={}",
+            strings.find("dux", "").is_some(), strings.find("dux", "lang").is_none())
+    println($"contains={}", strings.contains("hello dux", "dux"))
+    path := strings.repeat("ha", 3)
+    println($"repeat={} {}", path, path.len())
+    del(path)
+}

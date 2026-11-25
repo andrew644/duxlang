@@ -1,0 +1,67 @@
+// `std/strings`. The questions a `string` view answers, written in Dux
+// against the primitives the language already gives: `.len()`, byte indexing,
+// `[a..b]`, `==` and `+`. Ordering is `less` rather than `<` — the checker
+// sends a comparison on text here, so the spelling of an order says where it
+// lives.
+
+fn less(a: string, b: string) -> bool {
+    shared := a.len()
+    if b.len() < shared {
+        shared = b.len()
+    }
+    at: usize = 0
+    while at < shared {
+        if a[at] != b[at] {
+            return a[at] < b[at]
+        }
+        at += 1
+    }
+    return a.len() < b.len()
+}
+
+fn starts_with(text: string, prefix: string) -> bool {
+    if prefix.len() > text.len() {
+        return false
+    }
+    return text[0..prefix.len()] == prefix
+}
+
+fn ends_with(text: string, suffix: string) -> bool {
+    if suffix.len() > text.len() {
+        return false
+    }
+    return text[text.len() - suffix.len()..text.len()] == suffix
+}
+
+// The first byte offset where `needle` matches, which is where a slice of
+// `text` begins to read as `needle`. `None` says no slice of it does.
+fn find(text: string, needle: string) -> Option<usize> {
+    if needle.len() > text.len() {
+        return None
+    }
+    at: usize = 0
+    while at + needle.len() <= text.len() {
+        if text[at..at + needle.len()] == needle {
+            return Some(at)
+        }
+        at += 1
+    }
+    return None
+}
+
+fn contains(text: string, needle: string) -> bool {
+    return find(text, needle).is_some()
+}
+
+// Text `count` times over. Each `+` builds from the context, and the copies
+// under the last one are the runtime's to reclaim; the answer is the caller's
+// to `del`.
+fn repeat(text: string, count: usize) -> string {
+    out := ""
+    at: usize = 0
+    while at < count {
+        out = out + text
+        at += 1
+    }
+    return out
+}
