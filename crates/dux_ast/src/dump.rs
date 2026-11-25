@@ -119,7 +119,18 @@ fn dump_decl(decl: &Decl, level: usize) -> String {
             out.push_str(&format!("{pad}}}\n"));
             out
         }
-        Decl::Module(decl) => format!("{pad}{}mod {};\n", dump_attributes(&decl.attributes), decl.name.name),
+        Decl::Module(decl) => {
+            let head = dump_attributes(&decl.attributes);
+            if decl.decls.is_empty() {
+                return format!("{pad}{head}mod {};\n", decl.name.name);
+            }
+            let mut out = format!("{pad}{head}mod {} {{\n", decl.name.name);
+            for inner in &decl.decls {
+                out.push_str(&dump_decl(inner, level + 1));
+            }
+            out.push_str(&format!("{pad}}}\n"));
+            out
+        }
         Decl::Extern(block) => {
             let mut out = format!("{pad}extern \"{}\" {{\n", block.abi);
             for function in &block.functions {

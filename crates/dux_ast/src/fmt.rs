@@ -205,11 +205,21 @@ impl Printer {
                     decl.type_name.name
                 )
             }
-            Decl::Module(decl) => format!(
-                "{}mod {};",
-                self.attributes_inline(&decl.attributes),
-                decl.name.name
-            ),
+            Decl::Module(decl) => {
+                let attributes = self.attributes_inline(&decl.attributes);
+                if decl.decls.is_empty() {
+                    return format!("{attributes}mod {};", decl.name.name);
+                }
+                let body = decl
+                    .decls
+                    .iter()
+                    .map(|inner| self.decl(inner, level + 1))
+                    .collect::<Vec<_>>()
+                    .join("
+
+");
+                format!("{attributes}mod {} {{\n{body}\n{p}}}", decl.name.name)
+            }
             Decl::Extern(block) => {
                 let attributes = self.attributes_standalone(&block.attributes, level);
                 if block.functions.is_empty() {

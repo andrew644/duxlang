@@ -126,75 +126,34 @@ impl<'a> Parser<'a> {
             let before = self.cursor;
             let attributes = self.attributes();
             match self.peek().kind {
-                TokenKind::Keyword(Keyword::Import) => {
-                    self.bump();
-                    let token = self.peek().clone();
-                    match &token.literal {
-                        Some(Literal::Text(path)) => {
-                            program.imports.push(Import {
-                                path: path.clone(),
-                                span: token.span,
-                            });
-                        }
-                        _ => self.error(&token, "import expects a string literal path"),
-                    }
-                    self.bump();
-                }
-                TokenKind::Keyword(Keyword::Fn) => {
-                    let function = self.function(attributes);
-                    program.decls.push(Decl::Fn(function));
-                }
-                TokenKind::Keyword(Keyword::Struct) => {
-                    let decl = self.struct_decl(attributes);
-                    program.decls.push(Decl::Struct(decl));
-                }
-                TokenKind::Keyword(Keyword::Enum) => {
-                    let decl = self.enum_decl(attributes);
-                    program.decls.push(Decl::Enum(decl));
-                }
-                TokenKind::Keyword(Keyword::Const) => {
-                    let decl = self.constant(attributes);
-                    program.decls.push(Decl::Const(decl));
-                }
-                TokenKind::Keyword(Keyword::Global) => {
-                    let decl = self.global_variable(attributes);
-                    program.decls.push(Decl::Global(decl));
-                }
-                TokenKind::Keyword(Keyword::Type) => {
-                    let decl = self.type_alias();
-                    program.decls.push(Decl::TypeAlias(decl));
-                }
-                TokenKind::Keyword(Keyword::Impl) => {
-                    let decl = self.impl_block();
-                    program.decls.push(Decl::Impl(decl));
-                }
-                TokenKind::Keyword(Keyword::Mod) => {
-                    let decl = self.module_decl(attributes);
-                    program.decls.push(Decl::Module(decl));
-                }
-                TokenKind::Keyword(Keyword::Extern) => {
-                    let decl = self.extern_block(attributes);
-                    program.decls.push(Decl::Extern(decl));
-                }
-                TokenKind::Eof => break,
-                _ => {
-                    let token = self.peek().clone();
-                    if attributes.is_empty() && token.is_punct(Punct::Semicolon) {
-                        self.bump();
-                        continue;
-                    }
+                TokenKind::Keyword(Keyword::Import) => self.import(&mut program),
+                TokenKind::Eof => {
                     if !attributes.is_empty() {
-                        self.error(
-                            &token,
-                            "an attribute must be followed by a declaration",
-                        );
-                    } else {
-                        self.error(
-                            &token,
-                            "expected `fn`, `const`, `global`, `struct`, `enum` or `impl` at top level",
-                        );
+                        let token = self.peek().clone();
+                        self.error(&token, "an attribute must be followed by a declaration");
                     }
-                    self.recover_to_top_level();
+                    break;
+                }
+                _ => {
+                    let bare = attributes.is_empty();
+                    match self.declaration(attributes) {
+                        Some(decl) => program.decls.push(decl),
+                        None => {
+                            let token = self.peek().clone();
+                            if bare && token.is_punct(Punct::Semicolon) {
+                                self.bump();
+                            } else if !bare {
+                                self.error(&token, "an attribute must be followed by a declaration");
+                                self.recover_to_top_level();
+                            } else {
+                                self.error(
+                                    &token,
+                                    "expected `fn`, `const`, `global`, `struct`, `enum` or `impl` at top level",
+                                );
+                                self.recover_to_top_level();
+                            }
+                        }
+                    }
                 }
             }
             if self.cursor == before {
@@ -203,6 +162,48 @@ impl<'a> Parser<'a> {
         }
         program
     }
+
+    /// One `import "path"`: the path is kept as it was written, and the driver
+    /// is the one that goes and finds the file.
+    fn import(&mut self, program: &mut Program) {
+        self.bump();
+        let token = self.peek().clone();
+        match &token.literal {
+            Some(Literal::Text(path)) => program.imports.push(Import {
+                path: path.clone(),
+                span: token.span,
+            }),
+            _ => self.error(&token, "import expects a string literal path"),
+        }
+        self.bump();
+    }
+
+    /// One declaration. `None` says what follows is not one, which is for the
+    /// caller to say: a file and a module body want different words.
+    fn declaration(&mut self, attributes: Vec<Attribute>) -> Option<Decl> {
+        Some(match self.peek().kind {
+            TokenKind::Keyword(Keyword::Fn) => Decl::Fn(self.function(attributes)),
+            TokenKind::Keyword(Keyword::Struct) => Decl::Struct(self.struct_decl(attributes)),
+            TokenKind::Keyword(Keyword::Enum) => Decl::Enum(self.enum_decl(attributes)),
+            TokenKind::Keyword(Keyword::Const) => Decl::Const(self.constant(attributes)),
+            TokenKind::Keyword(Keyword::Global) => Decl::Global(self.global_variable(attributes)),
+            TokenKind::Keyword(Keyword::Type) => Decl::TypeAlias(self.type_alias()),
+            TokenKind::Keyword(Keyword::Impl) => Decl::Impl(self.impl_block()),
+            TokenKind::Keyword(Keyword::Mod) => Decl::Module(self.module_decl(attributes)),
+            TokenKind::Keyword(Keyword::Extern) => Decl::Extern(self.extern_block(attributes)),
+            TokenKind::Keyword(Keyword::Import) => {
+                let token = self.peek().clone();
+                self.bump();
+                self.error(
+                    &token,
+                    "an import is written at the top of a file, next to the package it belongs to",
+                );
+                return None;
+            }
+            _ => return None,
+        })
+    }
+
 
     fn recover_to_top_level(&mut self) {
         if !self.at_end() {
@@ -592,10 +593,35 @@ impl<'a> Parser<'a> {
         let start = self.peek().span;
         self.bump();
         let name = self.expect_ident("module name");
-        let end = self.expect_punct(Punct::Semicolon, "expected `;` after the module name");
+        let mut decls = Vec::new();
+        let end = if self.at_punct(Punct::LBrace) {
+            self.bump();
+            while !self.at_punct(Punct::RBrace) && !self.at_end() {
+                let before = self.cursor;
+                let attributes = self.attributes();
+                match self.declaration(attributes) {
+                    Some(decl) => decls.push(decl),
+                    None => {
+                        let token = self.peek().clone();
+                        self.error(
+                            &token,
+                            "a module holds declarations: `fn`, `struct`, `enum`, `const`, `global`, `type` or `impl`",
+                        );
+                        self.recover_to_top_level();
+                    }
+                }
+                if self.cursor == before {
+                    self.bump();
+                }
+            }
+            self.expect_punct(Punct::RBrace, "expected `}` to close the module")
+        } else {
+            self.expect_punct(Punct::Semicolon, "expected `;` or `{` after the module name")
+        };
         ModuleDecl {
             attributes,
             name,
+            decls,
             span: start.merge(end),
         }
     }
@@ -2816,6 +2842,25 @@ mod tests {
             panic!("expected named type")
         };
         assert_eq!((name.as_str(), args.len()), ("HashMap", 2));
+    }
+
+    #[test]
+    fn a_module_body_holds_the_declarations_it_was_given() {
+        let (program, diagnostics) = parse_text(
+            "mod math {\n    fn sqrt(x: f64) -> f64 { return x }\n\n    struct Meters { v: f64 }\n}\n\nmod c;\n",
+        );
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        let Decl::Module(decl) = &program.decls[0] else {
+            panic!("a module")
+        };
+        assert_eq!((decl.name.name.as_str(), decl.decls.len()), ("math", 2));
+        let Decl::Module(forward) = &program.decls[1] else {
+            panic!("a forward-declared namespace")
+        };
+        assert!(
+            forward.decls.is_empty(),
+            "`mod c;` says the namespace exists and nothing more"
+        );
     }
 
     #[test]

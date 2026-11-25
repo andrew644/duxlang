@@ -665,6 +665,10 @@ pub struct ImplDecl {
 pub struct ModuleDecl {
     pub attributes: Vec<Attribute>,
     pub name: Ident,
+    /// A `mod ns;` says the namespace exists and nothing else. The body of an
+    /// imported file arrives filled in: a `package`'s declarations, under the
+    /// name the import wrote.
+    pub decls: Vec<Decl>,
     pub span: Span,
 }
 
