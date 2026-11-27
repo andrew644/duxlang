@@ -30,17 +30,24 @@ use inkwell::targets::TargetData;
 use inkwell::types::{
     BasicMetadataTypeEnum, BasicType, BasicTypeEnum, FloatType, FunctionType, IntType, StructType,
 };
+use inkwell::values::{AsValueRef, BasicValue, FunctionValue, ValueKind};
 use inkwell::values::{
     BasicMetadataValueEnum, BasicValueEnum, CallSiteValue, FloatValue, GlobalValue, IntValue,
     PointerValue, StructValue,
 };
-use inkwell::values::{BasicValue, FunctionValue, ValueKind};
 use inkwell::{AddressSpace, FloatPredicate, IntPredicate};
 
 const DW_ATE_BOOLEAN: u32 = 0x02;
 const DW_ATE_FLOAT: u32 = 0x04;
 const DW_ATE_SIGNED: u32 = 0x05;
 const DW_ATE_UNSIGNED: u32 = 0x07;
+const DW_ATE_ADDRESS: u32 = 0x0f;
+
+/// The name a debugger is shown: a module's home is how the program finds
+/// a name, not how the program says it.
+fn di_written_name(name: &str) -> &str {
+    name.rsplit('.').next().unwrap_or(name)
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum DuxType {
@@ -968,6 +975,18 @@ pub(crate) struct Emitter {
     compile_unit: Option<DICompileUnit<'static>>,
     scope: Option<DISubprogram<'static>>,
     di_files: HashMap<FileId, DIFile<'static>>,
+    /// The debug types seen, interned by their key: one `Vec3<i32>` is one
+    /// DIE, however many signatures name it, and a record that points at
+    /// itself through a pointer finds its own name waiting.
+    di_types: HashMap<String, inkwell::debug_info::DIType<'static>>,
+    /// The types being built, so a walk through a record's fields stops
+    /// when it comes back around instead of chasing the cycle.
+    di_under_construction: HashSet<String>,
+    /// Where each record and sum type was declared, so its DIE can say so.
+    di_decl_sites: HashMap<String, Span>,
+    /// The file the function being lowered was written in, for the
+    /// variables its body declares.
+    di_scope_file: Option<DIFile<'static>>,
 }
 
 impl Emitter {
@@ -1031,6 +1050,10 @@ impl Emitter {
             compile_unit: None,
             scope: None,
             di_files: HashMap::new(),
+            di_types: HashMap::new(),
+            di_under_construction: HashSet::new(),
+            di_decl_sites: HashMap::new(),
+            di_scope_file: None,
         }
     }
 
@@ -1057,7 +1080,7 @@ impl Emitter {
                 .unwrap_or_else(|| "main.dux".to_string());
             let (dibuilder, compile_unit) = module.create_debug_info_builder(
                 true,
-                DWARFSourceLanguage::Rust,
+                DWARFSourceLanguage::C99,
                 &file,
                 "",
                 "duxc",
@@ -1085,6 +1108,16 @@ impl Emitter {
             );
         }
         self.struct_decls = program.structs().cloned().collect();
+        for decl in program.structs() {
+            self.di_decl_sites
+                .entry(decl.name.name.clone())
+                .or_insert(decl.name.span);
+        }
+        for decl in program.enums() {
+            self.di_decl_sites
+                .entry(decl.name.name.clone())
+                .or_insert(decl.name.span);
+        }
         for decl in program.structs() {
             if !decl.type_params.is_empty() {
                 self.generic_structs
@@ -2744,6 +2777,7 @@ impl Emitter {
             if let Some(basic) = (Typed { core, ty }).basic() {
                 let _ = self.builder.build_store(slot, basic);
             }
+            self.note_slot(&param.name.name, ty, slot);
             if let Some(scope) = self.scopes.last_mut() {
                 scope.insert(param.name.name.clone(), (ty, slot));
             }
@@ -3633,6 +3667,9 @@ impl Emitter {
 
     /// Pattern bindings become ordinary slots in the arm's own scope.
     fn declare_bindings(&mut self, bound: &[Binding]) {
+        for (name, ty, slot) in bound {
+            self.note_slot(name, *ty, *slot);
+        }
         if let Some(scope) = self.scopes.last_mut() {
             for (name, ty, slot) in bound {
                 scope.insert(name.clone(), (*ty, *slot));
@@ -4003,6 +4040,7 @@ impl Emitter {
                 let _ = self.builder.build_store(slot, zero);
             }
         }
+        self.note_slot(&name, ty, slot);
         if let Some(scope) = self.scopes.last_mut() {
             scope.insert(name, (ty, slot));
         }
@@ -4990,6 +5028,7 @@ impl Emitter {
         let _ = self.builder.build_store(limit, end_int);
         let value_slot = if value.name != "_" {
             let slot = self.alloca(DuxType::I64, &value.name);
+            self.note_slot(&value.name, DuxType::I64, slot);
             if let Some(scope) = self.scopes.last_mut() {
                 scope.insert(value.name.clone(), (DuxType::I64, slot));
             }
@@ -5104,6 +5143,7 @@ impl Emitter {
         let index_slot = match index.filter(|bind| bind.name != "_") {
             Some(bind) => {
                 let slot = self.alloca(DuxType::I64, &bind.name);
+                self.note_slot(&bind.name, DuxType::I64, slot);
                 if let Some(scope) = self.scopes.last_mut() {
                     scope.insert(bind.name.clone(), (DuxType::I64, slot));
                 }
@@ -5113,6 +5153,7 @@ impl Emitter {
         };
         let value_slot = if value.name != "_" {
             let slot = self.alloca(element, &value.name);
+            self.note_slot(&value.name, element, slot);
             if let Some(scope) = self.scopes.last_mut() {
                 scope.insert(value.name.clone(), (element, slot));
             }
@@ -6840,10 +6881,9 @@ impl Emitter {
         self.builder.set_current_debug_location(location);
     }
 
-    /// A `DISubprogram` per function. Parameter types are described for the
-    /// primitives; a function that touches anything richer gets an empty
-    /// signature — full DWARF type DIEs land at M7, the line table does not
-    /// depend on them.
+    /// A `DISubprogram` per function, with its real signature: every
+    /// parameter and the answer are described by the type DIEs the lowering
+    /// resolves, so a debugger reads a function as the program wrote it.
     fn begin_function_debug(
         &mut self,
         function: &FnDecl,
@@ -6863,7 +6903,7 @@ impl Emitter {
         let mut params = Vec::new();
         let mut exact = true;
         for param in &function.params {
-            match DuxType::from_ast(&param.ty).and_then(|ty| self.di_type(ty)) {
+            match self.type_of(&param.ty).and_then(|ty| self.di_type(ty)) {
                 Some(ty) => params.push(ty),
                 None => exact = false,
             }
@@ -6871,7 +6911,7 @@ impl Emitter {
         let return_type: Option<Option<inkwell::debug_info::DIType<'static>>> =
             match function.return_ty.as_ref() {
                 None => Some(None),
-                Some(ty) => match DuxType::from_ast(ty) {
+                Some(ty) => match self.type_of(ty) {
                     Some(ty) => self.di_type(ty).map(Some),
                     None => None,
                 },
@@ -6905,6 +6945,7 @@ impl Emitter {
         );
         fn_value.set_subprogram(subprogram);
         self.scope = Some(subprogram);
+        self.di_scope_file = Some(file);
         self.builder.unset_current_debug_location();
         self.set_location(function.name.span);
     }
@@ -6923,7 +6964,7 @@ impl Emitter {
     }
 
     fn di_type(&mut self, ty: DuxType) -> Option<inkwell::debug_info::DIType<'static>> {
-        let dibuilder = self.dibuilder.as_ref()?;
+        self.dibuilder.as_ref()?;
         let (name, bits, encoding) = match ty {
             DuxType::Bool => ("bool", 1, DW_ATE_BOOLEAN),
             DuxType::I8 => ("i8", 8, DW_ATE_SIGNED),
@@ -6945,12 +6986,443 @@ impl Emitter {
             ),
             DuxType::F32 => ("f32", 32, DW_ATE_FLOAT),
             DuxType::F64 => ("f64", 64, DW_ATE_FLOAT),
-            _ => return None,
+            DuxType::CLongDouble => ("c_long_double", 128, DW_ATE_FLOAT),
+            _ => {
+                let key = ty.key();
+                if let Some(found) = self.di_types.get(&key).copied() {
+                    return Some(found);
+                }
+                if !self.di_under_construction.insert(key.clone()) {
+                    return None;
+                }
+                let built = self.di_derived(ty);
+                self.di_under_construction.remove(&key);
+                if let Some(built) = built {
+                    self.di_types.insert(key, built);
+                }
+                return built;
+            }
         };
-        dibuilder
-            .create_basic_type(name, bits, encoding, DIFlags::ZERO)
-            .ok()
-            .map(|ty| ty.as_type())
+        let created = match &self.dibuilder {
+            Some(dibuilder) => dibuilder
+                .create_basic_type(name, bits, encoding, DIFlags::ZERO)
+                .ok()
+                .map(|ty| ty.as_type()),
+            None => None,
+        };
+        created
+    }
+
+    /// The shapes above the primitives: records with their fields and byte
+    /// offsets, tuples by position, arrays and slices, pointers whose pointee
+    /// is a type too, sum types told as the tag-plus-payload they really
+    /// are, and function pointers with their signature. A record imported
+    /// from C answers by its own name — `point`, not `demo.point` — because
+    /// a debugger is showing the user the program, not the linker's table.
+    fn di_derived(&mut self, ty: DuxType) -> Option<inkwell::debug_info::DIType<'static>> {
+        let scope = self.compile_unit?.as_debug_info_scope();
+        let data = TargetData::create(&self.layout);
+        match ty {
+            DuxType::Ptr => {
+                let void = self.di_void()?;
+                Some(
+                    self.dibuilder
+                        .as_ref()?
+                        .create_pointer_type("rawptr", void, 64, 64, AddressSpace::default())
+                        .as_type(),
+                )
+            }
+            DuxType::Pointer(target) => {
+                let pointee = self.di_type(*target).or_else(|| self.di_void())?;
+                Some(
+                    self.dibuilder
+                        .as_ref()?
+                        .create_pointer_type("", pointee, 64, 64, AddressSpace::default())
+                        .as_type(),
+                )
+            }
+            DuxType::Str => {
+                let (file, line) = self.di_decl_site("");
+                self.di_pair("string", file, line, "data", "length")
+            }
+            DuxType::Slice(_) => {
+                let (file, line) = self.di_decl_site("");
+                let name = ty.name();
+                self.di_pair(&name, file, line, "data", "length")
+            }
+            DuxType::Array(info) => {
+                let element = self.di_type(info.elem)?;
+                let element_llvm = self.llvm_of(info.elem);
+                let size = data.get_abi_size(&element_llvm) * info.len;
+                let align = data.get_abi_alignment(&element_llvm);
+                let bounds = 0..info.len as i64;
+                let subscripts = [bounds];
+                Some(
+                    self.dibuilder
+                        .as_ref()?
+                        .create_array_type(element, size, align, &subscripts)
+                        .as_type(),
+                )
+            }
+            DuxType::Tuple(info) => {
+                let elems = info.elems.clone();
+                let llvm: BasicTypeEnum = info.llvm.into();
+                let (file, line) = self.di_decl_site("");
+                let size = data.get_abi_size(&llvm) * 8;
+                let align = data.get_abi_alignment(&llvm);
+                let mut members: Vec<inkwell::debug_info::DIType<'static>> = Vec::new();
+                for (index, elem) in elems.iter().enumerate() {
+                    let index = index as u32;
+                    let Some(elem_dity) = self.di_type(*elem) else {
+                        continue;
+                    };
+                    let at = data.offset_of_element(&info.llvm, index).unwrap_or(0) * 8;
+                    let elem_size = data.get_abi_size(&self.llvm_of(*elem)) * 8;
+                    let elem_align = data.get_abi_alignment(&self.llvm_of(*elem));
+                    members.push(self.di_member(
+                        &format!("{index}"),
+                        (file, line),
+                        elem_size,
+                        elem_align,
+                        at,
+                        elem_dity,
+                    )?);
+                }
+                Some(
+                    self.dibuilder
+                        .as_ref()?
+                        .create_struct_type(
+                            scope,
+                            &ty.name(),
+                            file,
+                            line,
+                            size,
+                            align,
+                            DIFlags::ZERO,
+                            None,
+                            &members,
+                            0,
+                            None,
+                            "",
+                        )
+                        .as_type(),
+                )
+            }
+            DuxType::Struct(info) => {
+                let fields = self.struct_field_list(info).to_vec();
+                let site = info.name.to_string();
+                let written = di_written_name(info.name);
+                let (file, line) = self.di_decl_site(&site);
+                let llvm: BasicTypeEnum = info.llvm.into();
+                let size = data.get_abi_size(&llvm) * 8;
+                let align = data.get_abi_alignment(&llvm);
+                let mut members: Vec<inkwell::debug_info::DIType<'static>> = Vec::new();
+                for (index, (field, field_ty)) in fields.iter().enumerate() {
+                    let index = index as u32;
+                    let Some(field_dity) = self.di_type(*field_ty) else {
+                        continue;
+                    };
+                    let at = data.offset_of_element(&info.llvm, index).unwrap_or(0) * 8;
+                    let field_llvm = self.llvm_of(*field_ty);
+                    members.push(self.di_member(
+                        field,
+                        (file, line),
+                        data.get_abi_size(&field_llvm) * 8,
+                        data.get_abi_alignment(&field_llvm),
+                        at,
+                        field_dity,
+                    )?);
+                }
+                let _ = spelled;
+                Some(
+                    self.dibuilder
+                        .as_ref()?
+                        .create_struct_type(
+                            scope,
+                            written,
+                            file,
+                            line,
+                            size,
+                            align,
+                            DIFlags::ZERO,
+                            None,
+                            &members,
+                            0,
+                            None,
+                            "",
+                        )
+                        .as_type(),
+                )
+            }
+            DuxType::Enum(info) => {
+                let written = di_written_name(info.name).to_string();
+                let (file, line) = self.di_decl_site(info.name);
+                let llvm = info.llvm;
+                let size = data.get_abi_size(&llvm) * 8;
+                let align = data.get_abi_alignment(&llvm);
+                let niche = !matches!(llvm, BasicTypeEnum::StructType(_));
+                let mut members: Vec<inkwell::debug_info::DIType<'static>> = Vec::new();
+                if niche {
+                    // The pointer that is the sum type doubles as its own
+                    // tag; the debugger sees the address, and the variants
+                    // keep their names through the struct below.
+                } else {
+                    let tag_dity = self.di_type(DuxType::U16)?;
+                    members.push(self.di_member(
+                        "tag",
+                        (file, line),
+                        16,
+                        2,
+                        info.tag_at * 8,
+                        tag_dity,
+                    )?);
+                }
+                for variant in &info.variants {
+                    if variant.fields.is_empty() {
+                        continue;
+                    }
+                    let name = variant.name.to_string();
+                    let fields = variant.fields.clone();
+                    let offsets = variant.offsets.clone();
+                    let at_base = if niche {
+                        0
+                    } else {
+                        *offsets.first().unwrap_or(&0)
+                    };
+                    let mut field_types: Vec<(
+                        String,
+                        inkwell::debug_info::DIType<'static>,
+                        u64,
+                        u64,
+                        u32,
+                    )> = Vec::new();
+                    for (at, (field, field_ty)) in fields.iter().enumerate() {
+                        let Some(field_dity) = self.di_type(*field_ty) else {
+                            continue;
+                        };
+                        let field_llvm = self.llvm_of(*field_ty);
+                        field_types.push((
+                            field.to_string(),
+                            field_dity,
+                            *offsets.get(at).unwrap_or(&0) * 8 - at_base * 8,
+                            data.get_abi_size(&field_llvm) * 8,
+                            data.get_abi_alignment(&field_llvm),
+                        ));
+                    }
+                    let mut member_types: Vec<inkwell::debug_info::DIType<'static>> = Vec::new();
+                    for (field, field_dity, at, field_size, field_align) in field_types {
+                        member_types.push(self.di_member(
+                            &field,
+                            (file, line),
+                            field_size,
+                            field_align,
+                            at,
+                            field_dity,
+                        )?);
+                    }
+                    let payload = self.dibuilder.as_ref()?.create_struct_type(
+                        scope,
+                        &format!("{written}::{name}"),
+                        file,
+                        line,
+                        size - at_base * 8,
+                        align,
+                        DIFlags::ZERO,
+                        None,
+                        &member_types,
+                        0,
+                        None,
+                        "",
+                    );
+                    members.push(self.di_member(
+                        &name,
+                        (file, line),
+                        size - at_base * 8,
+                        align,
+                        at_base * 8,
+                        payload.as_type(),
+                    )?);
+                }
+                Some(
+                    self.dibuilder
+                        .as_ref()?
+                        .create_struct_type(
+                            scope,
+                            &written,
+                            file,
+                            line,
+                            size,
+                            align,
+                            DIFlags::ZERO,
+                            None,
+                            &members,
+                            0,
+                            None,
+                            "",
+                        )
+                        .as_type(),
+                )
+            }
+            DuxType::Fn(_) => {
+                let name = ty.name();
+                Some(
+                    self.dibuilder
+                        .as_ref()?
+                        .create_basic_type(&name, 64, DW_ATE_ADDRESS, DIFlags::ZERO)
+                        .ok()?
+                        .as_type(),
+                )
+            }
+            _ => None,
+        }
+    }
+
+    /// The `{ data, length }` shape a `string` and a `[]T` share.
+    fn di_pair(
+        &mut self,
+        name: &str,
+        file: DIFile<'static>,
+        line: u32,
+        first: &str,
+        second: &str,
+    ) -> Option<inkwell::debug_info::DIType<'static>> {
+        let scope = self.compile_unit?.as_debug_info_scope();
+        let void = self.di_void()?;
+        let pointer = self
+            .dibuilder
+            .as_ref()?
+            .create_pointer_type("", void, 64, 64, AddressSpace::default())
+            .as_type();
+        let length = self.di_type(DuxType::U64)?;
+        let data_member = self.di_member(first, (file, line), 64, 64, 0, pointer)?;
+        let length_member = self.di_member(second, (file, line), 64, 64, 64, length)?;
+        Some(
+            self.dibuilder
+                .as_ref()?
+                .create_struct_type(
+                    scope,
+                    name,
+                    file,
+                    line,
+                    128,
+                    64,
+                    DIFlags::ZERO,
+                    None,
+                    &[data_member, length_member],
+                    0,
+                    None,
+                    "",
+                )
+                .as_type(),
+        )
+    }
+
+    fn di_member(
+        &self,
+        name: &str,
+        place: (DIFile<'static>, u32),
+        size_bits: u64,
+        align_bits: u32,
+        offset_bits: u64,
+        ty: inkwell::debug_info::DIType<'static>,
+    ) -> Option<inkwell::debug_info::DIType<'static>> {
+        let scope = self.compile_unit?.as_debug_info_scope();
+        let (file, line) = place;
+        Some(
+            self.dibuilder
+                .as_ref()?
+                .create_member_type(
+                    scope,
+                    name,
+                    file,
+                    line,
+                    size_bits,
+                    align_bits,
+                    offset_bits,
+                    DIFlags::ZERO,
+                    ty,
+                )
+                .as_type(),
+        )
+    }
+
+    /// The void a pointer to nothing points at, and the void a function
+    /// without an answer returns.
+    fn di_void(&self) -> Option<inkwell::debug_info::DIType<'static>> {
+        Some(
+            self.dibuilder
+                .as_ref()?
+                .create_basic_type("void", 0, DW_ATE_ADDRESS, DIFlags::ZERO)
+                .ok()?
+                .as_type(),
+        )
+    }
+
+    /// Where a type was declared, for the DIE that speaks of it. A type the
+    /// program never declared — a slice, a tuple, the view inside a
+    /// `string` — belongs to the first file, where the program is.
+    fn di_decl_site(&mut self, name: &str) -> (DIFile<'static>, u32) {
+        if let Some(span) = self.di_decl_sites.get(name).copied() {
+            let file = self.di_file(span.file);
+            let (line, _) = self.sources.line_col(span.file, span.start);
+            return (file, line as u32);
+        }
+        let file = self.di_file(self.sources.first_file().unwrap_or_default());
+        (file, 0)
+    }
+
+    /// The LLVM shape a Dux type has, for the layout questions a DIE asks.
+    fn llvm_of(&self, ty: DuxType) -> BasicTypeEnum<'static> {
+        ty.llvm(self.context)
+    }
+
+    /// A slot a name lives in gets a debugger's blessing too: the name,
+    /// its type and where the value rests. A name whose type has no DIE
+    /// yet, or a slot bound where no debug location stands, passes
+    /// unannounced — the program runs the same either way.
+    fn note_slot(&mut self, name: &str, ty: DuxType, storage: PointerValue<'static>) {
+        if name == "_" {
+            return;
+        }
+        let Some(location) = self.builder.get_current_debug_location() else {
+            return;
+        };
+        let Some(di_type) = self.di_type(ty) else {
+            return;
+        };
+        let Some(file) = self.di_scope_file else {
+            return;
+        };
+        let Some(scope) = self.scope else {
+            return;
+        };
+        let Some(block) = self.allocas else {
+            return;
+        };
+        let Some(dibuilder) = &self.dibuilder else {
+            return;
+        };
+        let variable = dibuilder.create_auto_variable(
+            scope.as_debug_info_scope(),
+            name,
+            file,
+            location.get_line(),
+            di_type,
+            true,
+            DIFlags::ZERO,
+            0,
+        );
+        let expression = dibuilder.create_expression(Vec::new());
+        unsafe {
+            inkwell::llvm_sys::debuginfo::LLVMDIBuilderInsertDeclareRecordAtEnd(
+                dibuilder.as_mut_ptr(),
+                storage.as_value_ref(),
+                variable.as_mut_ptr(),
+                expression.as_mut_ptr(),
+                location.as_mut_ptr(),
+                block.as_mut_ptr(),
+            );
+        }
     }
 }
 

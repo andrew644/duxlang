@@ -2,8 +2,6 @@
 
 ## M7 — toolchain maturity
 
-- [ ] Full DWARF type DIEs for user types; `DW_LANG_C99` DIEs for imported C types so lldb prints them
-- [ ] `-O2` release pipeline; prove release stdout identical to debug on the corpus
 - [ ] `dux test` subcommand: test discovery, runner, per-run leak report
 - [ ] `lldb -batch` smoke test in the suite
 - [ ] Grow the negative-test corpus (bad `match` arms, layout, conversions all have seeds; pointers/allocations do not)

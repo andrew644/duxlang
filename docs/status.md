@@ -167,6 +167,10 @@ each remaining gap is waiting for. A gap is a milestone, never a verdict.
   value.
 - **An interpolated hole holds no quotes.** `{f("x")}` does not lex; `{x}` and
   `{}` with trailing arguments do.
-- **Full DWARF type DIEs land at M7.** Today's debug info is the line table
-  plus subprograms with primitive parameter types — enough for `gdb` to stop
-  on Dux lines and print source.
+- **The debug info describes the program.** Every function carries its real
+  signature — records with their fields and byte offsets, sum types as tag
+  beside their variant payloads, arrays, slices, pointers and imported C
+  records by their C names — and every binding, parameter and loop variable
+  announces itself, so `lldb` prints `(Vec3) big = { x = 2, y = 4, z = 6 }`
+  and `(Point) p = { x = 3, y = 4 }` straight out of the running program.
+  A `dux test` runner and an `lldb -batch` smoke join at M7.

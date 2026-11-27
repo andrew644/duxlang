@@ -545,6 +545,56 @@ fn the_normative_control_flow_example_runs_every_loop_and_a_match() {
 }
 
 #[test]
+fn the_debug_info_describes_the_program_the_way_a_debugger_reads_it() {
+    let fixture = Path::new(FIXTURE_DIR).join("debug_types.dux");
+    let scratch = Path::new(SCRATCH_DIR).join("debug-types");
+    let _ = std::fs::remove_dir_all(&scratch);
+    let object = scratch.join("program");
+    std::fs::create_dir_all(&scratch).expect("scratch is writable");
+    let build = Command::new(env!("CARGO_BIN_EXE_duxc"))
+        .arg("build")
+        .arg(&fixture)
+        .arg("-o")
+        .arg(&object)
+        .arg("--out-dir")
+        .arg(&scratch)
+        .output()
+        .expect("the compiler runs");
+    assert_eq!(
+        build.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+    let dump = ["llvm-dwarfdump-23", "llvm-dwarfdump"]
+        .iter()
+        .map(|tool| Command::new(tool).arg("--debug-info").arg(&object).output())
+        .find_map(|attempt| attempt.ok())
+        .expect("llvm-dwarfdump is runnable");
+    assert!(
+        dump.status.success(),
+        "llvm-dwarfdump failed: {}",
+        String::from_utf8_lossy(&dump.stderr)
+    );
+    let dwarf = String::from_utf8_lossy(&dump.stdout).into_owned();
+    for wanted in [
+        "DW_TAG_structure_type",
+        "DW_AT_name\t(\"Vec3\")",
+        "DW_AT_name\t(\"x\")",
+        "DW_AT_name\t(\"Event::Tick\")",
+        "DW_TAG_array_type",
+        "DW_TAG_variable",
+        "DW_AT_name\t(\"big\")",
+        "DW_AT_name\t(\"k\")",
+    ] {
+        assert!(
+            dwarf.contains(wanted),
+            "the debug info does not say {wanted}:\n{dwarf}"
+        );
+    }
+}
+
+#[test]
 fn cimports_names_what_crossed_and_what_the_header_kept_back() {
     let report = Path::new(FIXTURE_DIR).join("c_header_lib.dux");
     let text = Command::new(env!("CARGO_BIN_EXE_duxc"))
