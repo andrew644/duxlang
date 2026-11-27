@@ -165,6 +165,23 @@ fn the_mapping_table_crosses_what_it_promises() {
 }
 
 #[test]
+fn long_double_crosses_as_c_long_double() {
+    let decls = mini();
+    let wide = function(&decls, "dux_wide");
+    assert!(
+        matches!(wide.returns, Some(CType::LongDouble)),
+        "clang says `long double` and the walk keeps it"
+    );
+    let text = spell("mini", &decls);
+    assert!(
+        text.contains(
+            "fn dux_wide(x: c_long_double, spare: Option<*c_long_double>) -> c_long_double"
+        ),
+        "C's widest float arrives whole, never disguised as a double:\n{text}"
+    );
+}
+
+#[test]
 fn static_inline_reaches_the_module_through_a_wrapper() {
     let decls = mini();
     let text = spell("mini", &decls);

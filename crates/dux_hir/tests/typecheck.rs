@@ -1275,6 +1275,39 @@ fn hash_answers_an_integer_and_nothing_else_adopts_it_for_free() {
 }
 
 #[test]
+fn c_long_double_widens_for_free_and_narrows_by_written_as() {
+    let widening = "package main
+extern \"C\" {
+    fn wide(x: c_long_double) -> c_long_double
+}
+fn main() {
+    scale: c_long_double = 0.5
+    half := wide(2.25)
+    back := half as f64
+    println($\"{}\", back)
+}";
+    let found = codes(widening);
+    assert!(
+        found.is_empty(),
+        "every IEEE float fits C's widest one for free (D25): {found:?}"
+    );
+
+    let narrowing = "package main
+extern \"C\" {
+    fn wide(x: c_long_double) -> c_long_double
+}
+fn main() {
+    up := wide(1.5)
+    down: f64 = up
+    println($\"{}\", down)
+}";
+    assert!(
+        codes(narrowing).contains(&dux_diag::code::LOSSY_CONVERSION),
+        "the wide float does not shrink into an `f64` for free"
+    );
+}
+
+#[test]
 fn c_integers_are_their_own_types() {
     let source = "package main
 extern \"C\" {

@@ -484,7 +484,7 @@ fn cimports_names_what_crossed_and_what_the_header_kept_back() {
         .expect("the compiler runs");
     let said = String::from_utf8_lossy(&text.stdout);
     assert!(
-        said.contains("edge (cedge.h)") && said.contains("3 declaration(s) crossed"),
+        said.contains("edge (cedge.h)") && said.contains("5 declaration(s) crossed"),
         "the namespace reports itself:\n{said}"
     );
     assert!(

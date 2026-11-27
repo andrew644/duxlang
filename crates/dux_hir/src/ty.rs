@@ -100,6 +100,12 @@ pub enum Ty {
     C(CInt),
     F32,
     F64,
+    /// C's `long double`: its own shape, wider than either IEEE float, and
+    /// no IEEE shape at all. It exists so a header's widest float can cross
+    /// the boundary whole; the arithmetic lattice keeps out of it, and a
+    /// value of it copies, sits, is addressed and converts, but computes
+    /// nothing.
+    CLongDouble,
     Str,
     Ptr,
     /// `*T`: a non-null pointer with a known target. `rawptr` is `Ptr`.
@@ -150,6 +156,7 @@ impl Ty {
             Ty::U64 => "u64".to_string(),
             Ty::F32 => "f32".to_string(),
             Ty::F64 => "f64".to_string(),
+            Ty::CLongDouble => "c_long_double".to_string(),
             Ty::Str => "string".to_string(),
             Ty::Ptr => "rawptr".to_string(),
             Ty::Targeted(target) => format!("*{}", target.name()),
@@ -243,6 +250,7 @@ impl Ty {
             Ty::I8 | Ty::U8 => 8,
             Ty::I16 | Ty::U16 => 16,
             Ty::I32 | Ty::U32 | Ty::F32 => 32,
+            Ty::CLongDouble => 128,
             _ => 64,
         }
     }
@@ -323,6 +331,11 @@ impl Ty {
             return self.width() <= 16 || (self.width() <= 32 && *to == Ty::F64);
         }
         if *self == Ty::F32 && *to == Ty::F64 {
+            return true;
+        }
+        // C's widest float holds every IEEE value the language has (D25):
+        // the destination's set swallows the source's whole.
+        if self.is_float() && *to == Ty::CLongDouble {
             return true;
         }
         if *self == Ty::Ptr && *to == Ty::Str {
@@ -546,9 +559,11 @@ fn primitive(name: &str) -> Option<Ty> {
         "c_ulong_long" => Ty::C(CInt::ULongLong),
         "c_bool" => Ty::C(CInt::Bool),
         // C's floats map straight through (DESIGN 5.2): no distinct type and
-        // no newtype, because there is only one IEEE shape each.
+        // no newtype, because there is only one IEEE shape each. `long double`
+        // has no IEEE shape to borrow, so it gets one of its own.
         "c_float" => Ty::F32,
         "c_double" => Ty::F64,
+        "c_long_double" => Ty::CLongDouble,
         "i8" | "byte" => Ty::I8,
         "i16" => Ty::I16,
         "i32" | "int" | "rune" => Ty::I32,
@@ -1366,7 +1381,7 @@ impl<'a> Checker<'a> {
                 self.mismatch(span, expected, &value);
                 to.clone()
             }
-            (Ty::FloatConst(_), to) if to.is_float() => to.clone(),
+            (Ty::FloatConst(_), to) if to.is_float() || *to == Ty::CLongDouble => to.clone(),
             (Ty::FloatConst(_), to) => {
                 self.report(
                     span,
@@ -1398,6 +1413,8 @@ impl<'a> Checker<'a> {
                     return to.clone();
                 }
                 let on_the_numeric_lattice = (from.is_numeric() && to.is_numeric())
+                    || (from.is_float() && *to == Ty::CLongDouble)
+                    || (from == Ty::CLongDouble && to.is_float())
                     || (from == Ty::Ptr && *to == Ty::Str)
                     || (from.is_pointer() && to.is_pointer())
                     || (from.is_pointer() && option_of_pointer(to))

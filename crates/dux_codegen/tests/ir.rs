@@ -252,6 +252,31 @@ fn an_f32_past_the_written_list_becomes_a_double() {
 }
 
 #[test]
+fn c_long_double_is_the_machine_wide_c_float_everywhere_it_lands() {
+    let ir = build(
+        "package main\nstruct Wide {\n    part: c_long_double,\n    tag: c_int,\n}\nextern \"C\" {\n    fn wide(x: c_long_double) -> c_long_double\n}\nfn main() {\n    measure: f64 = 2.5\n    up := wide(measure)\n    back := up as f64\n    println($\"{}\", back)\n    whole := Wide { part: up, tag: 1 }\n    println($\"{}\", whole.tag)\n}",
+    )
+    .expect("builds")
+    .ir_text();
+    assert!(
+        ir.contains("declare x86_fp80 @wide(x86_fp80, ...)"),
+        "the declaration is exactly what clang would write for `long double`:\n{ir}"
+    );
+    assert!(
+        ir.contains("%Wide = type { x86_fp80, i32 }"),
+        "a record holds the wide float the way C lays it out:\n{ir}"
+    );
+    assert!(
+        ir.contains("fpext double"),
+        "an IEEE value widens into it:\n{ir}"
+    );
+    assert!(
+        ir.contains("fptrunc x86_fp80"),
+        "and comes back by a written `as`:\n{ir}"
+    );
+}
+
+#[test]
 fn a_string_crosses_the_boundary_as_its_bytes() {
     let ir = build(
         "package main\nextern \"C\" {\n    fn strlen(s: *c_char) -> usize\n}\nfn main() {\n    text := \"dux\"\n    n := strlen(text)\n    println($\"{}\", n)\n}",

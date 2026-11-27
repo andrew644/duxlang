@@ -59,6 +59,12 @@ pub(crate) enum DuxType {
     C(CInt),
     F32,
     F64,
+    /// C's `long double` (DESIGN 5.2): the machine's widest C float, LLVM's
+    /// `x86_fp80` on this target. It is exactly what clang hands a C
+    /// function, in a struct and across a boundary; the language gives it
+    /// no operators, no methods and no literals - only `as` reaches it and
+    /// only `as` comes back.
+    CLongDouble,
     /// A string literal: a pointer into NUL terminated static storage. The
     /// fat `{ ptr, len }` form arrives with slices at M3.
     Str,
@@ -272,6 +278,7 @@ impl DuxType {
             "c_bool" => DuxType::C(CInt::Bool),
             "c_float" => DuxType::F32,
             "c_double" => DuxType::F64,
+            "c_long_double" => DuxType::CLongDouble,
             "f32" => DuxType::F32,
             "f64" | "float" => DuxType::F64,
             "string" => DuxType::Str,
@@ -293,6 +300,7 @@ impl DuxType {
                 | DuxType::Array(_)
                 | DuxType::Slice(_)
                 | DuxType::Tuple(_)
+                | DuxType::CLongDouble
         ) || self.is_integral()
             || self.is_float()
     }
@@ -359,6 +367,7 @@ impl DuxType {
             DuxType::I8 | DuxType::U8 => 8,
             DuxType::I16 | DuxType::U16 => 16,
             DuxType::I32 | DuxType::U32 | DuxType::F32 => 32,
+            DuxType::CLongDouble => 128,
             _ => 64,
         }
     }
@@ -378,6 +387,7 @@ impl DuxType {
             },
             DuxType::F32 => context.f32_type().into(),
             DuxType::F64 => context.f64_type().into(),
+            DuxType::CLongDouble => wide_float_type(context).into(),
             DuxType::Ptr | DuxType::Error => context.ptr_type(AddressSpace::default()).into(),
             DuxType::Fn(_) => context.ptr_type(AddressSpace::default()).into(),
             DuxType::Pointer(_) => context.ptr_type(AddressSpace::default()).into(),
@@ -434,6 +444,7 @@ impl DuxType {
             DuxType::C(kind) => kind.spelled().to_string(),
             DuxType::F32 => "f32".to_string(),
             DuxType::F64 => "f64".to_string(),
+            DuxType::CLongDouble => "c_long_double".to_string(),
             DuxType::Str => "string".to_string(),
             DuxType::Ptr => "rawptr".to_string(),
             DuxType::Pointer(target) => format!("*{}", target.name()),
@@ -489,6 +500,7 @@ impl DuxType {
                 }
             }
             DuxType::F32 | DuxType::F64 => return true,
+            DuxType::CLongDouble => return false,
             DuxType::Array(..)
             | DuxType::Struct(..)
             | DuxType::Tuple(..)
@@ -2414,16 +2426,39 @@ impl Emitter {
     }
 
     /// The alignment the allocator must respect. A fixed shape's alignment is
-    /// its first field's, and no primitive the language has asks for more than
-    /// eight bytes.
+    /// its first field's, and the target's own layout has the last word:
+    /// a field's offset in a `{ i8, T }` is `T`'s alignment, and C's widest
+    /// float asks for more than any Dux primitive does.
     fn alignment_of(&mut self, ty: BasicTypeEnum<'static>) -> u32 {
         let size = self
             .size_of(ty)
             .and_then(|size| size.get_zero_extended_constant());
-        match size {
+        let natural = match size {
             Some(value) if value < 8 => value as u32,
             _ => 8,
+        };
+        let i64_type = self.context.i64_type();
+        let probe = self
+            .context
+            .struct_type(&[self.context.i8_type().into(), ty], false);
+        let probe_address = unsafe {
+            self.builder
+                .build_gep(
+                    probe,
+                    self.context.ptr_type(AddressSpace::default()).const_null(),
+                    &[i64_type.const_zero(), i64_type.const_int(1, false)],
+                    "aligned",
+                )
+                .ok()
         }
+        .and_then(|at| {
+            self.builder
+                .build_ptr_to_int(at, i64_type, "alignment")
+                .ok()
+        })
+        .and_then(|offset| offset.get_zero_extended_constant())
+        .unwrap_or(natural as u64);
+        natural.max(probe_address as u32)
     }
 
     /// A `"file:line"` literal for the allocator's location field.
@@ -7960,6 +7995,10 @@ impl Emitter {
         if from == DuxType::F32 && to == DuxType::F64 {
             return true;
         }
+        // C's widest float holds every IEEE value the language has (D25).
+        if from.is_float() && to == DuxType::CLongDouble {
+            return true;
+        }
         if from == DuxType::Ptr && to == DuxType::Str {
             return true;
         }
@@ -8055,6 +8094,23 @@ impl Emitter {
                     .build_float_trunc(value.float_value()?, to.float_type(self.context), "fptrunc")
                     .ok()?
             };
+            return Some(Typed::float(cast, to));
+        }
+        // C's widest float takes an IEEE value by extension and gives one
+        // back by truncation; the widening is the lossless direction, and
+        // narrowing is a written `as`.
+        if from.is_float() && to == DuxType::CLongDouble {
+            let cast = self
+                .builder
+                .build_float_ext(value.float_value()?, wide_float_type(self.context), "widen")
+                .ok()?;
+            return Some(Typed::float(cast, to));
+        }
+        if from == DuxType::CLongDouble && to.is_float() {
+            let cast = self
+                .builder
+                .build_float_trunc(value.float_value()?, to.float_type(self.context), "narrow")
+                .ok()?;
             return Some(Typed::float(cast, to));
         }
         if from == DuxType::Bool && to.is_integral() {
@@ -9830,6 +9886,18 @@ fn compound_op(op: dux_ast::AssignOp) -> Option<BinaryOp> {
     })
 }
 
+/// The machine's widest C float: LLVM's x86 80-bit extended, padded and
+/// aligned to sixteen bytes by the target layout - exactly the shape clang
+/// gives `long double`. inkwell does not wrap the type; LLVM's C API does,
+/// which is where every other compiler gets it from.
+fn wide_float_type(context: &inkwell::context::Context) -> FloatType<'_> {
+    unsafe {
+        FloatType::new(inkwell::llvm_sys::core::LLVMX86FP80TypeInContext(
+            context.raw(),
+        ))
+    }
+}
+
 fn spec_for(ty: DuxType) -> Option<&'static str> {
     if ty.slice_element().is_some() {
         return None;
@@ -9854,6 +9922,7 @@ fn spec_for(ty: DuxType) -> Option<&'static str> {
         | DuxType::Tuple(..)
         | DuxType::Enum(_)
         | DuxType::Slice(_)
+        | DuxType::CLongDouble
         | DuxType::Error => return None,
     })
 }

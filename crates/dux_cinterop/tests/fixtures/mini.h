@@ -52,3 +52,5 @@ union counter {
     };
     long whole;
 };
+
+long double dux_wide(long double x, long double *spare);

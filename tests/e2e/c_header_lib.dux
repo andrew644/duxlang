@@ -2,7 +2,8 @@ package main
 //@stderr_empty
 // The compiled translation unit: `static inline` definitions and the
 // state behind them arrive with the program, not with a library someone
-// has to remember to link. The header *is* the library.
+// has to remember to link. The header *is* the library. And the widest
+// float C has — `long double` — crosses as `c_long_double`, whole.
 
 #[c_include("cedge.h")]
 mod edge;
@@ -11,4 +12,10 @@ fn main() {
     println($"service={}", edge.cedge_service(2))
     println($"first={}", edge.cedge_visit())
     println($"second={}", edge.cedge_visit())
+    step: c_long_double = 0.5
+    scaled := edge.cedge_scale(2.25, step)
+    scratch: c_long_double = 0.0
+    echoed := edge.cedge_store(scaled, &scratch)
+    println($"scaled={}", scaled as f64)
+    println($"stored={}", echoed as f64)
 }

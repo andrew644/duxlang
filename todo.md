@@ -2,7 +2,6 @@
 
 ## C interop (M6 "remaining: reported, none silent")
 
-- [ ] Import `long double` as `c_long_double`
 - [ ] Import function-like macros
 - [ ] Import global variables from headers
 

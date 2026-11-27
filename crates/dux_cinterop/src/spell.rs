@@ -333,7 +333,7 @@ fn field_crosses(
                 && record_crosses(name, bodies, underlying, decided, trail)
         }
         CType::Typedef(_, target) => field_crosses(target, bodies, underlying, decided, trail),
-        CType::Opaque(_) | CType::Void | CType::LongDouble => false,
+        CType::Opaque(_) | CType::Void => false,
         _ => true,
     }
 }
@@ -514,7 +514,10 @@ fn spelling(ctx: &Ctx, ty: &CType) -> Option<String> {
         CType::ULongLong => "c_ulong_long",
         CType::Float => "c_float",
         CType::Double => "c_double",
-        CType::LongDouble => return None,
+        // C's widest float keeps a type of its own (DESIGN 5.2): there is no
+        // IEEE shape for it to borrow, and pretending it is a `c_double`
+        // would mislay both its size and its ABI.
+        CType::LongDouble => "c_long_double",
         CType::Pointer(target) => {
             if matches!(resolve(target), CType::Void) {
                 return Some("rawptr".to_string());
