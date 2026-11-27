@@ -15,6 +15,7 @@ struct Spec {
     expected_stderr: Option<String>,
     require_clean_stderr: bool,
     release: bool,
+    debug_only: bool,
     program_args: Vec<String>,
 }
 
@@ -36,6 +37,7 @@ impl Spec {
             expected_stderr: None,
             require_clean_stderr: false,
             release: false,
+            debug_only: false,
             program_args: Vec::new(),
         };
         for line in source.lines() {
@@ -65,6 +67,7 @@ impl Spec {
                 }
                 Some("stderr_empty") => spec.require_clean_stderr = true,
                 Some("release") => spec.release = true,
+                Some("debug_only") => spec.debug_only = true,
                 Some("args") => spec.program_args = words.map(String::from).collect(),
                 Some(other) => panic!("{}: unknown directive `//@{other}`", spec.name),
                 None => {}
@@ -112,6 +115,72 @@ fn duxc(spec: &Spec, verb: &str) -> Run {
         stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
         code: output.status.code().unwrap_or(-1),
     }
+}
+
+/// The `-O2` promise: past the first optimization the program is the same
+/// program. Every fixture that does not live in debug machinery runs in the
+/// release build too, and its stdout must arrive exactly as the debug build
+/// pinned it. Fixtures marked `//@debug_only` are the debug runtime's own —
+/// guard pages, poison, bounds traps — and the release build never
+/// promised them. A leak report is debug-only speech too, so the release
+/// road reads stdout and exit codes and stays quiet about stderr.
+#[test]
+fn the_release_build_prints_what_the_debug_build_pinned_across_the_corpus() {
+    let failures: Vec<String> = specs()
+        .into_iter()
+        .filter(|spec| !spec.debug_only && !spec.release)
+        .filter_map(|spec| evaluate_release(spec).err())
+        .collect();
+    assert!(
+        failures.is_empty(),
+        "{} release fixture(s) disagreed with their debug pins:\n\n{}",
+        failures.len(),
+        failures.join("\n\n")
+    );
+}
+
+fn evaluate_release(spec: Spec) -> Result<(), String> {
+    let spec = Spec {
+        release: true,
+        ..spec
+    };
+    let run = duxc(&spec, "run");
+    if let Some(code) = &spec.expect_error {
+        if run.code == 0 {
+            return Err(format!(
+                "{}: the release build compiled a program the debug build refused",
+                spec.name
+            ));
+        }
+        if !run.stderr.contains(code.as_str()) {
+            return Err(format!(
+                "{}: the release build refused with something else:\n{}",
+                spec.name, run.stderr
+            ));
+        }
+        return Ok(());
+    }
+    let expected = std::fs::read_to_string(&spec.expected)
+        .unwrap_or_else(|e| panic!("{}: no .expected ({e})", spec.name));
+    if run.stdout != expected {
+        return Err(format!(
+            "{}: release stdout differs\n--- expected ---\n{expected}--- actual ---\n{}",
+            spec.name, run.stdout
+        ));
+    }
+    if run.code != spec.expected_exit {
+        return Err(format!(
+            "{}: release exit code {} but expected {}",
+            spec.name, run.code, spec.expected_exit
+        ));
+    }
+    if spec.require_clean_stderr && !run.stderr.is_empty() {
+        return Err(format!(
+            "{}: release stderr is not empty:\n{}",
+            spec.name, run.stderr
+        ));
+    }
+    Ok(())
 }
 
 fn update_expected() -> bool {

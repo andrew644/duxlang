@@ -1,5 +1,8 @@
 //@exit 2
 //@stderr index out of bounds
+//@debug_only
+// Bounds checks are the debug build's promise;
+// the release build runs the index unchecked.
 // An index that lands outside its view stops the debug build where the rule
 // broke; the trap message names the line the index was written on.
 

@@ -1,4 +1,7 @@
 //@exit 139
+//@debug_only
+// Guard pages are the debug allocator's promise;
+// the release build maps no guard and faults on nothing.
 // The debug allocator maps each block flush against a guard page, so a
 // write past the end of a block faults at the write rather than rotting
 // the heap around it.

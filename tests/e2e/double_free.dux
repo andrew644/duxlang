@@ -1,5 +1,8 @@
 //@exit 2
 //@stderr double free
+//@debug_only
+// Poison at free is the debug allocator's promise;
+// the release build frees to the platform and catches nothing.
 // A block is poisoned when it is released, so a second free of the same
 // pointer is caught at the second free rather than in a later crash.
 
