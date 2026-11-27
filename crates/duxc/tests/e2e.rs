@@ -855,3 +855,56 @@ fn cimports_names_what_crossed_and_what_the_header_kept_back() {
         "the same report, machine-readable:\n{said}"
     );
 }
+#[test]
+fn a_cross_built_hello_is_a_windows_executable() {
+    if !Path::new("/usr/x86_64-w64-mingw32").is_dir() {
+        eprintln!("this machine has no mingw sysroot to cross into");
+        return;
+    }
+    let out_dir = Path::new(SCRATCH_DIR).join("cross-windows");
+    let exe = out_dir.join("hello.exe");
+    let _ = std::fs::remove_dir_all(&out_dir);
+    let build = Command::new(env!("CARGO_BIN_EXE_duxc"))
+        .arg("build")
+        .arg(Path::new(EXAMPLE_DIR).join("hello.dux"))
+        .arg("--target=x86_64-pc-windows-gnu")
+        .arg("--release")
+        .arg("-o")
+        .arg(&exe)
+        .arg("--out-dir")
+        .arg(&out_dir)
+        .output()
+        .expect("the compiler runs");
+    assert_eq!(
+        build.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+    let listing = Command::new("file").arg(&exe).output().expect("file runs");
+    let said = String::from_utf8_lossy(&listing.stdout).into_owned();
+    assert!(
+        said.contains("PE32+") && said.contains("x86-64"),
+        "the object answers to Windows, not this machine: {said}"
+    );
+}
+
+#[test]
+fn a_cross_build_without_release_says_the_debug_runtime_stays_home() {
+    let out_dir = Path::new(SCRATCH_DIR).join("cross-debug");
+    let _ = std::fs::remove_dir_all(&out_dir);
+    let build = Command::new(env!("CARGO_BIN_EXE_duxc"))
+        .arg("build")
+        .arg(Path::new(EXAMPLE_DIR).join("hello.dux"))
+        .arg("--target=x86_64-pc-windows-gnu")
+        .arg("--out-dir")
+        .arg(&out_dir)
+        .output()
+        .expect("the compiler runs");
+    assert_ne!(build.status.code(), Some(0));
+    let said = String::from_utf8_lossy(&build.stderr).into_owned();
+    assert!(
+        said.contains("--release"),
+        "the program was told how to cross: {said}"
+    );
+}

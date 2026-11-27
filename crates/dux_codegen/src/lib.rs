@@ -82,6 +82,10 @@ pub struct Options {
     /// this way: what clang compiled is part of the program, not something
     /// the linker has to go find.
     pub bitcode: Vec<std::path::PathBuf>,
+    /// The triple to build for, when the program is not built for this
+    /// machine: `x86_64-pc-windows-gnu` and the like. Absent means the
+    /// host, which is what every build was before crossing existed.
+    pub target: Option<String>,
 }
 
 impl Default for Options {
@@ -91,6 +95,7 @@ impl Default for Options {
             debug_allocator: true,
             bounds_checks: true,
             bitcode: Vec::new(),
+            target: None,
         }
     }
 }
@@ -142,7 +147,12 @@ impl CompiledModule {
     ) -> Result<CompiledModule, Vec<Diagnostic>> {
         let context = process_context();
         let module = context.create_module(module_name(program));
-        let machine = target_machine(options.opt_level)?;
+        let machine = target_machine(options.opt_level, options.target.as_deref())?;
+        let triple = options
+            .target
+            .clone()
+            .unwrap_or_else(|| machine.get_triple().as_str().to_string_lossy().into_owned());
+        let windows = triple.contains("windows");
         module.set_triple(&machine.get_triple());
         module.set_data_layout(&machine.get_target_data().get_data_layout());
 
@@ -165,7 +175,7 @@ impl CompiledModule {
         }
 
         select_main(program)?;
-        let mut emitter = Emitter::new(context, sources.clone());
+        let mut emitter = Emitter::new(context, sources.clone(), windows);
         emitter.debug_allocator = options.debug_allocator;
         emitter.bounds_checks = options.bounds_checks;
         let diagnostics = emitter.lower(&module, program);
@@ -202,10 +212,23 @@ impl CompiledModule {
     }
 }
 
-fn target_machine(opt_level: OptLevel) -> Result<TargetMachine, Vec<Diagnostic>> {
+/// The triple this machine would build for when asked nothing else.
+pub fn host_triple() -> String {
+    TargetMachine::get_default_triple()
+        .as_str()
+        .to_string_lossy()
+        .into_owned()
+}
+
+fn target_machine(
+    opt_level: OptLevel,
+    target: Option<&str>,
+) -> Result<TargetMachine, Vec<Diagnostic>> {
     Target::initialize_all(&InitializationConfig::default());
-    let triple = TargetMachine::get_default_triple();
-    let target = Target::from_triple(&triple).map_err(|e| {
+    let written = target.map(inkwell::targets::TargetTriple::create);
+    let host = TargetMachine::get_default_triple();
+    let triple = written.as_ref().unwrap_or(&host);
+    let target = Target::from_triple(triple).map_err(|e| {
         vec![Diagnostic::error(
             code::CODEGEN_FAILED,
             format!(
@@ -216,7 +239,7 @@ fn target_machine(opt_level: OptLevel) -> Result<TargetMachine, Vec<Diagnostic>>
     })?;
     target
         .create_target_machine(
-            &triple,
+            triple,
             "",
             "",
             opt_level.inkwell(),

@@ -970,6 +970,9 @@ pub(crate) struct Emitter {
     dead: bool,
     printf: Option<FunctionValue<'static>>,
     stdout: Option<inkwell::values::GlobalValue<'static>>,
+    /// The machine being built for answers to the C standard library by a
+    /// different name: Windows keeps its streams behind `__imp_` thunks.
+    windows: bool,
     sources: SourceMap,
     dibuilder: Option<DebugInfoBuilder<'static>>,
     compile_unit: Option<DICompileUnit<'static>>,
@@ -990,7 +993,7 @@ pub(crate) struct Emitter {
 }
 
 impl Emitter {
-    pub(crate) fn new(context: &'static Context, sources: SourceMap) -> Self {
+    pub(crate) fn new(context: &'static Context, sources: SourceMap, windows: bool) -> Self {
         Self {
             context,
             builder: context.create_builder(),
@@ -1045,6 +1048,7 @@ impl Emitter {
             dead: false,
             printf: None,
             stdout: None,
+            windows,
             sources,
             dibuilder: None,
             compile_unit: None,
@@ -1070,7 +1074,12 @@ impl Emitter {
         let program = &rewritten;
         self.allocating = self.allocation_analysis(program);
         if !self.allocating.is_empty() {
-            self.runtime = Some(Runtime::emit(self.context, module, self.debug_allocator));
+            self.runtime = Some(Runtime::emit(
+                self.context,
+                module,
+                self.debug_allocator,
+                self.windows,
+            ));
         }
         if !self.sources.is_empty() {
             let file = self
@@ -3746,7 +3755,12 @@ impl Emitter {
         // A program that allocates nothing still has to stop when a language
         // rule is broken, so the runtime arrives on demand for the trap alone.
         if self.runtime.is_none() {
-            self.runtime = Some(Runtime::emit(self.context, module, self.debug_allocator));
+            self.runtime = Some(Runtime::emit(
+                self.context,
+                module,
+                self.debug_allocator,
+                self.windows,
+            ));
         }
         let Some(trap) = self.runtime.as_ref().map(|runtime| runtime.trap) else {
             let _ = self.builder.build_unreachable();
@@ -10024,6 +10038,20 @@ impl Emitter {
 
     fn stdout_stream(&mut self, module: &Module<'static>) -> Option<PointerValue<'static>> {
         let c_char = self.context.ptr_type(AddressSpace::default());
+        if self.windows {
+            let number = self.context.i32_type().const_int(1, false);
+            let fn_type = c_char.fn_type(&[self.context.i32_type().into()], false);
+            let iob = declared(module, "__acrt_iob_func", fn_type);
+            let stream = self
+                .builder
+                .build_call(iob, &[number.into()], "stdout")
+                .ok()?
+                .try_as_basic_value()
+                .basic()
+                .expect("stdout")
+                .into_pointer_value();
+            return Some(stream);
+        }
         let stream = match self.stdout {
             Some(stream) => stream,
             None => {

@@ -42,13 +42,17 @@ fn main() -> ExitCode {
             release,
             bounds_check,
             emit,
+            target,
         } => build(
-            &file,
-            out.as_deref(),
-            &out_dir,
-            release,
-            bounds_check,
-            emit,
+            &BuildArgs {
+                file: &file,
+                out: out.as_deref(),
+                out_dir: &out_dir,
+                release,
+                bounds_check,
+                emit,
+                target: target.as_deref(),
+            },
             &mut err,
         ),
         Command::Run {
@@ -57,8 +61,16 @@ fn main() -> ExitCode {
             release,
             bounds_check,
             args,
+            target,
         } => {
-            let request = request(&file, &out_dir, release, bounds_check, DriverEmit::Execute);
+            let request = request(
+                &file,
+                &out_dir,
+                release,
+                bounds_check,
+                DriverEmit::Execute,
+                target,
+            );
             let mut stdout = std::io::stdout();
             match dux_driver::run(&request, &args, &mut stdout) {
                 Ok(code) => ExitCode::from(exit_of(code)),
@@ -343,22 +355,34 @@ fn check(file: &Path, err: &mut impl Write) -> ExitCode {
     }
 }
 
-fn build(
-    file: &Path,
-    out: Option<&Path>,
-    out_dir: &Path,
+struct BuildArgs<'a> {
+    file: &'a Path,
+    out: Option<&'a Path>,
+    out_dir: &'a Path,
     release: bool,
     bounds_check: BoundsCheck,
     emit: Emit,
-    err: &mut impl Write,
-) -> ExitCode {
+    target: Option<&'a str>,
+}
+
+fn build(args: &BuildArgs<'_>, err: &mut impl Write) -> ExitCode {
+    let BuildArgs {
+        file,
+        out,
+        out_dir,
+        release,
+        bounds_check,
+        emit,
+        target,
+    } = *args;
+    let target = target.map(str::to_string);
     let driver_emit = match emit {
         Emit::Exe => DriverEmit::Execute,
         Emit::Object => DriverEmit::Object,
         Emit::Ir => DriverEmit::LlvmIr,
         Emit::Ast => DriverEmit::Ast,
     };
-    let request = request(file, out_dir, release, bounds_check, driver_emit);
+    let request = request(file, out_dir, release, bounds_check, driver_emit, target);
     match dux_driver::build(&request, out) {
         Ok(artifact) => {
             let written = match (out, emit) {
@@ -384,12 +408,14 @@ fn request<'a>(
     release: bool,
     bounds_check: BoundsCheck,
     emit: DriverEmit,
+    target: Option<String>,
 ) -> BuildRequest<'a> {
     BuildRequest {
         source: file,
         out_dir: out_dir.to_path_buf(),
         emit,
         bounds_check,
+        target,
         opt_level: if release {
             Optimization::Balanced
         } else {

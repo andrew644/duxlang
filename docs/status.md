@@ -69,6 +69,12 @@ each remaining gap is waiting for. A gap is a milestone, never a verdict.
   borrows that; `"dux".len()` and `"dux".bytes()` do the same to a view that
   would otherwise live in registers. The temporary lives as long as the block
   that made it, which is where the value would have lived anyway.
+- **The debug runtime belongs to this machine.** A cross build —
+  `--target=<triple>` — compiles, and links, for the named triple; but the
+  debug allocator asks for `mmap` and guard pages, which is this machine's
+  idea of memory, so a cross build goes `--release`: the release runtime asks
+  the target only for what every C runtime carries. Windows keeps its standard
+  streams behind a call, `__acrt_iob_func`, and gets them that way.
 - **The C ladder is its own rung (D18).** `c_int`..`c_ulong_long` and `c_bool`
   are distinct from Dux's integers: an untyped literal adopts them, `as`
   crosses to them and from them, and nothing else crosses for free — an

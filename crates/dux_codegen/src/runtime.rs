@@ -52,7 +52,12 @@ pub struct Runtime {
 
 impl Runtime {
     /// Emit the allocator runtime into `module`.
-    pub fn emit(context: &'static Context, module: &Module<'static>, debug: bool) -> Self {
+    pub fn emit(
+        context: &'static Context,
+        module: &Module<'static>,
+        debug: bool,
+        windows: bool,
+    ) -> Self {
         let builder = context.create_builder();
         let ptr = context.ptr_type(AddressSpace::default());
         let i64_type = context.i64_type();
@@ -121,8 +126,8 @@ impl Runtime {
                 .i32_type()
                 .fn_type(&[ptr.into(), i64_type.into()], false),
         );
-        let oom = emit_oom(context, module, &builder);
-        let trap = emit_trap(context, module, &builder);
+        let oom = emit_oom(context, module, &builder, windows);
+        let trap = emit_trap(context, module, &builder, windows);
 
         emit_alloc(
             context, &builder, alloc, malloc, mmap, mprotect, oom, table, slots, overflowed, live,
@@ -134,6 +139,7 @@ impl Runtime {
                 context,
                 module,
                 &builder,
+                windows,
                 free,
                 munmap,
                 table.expect("table"),
@@ -146,6 +152,7 @@ impl Runtime {
                 context,
                 module,
                 &builder,
+                windows,
                 table.expect("table"),
                 slots.expect("slots"),
                 live,
@@ -557,6 +564,7 @@ fn emit_free_debug(
     context: &'static Context,
     module: &Module<'static>,
     builder: &Builder<'static>,
+    windows: bool,
     free: FunctionValue<'static>,
     munmap: FunctionValue<'static>,
     table: GlobalValue<'static>,
@@ -668,6 +676,7 @@ fn emit_free_debug(
         context,
         module,
         builder,
+        windows,
         "dux: free of memory this allocator did not hand out, or a double free\n",
     );
     abort(context, module, builder);
@@ -728,10 +737,12 @@ fn emit_free_plain(
     builder.build_return(None).expect("return");
 }
 
+#[allow(clippy::too_many_arguments)]
 fn emit_report(
     context: &'static Context,
     module: &Module<'static>,
     builder: &Builder<'static>,
+    windows: bool,
     table: GlobalValue<'static>,
     slots: GlobalValue<'static>,
     live: GlobalValue<'static>,
@@ -798,7 +809,7 @@ fn emit_report(
         )
         .expect("place format")
         .as_pointer_value();
-    let stderr = stream(context, module, builder, "stderr");
+    let stderr = stream(context, module, builder, "stderr", windows);
     let _ = builder.build_call(
         fprintf(context, module),
         &[
@@ -851,7 +862,7 @@ fn emit_report(
         )
         .expect("leak format")
         .as_pointer_value();
-    let stderr = stream(context, module, builder, "stderr");
+    let stderr = stream(context, module, builder, "stderr", windows);
     let _ = builder.build_call(
         fprintf(context, module),
         &[stderr.into(), format.into(), leaks.into(), trailing.into()],
@@ -869,6 +880,7 @@ fn emit_trap(
     context: &'static Context,
     module: &Module<'static>,
     builder: &Builder<'static>,
+    windows: bool,
 ) -> FunctionValue<'static> {
     let ptr = context.ptr_type(AddressSpace::default());
     let trap = module.add_function(
@@ -886,7 +898,7 @@ fn emit_trap(
         .unwrap()
         .get_first_param()
         .expect("message");
-    let stderr = stream(context, module, builder, "stderr");
+    let stderr = stream(context, module, builder, "stderr", windows);
     let _ = builder.build_call(
         fputs(context, module),
         &[message.into(), stderr.into()],
@@ -900,6 +912,7 @@ fn emit_oom(
     context: &'static Context,
     module: &Module<'static>,
     builder: &Builder<'static>,
+    windows: bool,
 ) -> FunctionValue<'static> {
     let ptr = context.ptr_type(AddressSpace::default());
     let oom = module.add_function(
@@ -910,7 +923,7 @@ fn emit_oom(
     oom.set_linkage(Linkage::Internal);
     let entry = context.append_basic_block(oom, "entry");
     builder.position_at_end(entry);
-    write_stderr(context, module, builder, "dux: out of memory\n");
+    write_stderr(context, module, builder, windows, "dux: out of memory\n");
     abort(context, module, builder);
     oom
 }
@@ -980,13 +993,14 @@ fn write_stderr(
     context: &'static Context,
     module: &Module<'static>,
     builder: &Builder<'static>,
+    windows: bool,
     message: &str,
 ) {
     let text = builder
         .build_global_string_ptr(message, "dux.message")
         .expect("message")
         .as_pointer_value();
-    let stderr = stream(context, module, builder, "stderr");
+    let stderr = stream(context, module, builder, "stderr", windows);
     let _ = builder.build_call(
         fputs(context, module),
         &[text.into(), stderr.into()],
@@ -1040,8 +1054,27 @@ fn stream(
     module: &Module<'static>,
     builder: &Builder<'static>,
     name: &str,
+    windows: bool,
 ) -> PointerValue<'static> {
     let ptr = context.ptr_type(AddressSpace::default());
+    // Windows has no `stdout` in storage to read: its C runtime hands out
+    // the standard streams by call, `__acrt_iob_func` with the slot number.
+    if windows {
+        let index = u64::from(name == "stderr");
+        let number = context.i32_type().const_int(index, false);
+        let iob = declare(
+            module,
+            "__acrt_iob_func",
+            ptr.fn_type(&[context.i32_type().into()], false),
+        );
+        return builder
+            .build_call(iob, &[number.into()], name)
+            .expect("iob")
+            .try_as_basic_value()
+            .basic()
+            .expect("stream")
+            .into_pointer_value();
+    }
     let global = module
         .get_global(name)
         .unwrap_or_else(|| module.add_global(BasicTypeEnum::from(ptr), None, name));

@@ -368,6 +368,9 @@ pub struct BuildRequest<'a> {
     pub emit: Emit,
     pub opt_level: OptLevel,
     pub bounds_check: BoundsCheck,
+    /// Build for a machine other than this one. The object file and the
+    /// link both answer to this triple; the host answers to none.
+    pub target: Option<String>,
 }
 
 #[derive(Debug)]
@@ -385,6 +388,16 @@ fn compile(request: &BuildRequest) -> Result<(Analyzed, CompiledModule, BuiltArt
             sources: analyzed.sources,
             diagnostics: analyzed.diagnostics,
         });
+    }
+    if let Some(triple) = &request.target {
+        let host = dux_codegen::host_triple();
+        if triple != &host && request.opt_level == dux_codegen::OptLevel::None {
+            return Err(Failure::bare(vec![Diagnostic::error(
+                code::UNSUPPORTED_IN_BUILD,
+                format!("the debug runtime — guard pages, poison, `mmap` — belongs to `{host}`, not to `{triple}`"),
+            )
+            .with_note("cross builds go `--release`: the release runtime asks the target only for `malloc` and `printf`")]));
+        }
     }
     let module = match generate(&analyzed, &analyzed.program, request) {
         Ok(module) => module,
@@ -406,8 +419,12 @@ fn generate(
     program: &Program,
     request: &BuildRequest,
 ) -> Result<CompiledModule, Vec<Diagnostic>> {
-    let bitcode =
-        build_c_bitcode(&analyzed.c_units, &request.out_dir).map_err(|f| f.diagnostics)?;
+    let bitcode = build_c_bitcode(
+        &analyzed.c_units,
+        &request.out_dir,
+        request.target.as_deref(),
+    )
+    .map_err(|f| f.diagnostics)?;
     let options = Options {
         debug_allocator: request.opt_level == dux_codegen::OptLevel::None,
         bounds_checks: request
@@ -415,6 +432,7 @@ fn generate(
             .enabled(request.opt_level == dux_codegen::OptLevel::None),
         opt_level: request.opt_level,
         bitcode,
+        target: request.target.clone(),
     };
     CompiledModule::build_with_line_tables(program, options, &analyzed.sources)
 }
@@ -465,7 +483,11 @@ pub fn build(
             }
         }
         Emit::Execute => {
-            link(&artifact, &libraries(&analyzed.program, request.source))?;
+            link(
+                &artifact,
+                &libraries(&analyzed.program, request.source),
+                request.target.as_deref(),
+            )?;
             if let Some(path) = out_override {
                 std::fs::copy(&artifact.executable, path).map_err(|e| io_failure(path, e))?;
             }
@@ -584,6 +606,7 @@ pub fn run_tests(
         emit: Emit::Execute,
         opt_level: OptLevel::None,
         bounds_check: BoundsCheck::Auto,
+        target: None,
     };
     let stem = output_stem(source);
     let mut passed = 0;
@@ -600,7 +623,7 @@ pub fn run_tests(
             }
         };
         let artifact = package(&module, &request, &format!("{stem}-{name}"))?;
-        link(&artifact, &libraries(&program, source))?;
+        link(&artifact, &libraries(&program, source), None)?;
         let output = std::process::Command::new(&artifact.executable)
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
@@ -715,7 +738,11 @@ fn exit_code(status: &std::process::ExitStatus) -> i32 {
 /// the generated source, the flags, the include paths, the header file
 /// itself and the compiler's version line — so an edit to a header, a new
 /// `-D` or a toolchain upgrade each miss the cache exactly once.
-fn build_c_bitcode(units: &[CUnit], out_dir: &Path) -> Result<Vec<PathBuf>, Failure> {
+fn build_c_bitcode(
+    units: &[CUnit],
+    out_dir: &Path,
+    target: Option<&str>,
+) -> Result<Vec<PathBuf>, Failure> {
     if units.is_empty() {
         return Ok(Vec::new());
     }
@@ -742,6 +769,9 @@ fn build_c_bitcode(units: &[CUnit], out_dir: &Path) -> Result<Vec<PathBuf>, Fail
             mix(header.as_bytes());
         }
         mix(version.as_bytes());
+        if let Some(triple) = target {
+            mix(triple.as_bytes());
+        }
         for part in unit.flags.iter().chain(unit.include_paths.iter()) {
             mix(part.as_bytes());
         }
@@ -767,6 +797,7 @@ fn build_c_bitcode(units: &[CUnit], out_dir: &Path) -> Result<Vec<PathBuf>, Fail
             .arg("-c")
             .arg("-emit-llvm")
             .arg("-w")
+            .args(target.map(|triple| format!("--target={triple}")))
             .args(&unit.flags)
             .args(unit.include_paths.iter().map(|dir| format!("-I{dir}")))
             .arg("-o")
@@ -830,10 +861,15 @@ fn io_diagnostic(error: std::io::Error) -> Diagnostic {
     Diagnostic::error(code::SOURCE_IO, format!("cannot write output: {error}"))
 }
 
-fn link(artifact: &BuiltArtifact, libraries: &[String]) -> Result<(), Failure> {
+fn link(
+    artifact: &BuiltArtifact,
+    libraries: &[String],
+    target: Option<&str>,
+) -> Result<(), Failure> {
     let linker = linker_command();
     let mut command = std::process::Command::new(&linker);
     command
+        .args(target.map(|triple| format!("--target={triple}")))
         .arg(&artifact.object)
         .arg("-o")
         .arg(&artifact.executable)
@@ -859,6 +895,16 @@ fn link(artifact: &BuiltArtifact, libraries: &[String]) -> Result<(), Failure> {
             code::LINK_FAILED,
             format!("`{linker}` exited with a failure status"),
         )]));
+    }
+    // A linker writing for Windows answers an `-o name` request with
+    // `name.exe`, whether it was asked to or not. The artifact names its
+    // executable, so a stray extension gets renamed back into place.
+    if !artifact.executable.exists() {
+        let suffixed = artifact.executable.with_extension("exe");
+        if suffixed.is_file() {
+            std::fs::rename(&suffixed, &artifact.executable)
+                .map_err(|e| io_failure(&artifact.executable, e))?;
+        }
     }
     Ok(())
 }

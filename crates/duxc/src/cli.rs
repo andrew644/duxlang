@@ -25,6 +25,7 @@ OPTIONS:
     --release         optimise (default<O2>) instead of -O0
     -bounds-check=on|off|auto
                       stop at an out-of-bounds index (auto: debug builds only)
+    --target=<triple> build for another machine (cross builds need --release)
     --emit=ir         write textual LLVM IR instead of linking
     --emit=ast        write the parsed AST dump instead of linking
     --emit=obj        keep the object file
@@ -57,6 +58,7 @@ pub enum Command {
         release: bool,
         bounds_check: BoundsCheck,
         emit: Emit,
+        target: Option<String>,
     },
     Run {
         file: PathBuf,
@@ -64,6 +66,7 @@ pub enum Command {
         release: bool,
         bounds_check: BoundsCheck,
         args: Vec<String>,
+        target: Option<String>,
     },
     Fmt {
         paths: Vec<PathBuf>,
@@ -134,6 +137,7 @@ pub fn parse<I: IntoIterator<Item = OsString>>(argv: I) -> Result<Command, Usage
             let mut release = false;
             let mut bounds_check = BoundsCheck::Auto;
             let mut emit = Emit::Exe;
+            let mut target = None;
             let mut index = 0;
             while index < rest.len() {
                 let arg = rest[index].as_str();
@@ -142,6 +146,9 @@ pub fn parse<I: IntoIterator<Item = OsString>>(argv: I) -> Result<Command, Usage
                     "-o" => out = Some(PathBuf::from(value(rest, &mut index, "-o")?)),
                     "--out-dir" => out_dir = PathBuf::from(value(rest, &mut index, "--out-dir")?),
                     "--release" => release = true,
+                    other if other.starts_with("--target=") => {
+                        target = Some(other.trim_start_matches("--target=").to_string())
+                    }
                     "--help" | "-h" => return Ok(Command::Help),
                     other if is_bounds_check(other) => bounds_check = parse_bounds_check(other)?,
                     other if other.starts_with("--emit=") => {
@@ -171,6 +178,7 @@ pub fn parse<I: IntoIterator<Item = OsString>>(argv: I) -> Result<Command, Usage
                 release,
                 bounds_check,
                 emit,
+                target,
             })
         }
         "run" | "r" => {
@@ -179,6 +187,7 @@ pub fn parse<I: IntoIterator<Item = OsString>>(argv: I) -> Result<Command, Usage
             let mut release = false;
             let mut bounds_check = BoundsCheck::Auto;
             let mut args = Vec::new();
+            let mut target = None;
             let mut index = 0;
             while index < rest.len() {
                 let arg = rest[index].as_str();
@@ -190,6 +199,9 @@ pub fn parse<I: IntoIterator<Item = OsString>>(argv: I) -> Result<Command, Usage
                 match arg {
                     "--out-dir" => out_dir = PathBuf::from(value(rest, &mut index, "--out-dir")?),
                     "--release" => release = true,
+                    other if other.starts_with("--target=") => {
+                        target = Some(other.trim_start_matches("--target=").to_string())
+                    }
                     other if is_bounds_check(other) => bounds_check = parse_bounds_check(other)?,
                     other if file.is_none() && !other.starts_with('-') => {
                         file = Some(PathBuf::from(other))
@@ -203,6 +215,7 @@ pub fn parse<I: IntoIterator<Item = OsString>>(argv: I) -> Result<Command, Usage
                 release,
                 bounds_check,
                 args,
+                target,
             })
         }
         "fmt" | "f" => {
@@ -363,6 +376,7 @@ mod tests {
                 release: false,
                 bounds_check: BoundsCheck::Auto,
                 emit: Emit::Ast,
+                target: None,
             })
         );
     }
@@ -385,6 +399,7 @@ mod tests {
                 release: true,
                 bounds_check: BoundsCheck::Auto,
                 emit: Emit::Object,
+                target: None,
             })
         );
     }
@@ -400,6 +415,7 @@ mod tests {
                 release: false,
                 bounds_check: BoundsCheck::Auto,
                 emit: Emit::Exe,
+                target: None,
             }
         );
         let Command::Build { out_dir, .. } =
@@ -437,6 +453,7 @@ mod tests {
                 release: false,
                 bounds_check: BoundsCheck::Off,
                 emit: Emit::Exe,
+                target: None,
             })
         );
         assert_eq!(
