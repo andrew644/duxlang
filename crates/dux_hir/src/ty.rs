@@ -1225,6 +1225,79 @@ impl<'a> Checker<'a> {
         self.report(span, Diagnostic::error(c, message));
     }
 
+    /// What stands behind `x?`: the success payload of a `Result` or an
+    /// `Option`, after a word about the function it stands in. The failure
+    /// walks out of the enclosing function unchanged, so the two failure
+    /// types must already be one — there is no conversion to invent.
+    fn propagates(&mut self, inner: Ty, span: Span) -> Ty {
+        match inner {
+            Ty::Opaque | Ty::Never => inner,
+            Ty::Enum { ref name, ref args }
+                if (name.as_str() == "Result" || name.ends_with("::Result")) && args.len() == 2 =>
+            {
+                let (error, answer) = (&args[1], &args[0]);
+                match &self.result {
+                    Ty::Enum {
+                        name: outer,
+                        args: outer_args,
+                    } if (outer == "Result" || outer.ends_with("::Result")) && outer_args.len() == 2 =>
+                    {
+                        let wants = &outer_args[1];
+                        if wants != error && *wants != Ty::Opaque && *error != Ty::Opaque {
+                            self.error(
+                                code::TYPE_MISMATCH,
+                                format!(
+                                    "`?` hands back an error of type `{}`, but this function returns `{}`",
+                                    error.name(),
+                                    wants.name()
+                                ),
+                                span,
+                            );
+                            return Ty::Opaque;
+                        }
+                        answer.clone()
+                    }
+                    _ => {
+                        self.error(
+                            code::TYPE_MISMATCH,
+                            "`?` needs an enclosing function that returns `Result`".to_string(),
+                            span,
+                        );
+                        Ty::Opaque
+                    }
+                }
+            }
+            Ty::Enum { ref name, ref args }
+                if (name.as_str() == "Option" || name.ends_with("::Option")) && args.len() == 1 =>
+            {
+                match &self.result {
+                    Ty::Enum { name: outer, args: outer_args }
+                        if (outer == "Option" || outer.ends_with("::Option"))
+                            && outer_args.len() == 1 =>
+                    {
+                        args[0].clone()
+                    }
+                    _ => {
+                        self.error(
+                            code::TYPE_MISMATCH,
+                            "`?` needs an enclosing function that returns `Option`".to_string(),
+                            span,
+                        );
+                        Ty::Opaque
+                    }
+                }
+            }
+            other => {
+                self.error(
+                    code::TYPE_MISMATCH,
+                    format!("`?` walks `Result` and `Option`, not `{}`", other.name()),
+                    span,
+                );
+                Ty::Opaque
+            }
+        }
+    }
+
     // ---------------------------------------------------------------- types
 
     /// Check `value` in a position that demands `expected`. Reports the two
@@ -2672,6 +2745,10 @@ impl<'a> Checker<'a> {
                     .collect();
                 let _ = span;
                 Ty::Tuple(parts)
+            }
+            Expr::Try { operand, span } => {
+                let inner = self.infer(operand);
+                self.propagates(inner, *span)
             }
             Expr::ArrayLiteral { elements, span } => self.array_literal(elements, *span, expected),
             Expr::RepeatedArray { value, len, span } => {

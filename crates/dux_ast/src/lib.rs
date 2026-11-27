@@ -389,6 +389,9 @@ pub enum Expr {
     Unary { op: UnaryOp, operand: Box<Expr>, span: Span },
     Binary { op: BinaryOp, lhs: Box<Expr>, rhs: Box<Expr>, span: Span },
     Cast { value: Box<Expr>, target: Type, span: Span },
+    /// `x?`: a `Result` or `Option` unwrapped where it stands, the failure
+    /// case handed back by the enclosing function.
+    Try { operand: Box<Expr>, span: Span },
     Paren { inner: Box<Expr>, span: Span },
     Error { span: Span },
 }
@@ -420,6 +423,7 @@ impl Expr {
             | Expr::Unary { span, .. }
             | Expr::Binary { span, .. }
             | Expr::Cast { span, .. }
+            | Expr::Try { span, .. }
             | Expr::Paren { span, .. }
             | Expr::Error { span } => *span,
         }

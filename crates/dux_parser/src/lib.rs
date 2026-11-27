@@ -1564,6 +1564,14 @@ impl<'a> Parser<'a> {
                         span,
                     };
                 }
+                TokenKind::Punct(Punct::Question) => {
+                    self.bump();
+                    let span = expr.span().merge(token.span);
+                    expr = Expr::Try {
+                        operand: Box::new(expr),
+                        span,
+                    };
+                }
                 _ => {
                     let _ = token;
                     return expr;
@@ -2663,6 +2671,30 @@ mod tests {
             panic!("a positional write is an assignment to a member");
         };
         assert!(matches!(target, Expr::Member { index: 1, .. }));
+    }
+
+    #[test]
+    fn a_question_mark_is_a_postfix_walk() {
+        let (program, diagnostics) = parse_text(
+            "fn f() {\n    a := load(1)?\n    b := table[load(0)?]\n    c := load(0)?.name\n}\n",
+        );
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        let function = program.find_function("f").unwrap();
+        let statements = &function.body.stmts;
+        assert!(matches!(
+            &statements[0],
+            Stmt::Binding {
+                value: Some(Expr::Try { operand, .. }),
+                ..
+            } if matches!(&**operand, Expr::Call { .. })
+        ));
+        assert!(matches!(
+            &statements[2],
+            Stmt::Binding {
+                value: Some(Expr::Field { base, .. }),
+                ..
+            } if matches!(&**base, Expr::Try { .. })
+        ));
     }
 
     #[test]

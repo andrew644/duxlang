@@ -1,0 +1,69 @@
+package main
+
+fn third(lo: i32, hi: i32) -> Result<i32, string> {
+    if lo < hi {
+        return Ok(lo + hi)
+    }
+    return Err("lo must come first")
+}
+
+fn outer(a: i32, b: i32) -> Result<i32, string> {
+    first := third(a, b)?
+    second := third(first, b)?
+    return Ok(second)
+}
+
+fn half(v: i32) -> Option<i32> {
+    if v % 2 == 0 {
+        return Some(v / 2)
+    }
+    return None
+}
+
+fn chain(v: i32) -> Option<i32> {
+    inner := half(v)?
+    back := half(inner)?
+    return Some(back)
+}
+
+fn mirrored(v: i32) -> Result<i32, string> {
+    total := if v > 0 { third(0, v)? } else { third(0, 0 - v)? }
+    return Ok(total)
+}
+
+fn guarded() -> Result<i32, string> {
+    defer println("guarded leaves")
+    inner := third(9, 1)?
+    return Ok(inner)
+}
+
+fn main() {
+    match outer(-5, 100) {
+        Ok(v) => println($"ok {v}"),
+        Err(e) => println($"err {e}"),
+    }
+    match outer(5, 1) {
+        Ok(v) => println($"ok {v}"),
+        Err(e) => println($"err {e}"),
+    }
+    match chain(20) {
+        Some(v) => println($"some {v}"),
+        None => println("none"),
+    }
+    match chain(10) {
+        Some(v) => println($"some {v}"),
+        None => println("none"),
+    }
+    match mirrored(6) {
+        Ok(v) => println($"mirrored {v}"),
+        Err(e) => println($"mirrored err {e}"),
+    }
+    match mirrored(0) {
+        Ok(v) => println($"mirrored {v}"),
+        Err(e) => println($"mirrored err {e}"),
+    }
+    match guarded() {
+        Ok(v) => println($"guarded {v}"),
+        Err(e) => println($"guarded err {e}"),
+    }
+}

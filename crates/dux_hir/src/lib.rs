@@ -410,6 +410,7 @@ impl<'a> Resolver<'a> {
                 }
             }
             Expr::Member { base, .. } => self.expr(base),
+            Expr::Try { operand, .. } => self.expr(operand),
             Expr::Tuple { elements, .. } => {
                 for element in elements {
                     self.expr(element);

@@ -730,6 +730,7 @@ impl Printer {
             Expr::Cast { value, target, .. } => {
                 format!("{} as {}", self.expr(value, level), self.ty(target))
             }
+            Expr::Try { operand, .. } => format!("{}?", self.expr(operand, level)),
             Expr::Paren { inner, .. } => format!("({})", self.expr(inner, level)),
             Expr::Error { .. } => "<error>".to_string(),
         }

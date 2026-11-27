@@ -493,6 +493,7 @@ fn dump_expr(expr: &Expr) -> String {
             format!("({} {} {})", dump_expr(lhs), op.symbol(), dump_expr(rhs))
         }
         Expr::Cast { value, target, .. } => format!("({} as {})", dump_expr(value), dump_type(target)),
+        Expr::Try { operand, .. } => format!("{}?", dump_expr(operand)),
         Expr::Paren { inner, .. } => dump_expr(inner),
         Expr::Error { .. } => "<error>".to_string(),
     }

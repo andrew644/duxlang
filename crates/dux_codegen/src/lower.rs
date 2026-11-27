@@ -6138,6 +6138,158 @@ impl Emitter {
         self.load(elem, at)
     }
 
+    /// `x?`: the value that succeeded, unwrapped where the question mark
+    /// stands. The failure walks out of the enclosing function the way an
+    /// explicit `return Err(…)` would, defers firing on its way out.
+    fn try_expr(&mut self, module: &Module<'static>, operand: &Expr, span: Span) -> Option<Typed> {
+        let value = self.expr(module, operand, None)?;
+        if value.ty == DuxType::Error {
+            return Some(Typed::error());
+        }
+        let DuxType::Enum(info) = value.ty else {
+            self.diagnostics.push(
+                Diagnostic::error(
+                    code::TYPE_MISMATCH,
+                    format!("`?` walks `Result` and `Option`, not `{}`", value.ty.name()),
+                )
+                .with_span(span),
+            );
+            return None;
+        };
+        let answer = self.result_ty?;
+        let DuxType::Enum(outer) = answer else {
+            self.diagnostics.push(
+                Diagnostic::error(
+                    code::TYPE_MISMATCH,
+                    format!("`?` cannot hand a `{}` back from this function", answer.name()),
+                )
+                .with_span(span),
+            );
+            return None;
+        };
+        let (failure, success) = match info.name {
+            "Result" => ("Err", "Ok"),
+            "Option" => ("None", "Some"),
+            _ => {
+                self.unsupported(span, &format!("propagating a `{}`", info.name));
+                return None;
+            }
+        };
+        if outer.name != info.name {
+            self.diagnostics.push(
+                Diagnostic::error(
+                    code::TYPE_MISMATCH,
+                    format!(
+                        "`?` hands back a `{}`, but this function returns a `{}`",
+                        info.name, outer.name
+                    ),
+                )
+                .with_span(span),
+            );
+            return None;
+        }
+        let (bad_index, bad) = info.variant(failure)?;
+        let (_, good) = info.variant(success)?;
+        let (outer_bad_index, outer_bad) = outer.variant(failure)?;
+        if bad.fields.len() != outer_bad.fields.len() {
+            self.diagnostics.push(
+                Diagnostic::error(
+                    code::TYPE_MISMATCH,
+                    format!(
+                        "`{}`::{failure} carries {} value(s); `{}`::{failure} takes {}",
+                        info.name,
+                        bad.fields.len(),
+                        outer.name,
+                        outer_bad.fields.len()
+                    ),
+                )
+                .with_span(span),
+            );
+            return None;
+        }
+        for ((_, mine), (_, wants)) in bad.fields.iter().zip(outer_bad.fields.iter()) {
+            if mine != wants {
+                self.diagnostics.push(
+                    Diagnostic::error(
+                        code::TYPE_MISMATCH,
+                        format!(
+                            "`?` hands back a `{}`; this function carries a `{}`",
+                            mine.name(),
+                            wants.name()
+                        ),
+                    )
+                    .with_span(span),
+                );
+                return None;
+            }
+        }
+        let slot = self.alloca(value.ty, "try");
+        let _ = self.builder.build_store(slot, value.basic()?).ok()?;
+        let holds_failure = self.variant_holds(info, bad_index, slot)?;
+        let happy = self.new_block("try.happy");
+        let bail = self.new_block("try.bail");
+        let _ = self
+            .builder
+            .build_conditional_branch(holds_failure, bail, happy)
+            .ok()?;
+        self.builder.position_at_end(bail);
+        self.dead = false;
+        self.fire_before(module, 0, false);
+        let out = self.alloca(answer, "propagate");
+        if let Some(carrier) = outer.niche {
+            if outer_bad_index != carrier {
+                let null = self.context.ptr_type(AddressSpace::default()).const_zero();
+                let _ = self.builder.build_store(self.byte_at(out, 0), null).ok()?;
+            }
+        } else {
+            let zero = outer.llvm.into_struct_type().const_zero();
+            let _ = self.builder.build_store(out, zero).ok()?;
+            let tag = outer.tag.const_int(outer_bad_index as u64, false);
+            let _ = self
+                .builder
+                .build_store(self.byte_at(out, outer.tag_at), tag)
+                .ok()?;
+        }
+        for (position, (_, field_ty)) in bad.fields.iter().enumerate() {
+            let from = self.byte_at(slot, bad.offsets[position]);
+            let into = self.byte_at(out, outer_bad.offsets[position]);
+            if let Some(array) = field_ty.array_info() {
+                self.copy_array(into, from, array);
+            } else {
+                let held = self
+                    .builder
+                    .build_load(field_ty.llvm(self.context), from, "carry")
+                    .ok()?;
+                let _ = self.builder.build_store(into, held).ok()?;
+            }
+        }
+        let handed = self.load(answer, out)?;
+        match self.returnable(handed, answer) {
+            Some(basic) => {
+                let _ = self.builder.build_return(Some(&basic)).ok()?;
+            }
+            None => {
+                self.unsupported(span, "returning this through `?`");
+                let zero = answer.llvm(self.context).const_zero();
+                let _ = self.builder.build_return(Some(&zero)).ok()?;
+            }
+        }
+        self.dead = true;
+        self.builder.position_at_end(happy);
+        self.dead = false;
+        let Some(((_, field_ty), offset)) = good.fields.first().zip(good.offsets.first()) else {
+            self.diagnostics.push(
+                Diagnostic::error(
+                    code::TYPE_MISMATCH,
+                    format!("`{}::{success}` carries no value to unwrap", info.name),
+                )
+                .with_span(span),
+            );
+            return None;
+        };
+        self.load(*field_ty, self.byte_at(slot, *offset))
+    }
+
     /// One line of the line table: every subsequent instruction carries the
     /// span's line and column until the next statement claims one.
     fn set_location(&mut self, span: Span) {
@@ -6427,6 +6579,7 @@ impl Emitter {
             }
             Expr::Tuple { elements, span } => self.tuple_literal(module, elements, expected, *span),
             Expr::Member { base, index, span } => self.member_expr(module, base, *index, *span),
+            Expr::Try { operand, span } => self.try_expr(module, operand, *span),
             Expr::RepeatedArray { value, len, span } => {
                 self.repeated_array(module, value, len, expected, *span)
             }
@@ -9429,6 +9582,7 @@ impl Scan {
             | Expr::Ident { .. }
             | Expr::Error { .. } => {}
             Expr::Field { base, .. } | Expr::Member { base, .. } => self.expr(base),
+            Expr::Try { operand, .. } => self.expr(operand),
             Expr::Tuple { elements, .. } => {
                 for element in elements {
                     self.expr(element);

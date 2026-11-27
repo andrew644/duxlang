@@ -1401,3 +1401,73 @@ fn positional_access_walks_nothing_but_a_tuple() {
 }";
     assert_eq!(codes(source), vec![dux_diag::code::TYPE_MISMATCH]);
 }
+
+#[test]
+fn a_question_mark_unwraps_what_it_walks() {
+    let clean = "fn third(lo: i32, hi: i32) -> Result<i32, string> {
+    if lo < hi {
+        return Ok(lo + hi)
+    }
+    return Err(\"no\")
+}
+
+fn outer(a: i32, b: i32) -> Result<i32, string> {
+    first := third(a, b)?
+    return Ok(first)
+}
+
+fn half(v: i32) -> Option<i32> {
+    if v == 0 {
+        return None
+    }
+    return Some(v)
+}
+
+fn chain(v: i32) -> Option<i32> {
+    inner := half(v)?
+    return Some(inner)
+}
+
+fn main() {
+    one := outer(1, 2)
+    two := chain(3)
+}";
+    assert_eq!(codes(clean), Vec::<&'static str>::new());
+}
+
+#[test]
+fn a_question_mark_outside_its_function_is_said() {
+    let source = "fn fails() -> Result<i32, string> {
+    return Err(\"no\")
+}
+
+fn main() {
+    x := fails()?
+}";
+    assert_eq!(codes(source), vec![dux_diag::code::TYPE_MISMATCH]);
+}
+
+#[test]
+fn a_question_mark_walks_nothing_else() {
+    let source = "fn main() -> i32 {
+    n := 1
+    return n?
+}";
+    assert_eq!(codes(source), vec![dux_diag::code::TYPE_MISMATCH]);
+}
+
+#[test]
+fn one_question_hands_back_one_error_type() {
+    let source = "fn text_failure() -> Result<i32, string> {
+    return Err(\"no\")
+}
+
+fn number_failure() -> Result<i32, i32> {
+    return text_failure()?
+}
+
+fn main() {
+    one := number_failure()
+}";
+    assert_eq!(codes(source), vec![dux_diag::code::TYPE_MISMATCH]);
+}

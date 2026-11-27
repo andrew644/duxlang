@@ -145,6 +145,7 @@ pub enum Punct {
     LBracket,
     RBracket,
     Hash,
+    Question,
 }
 
 impl Punct {
@@ -189,6 +190,7 @@ impl Punct {
             Punct::LBracket => "[",
             Punct::RBracket => "]",
             Punct::Hash => "#",
+            Punct::Question => "?",
         }
     }
 
@@ -696,7 +698,7 @@ impl<'a> Lexer<'a> {
             ("&&", Punct::AndAnd),
             ("||", Punct::OrOr),
         ];
-        const SHORT: [(char, Punct); 17] = [
+        const SHORT: [(char, Punct); 18] = [
             (';', Punct::Semicolon),
             (',', Punct::Comma),
             (':', Punct::Colon),
@@ -714,6 +716,7 @@ impl<'a> Lexer<'a> {
             ('(', Punct::LParen),
             (')', Punct::RParen),
             ('{', Punct::LBrace),
+            ('?', Punct::Question),
         ];
         let three = self.slice(3);
         let two = self.slice(2);
