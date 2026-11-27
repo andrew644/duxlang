@@ -75,6 +75,10 @@ pub(crate) enum DuxType {
     /// value, so it copies, is passed by value and lives in a slot like any
     /// other aggregate.
     Slice(&'static DuxType),
+    /// `(A, B)`: an anonymous, positional value. The LLVM representation is
+    /// a literal struct of the elements, so a tuple copies, travels in
+    /// registers and lives in a slot like any other aggregate.
+    Tuple(&'static TupleInfo),
     /// A declared `struct`. The LLVM representation is the nominal struct
     /// type, so assignment is a copy of the whole record.
     Struct(&'static StructInfo),
@@ -98,6 +102,24 @@ pub(crate) struct ArrayInfo {
     pub(crate) elem: DuxType,
     pub(crate) len: u64,
 }
+
+/// The shape of an anonymous tuple. Two tuples written the same are one
+/// type, so the emitter interns one `TupleInfo` per element list and
+/// identity follows the spelling.
+#[derive(Debug)]
+pub(crate) struct TupleInfo {
+    pub(crate) spelled: String,
+    pub(crate) elems: Vec<DuxType>,
+    pub(crate) llvm: StructType<'static>,
+}
+
+impl PartialEq for TupleInfo {
+    fn eq(&self, other: &Self) -> bool {
+        std::ptr::eq(self, other)
+    }
+}
+
+impl Eq for TupleInfo {}
 
 /// The shape a function pointer carries: what it takes and what it answers.
 /// A `fn` type is the C ABI — `&` takes the address of a `#[no_context]`
@@ -270,6 +292,7 @@ impl DuxType {
                 | DuxType::Pointer(_)
                 | DuxType::Array(_)
                 | DuxType::Slice(_)
+                | DuxType::Tuple(_)
         ) || self.is_integral()
             || self.is_float()
     }
@@ -369,6 +392,7 @@ impl DuxType {
                 )
                 .into(),
             DuxType::Struct(info) => info.llvm.into(),
+            DuxType::Tuple(info) => info.llvm.into(),
             DuxType::Enum(info) => info.llvm,
         }
     }
@@ -415,6 +439,7 @@ impl DuxType {
             DuxType::Pointer(target) => format!("*{}", target.name()),
             DuxType::Array(info) => format!("[{}; {}]", info.elem.name(), info.len),
             DuxType::Slice(element) => format!("[]{}", element.name()),
+            DuxType::Tuple(info) => info.spelled.clone(),
             DuxType::Struct(info) => info.name.to_string(),
             DuxType::Enum(info) => info.spelled.clone(),
             DuxType::Fn(info) => FnInfo::spelled(info),
@@ -430,6 +455,14 @@ impl DuxType {
             DuxType::Pointer(target) => format!("*{}", target.key()),
             DuxType::Array(info) => format!("[{}; {}]", info.elem.key(), info.len),
             DuxType::Slice(element) => format!("[]{}", element.key()),
+            DuxType::Tuple(info) => format!(
+                "({})",
+                info.elems
+                    .iter()
+                    .map(|ty| ty.key())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
             DuxType::Struct(info) => info.spelled.clone(),
             DuxType::Enum(info) => info.spelled.clone(),
             DuxType::Fn(info) => FnInfo::spelled(info),
@@ -458,6 +491,7 @@ impl DuxType {
             DuxType::F32 | DuxType::F64 => return true,
             DuxType::Array(..)
             | DuxType::Struct(..)
+            | DuxType::Tuple(..)
             | DuxType::Enum(_)
             | DuxType::Str
             | DuxType::Ptr
@@ -811,6 +845,9 @@ pub(crate) struct Emitter {
     /// `StructInfo` (a nominal LLVM struct type plus resolved field types).
     struct_decls: Vec<dux_ast::StructDecl>,
     structs: HashMap<String, &'static StructInfo>,
+    /// The anonymous tuple shapes seen, interned by their elements: one
+    /// `(i32, i64)` is one type, however many places spell it.
+    tuples: HashMap<String, &'static TupleInfo>,
     /// The module whose body is being lowered, written the way a use would
     /// write it. Inside `mod math` a bare name means the module's own first.
     home: String,
@@ -928,6 +965,7 @@ impl Emitter {
             signatures: HashMap::new(),
             struct_decls: Vec::new(),
             structs: HashMap::new(),
+            tuples: HashMap::new(),
             generic_fns: HashMap::new(),
             home: String::new(),
             home_of: HashMap::new(),
@@ -1268,6 +1306,13 @@ impl Emitter {
             Type::Slice { element, .. } => self
                 .type_of(element)
                 .map(|element| DuxType::Slice(Box::leak(Box::new(element)))),
+            Type::Tuple { elements, .. } => {
+                let mut elems = Vec::new();
+                for element in elements {
+                    elems.push(self.type_of(element)?);
+                }
+                Some(self.tuple_type(&elems))
+            }
             Type::Pointer { pointee, .. } => {
                 self.pointer_depth += 1;
                 let pointee = self.type_of(pointee);
@@ -2148,7 +2193,11 @@ impl Emitter {
         }
         if matches!(
             value.ty,
-            DuxType::Array(..) | DuxType::Slice(_) | DuxType::Struct(..) | DuxType::Enum(_)
+            DuxType::Array(..)
+                | DuxType::Slice(_)
+                | DuxType::Struct(..)
+                | DuxType::Tuple(..)
+                | DuxType::Enum(_)
         ) {
             self.unsupported(span, &format!("hashing a `{}`", value.ty.name()));
             return None;
@@ -3904,7 +3953,7 @@ impl Emitter {
                 Some(place) => place,
                 None => return,
             },
-            Expr::Field { .. } => {
+            Expr::Field { .. } | Expr::Member { .. } => {
                 if let Some(root) = place_root(target) {
                     if self.const_names.contains(root) {
                         self.diagnostics.push(
@@ -5467,6 +5516,12 @@ impl Emitter {
                 let (index, field_ty) = self.field_of(info, &name.name, name.span)?;
                 Some((field_ty, self.field_address(info, at, index)?))
             }
+            Expr::Member { base, index, .. } => {
+                let (ty, at) = self.place_of_expr(module, base)?;
+                let (info, at) = self.tuple_address(ty, at)?;
+                let elem = self.tuple_field(info, *index, expr.span())?;
+                Some((elem, self.tuple_field_address(info, at, *index)?))
+            }
             Expr::Index { base, index, .. } => self.place_of(module, base, index, false),
             Expr::Unary {
                 op: UnaryOp::Load,
@@ -5901,6 +5956,188 @@ impl Emitter {
         self.load(ty, slot)
     }
 
+    /// The type of an anonymous tuple, interned by its elements: two
+    /// `(i32, i64)`s written a thousand places apart are one type.
+    fn tuple_type(&mut self, elems: &[DuxType]) -> DuxType {
+        let key = format!(
+            "({})",
+            elems
+                .iter()
+                .map(|ty| ty.key())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        if let Some(info) = self.tuples.get(&key).copied() {
+            return DuxType::Tuple(info);
+        }
+        let spelled = format!(
+            "({})",
+            elems
+                .iter()
+                .map(|ty| ty.name())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        let fields: Vec<BasicTypeEnum<'static>> = elems
+            .iter()
+            .map(|ty| ty.llvm(self.context))
+            .collect();
+        let llvm = self.context.struct_type(&fields, false);
+        let info: &'static TupleInfo = Box::leak(Box::new(TupleInfo {
+            spelled,
+            elems: elems.to_vec(),
+            llvm,
+        }));
+        self.tuples.insert(key, info);
+        DuxType::Tuple(info)
+    }
+
+    /// The tuple a place reaches and the address of that tuple. A place of
+    /// tuple type is the tuple; a place of `*T` type holds the address, so
+    /// `p.0` reads the pointer out before stepping into the target.
+    fn tuple_address(
+        &mut self,
+        ty: DuxType,
+        at: PointerValue<'static>,
+    ) -> Option<(&'static TupleInfo, PointerValue<'static>)> {
+        match ty {
+            DuxType::Tuple(info) => Some((info, at)),
+            DuxType::Pointer(target) => {
+                let DuxType::Tuple(info) = *target else {
+                    return None;
+                };
+                let pointer = self
+                    .builder
+                    .build_load(self.pointer_to(*target).llvm(self.context), at, "deref")
+                    .ok()?
+                    .into_pointer_value();
+                Some((info, pointer))
+            }
+            _ => None,
+        }
+    }
+
+    /// `t.{index}`, with the out-of-range diagnostic in one place.
+    fn tuple_field(&mut self, info: &'static TupleInfo, index: u32, span: Span) -> Option<DuxType> {
+        match info.elems.get(index as usize) {
+            Some(ty) => Some(*ty),
+            None => {
+                self.diagnostics.push(
+                    Diagnostic::error(
+                        code::TYPE_MISMATCH,
+                        format!("`{}` has no member `.{index}`", info.spelled),
+                    )
+                    .with_span(span)
+                    .with_note(format!(
+                        "the members are .0..{}",
+                        info.elems.len().saturating_sub(1)
+                    )),
+                );
+                None
+            }
+        }
+    }
+
+    fn tuple_field_address(
+        &self,
+        info: &'static TupleInfo,
+        base: PointerValue<'static>,
+        index: u32,
+    ) -> Option<PointerValue<'static>> {
+        let zero = self.context.i32_type().const_zero();
+        let at = self.context.i32_type().const_int(index as u64, false);
+        unsafe {
+            self.builder
+                .build_gep(info.llvm, base, &[zero, at], "member")
+        }
+        .ok()
+    }
+
+    /// `(a, b)`: the elements are built into a slot of the tuple's own,
+    /// which is what makes assignment a copy of the whole.
+    fn tuple_literal(
+        &mut self,
+        module: &Module<'static>,
+        elements: &[Expr],
+        expected: Option<DuxType>,
+        span: Span,
+    ) -> Option<Typed> {
+        let wanted: Vec<Option<DuxType>> = match expected {
+            Some(DuxType::Tuple(info)) if info.elems.len() == elements.len() => {
+                info.elems.iter().map(|ty| Some(*ty)).collect()
+            }
+            _ => vec![None; elements.len()],
+        };
+        let mut values = Vec::new();
+        for (element, want) in elements.iter().zip(wanted.iter()) {
+            let value = self.expr(module, element, *want)?;
+            if value.ty == DuxType::Error {
+                return Some(Typed::error());
+            }
+            let value = match want {
+                Some(want) => self.coerce_implicit(module, value, *want, element.span())?,
+                None => value,
+            };
+            values.push(value);
+        }
+        let elems: Vec<DuxType> = values.iter().map(|value| value.ty).collect();
+        let ty = self.tuple_type(&elems);
+        let DuxType::Tuple(info) = ty else {
+            return None;
+        };
+        let slot = self.alloca(ty, "tuple");
+        let _ = self.builder.build_store(slot, info.llvm.const_zero()).ok()?;
+        for (index, value) in values.iter().enumerate() {
+            let at = self.tuple_field_address(info, slot, index as u32)?;
+            match (info.elems[index].array_info(), value.core) {
+                (Some(array), Core::Ptr(source)) => self.copy_array(at, source, array),
+                (None, _) => {
+                    let Some(basic) = value.basic() else {
+                        self.unsupported(span, "storing this value in a tuple");
+                        return None;
+                    };
+                    let _ = self.builder.build_store(at, basic).ok()?;
+                }
+                (Some(_), _) => {
+                    self.unsupported(span, "storing this array value in a tuple");
+                    return None;
+                }
+            }
+        }
+        self.load(ty, slot)
+    }
+
+    /// `t.0`: a positional read. A place reaches its member directly; a
+    /// value the program just built is stood in a slot of its own first.
+    fn member_expr(
+        &mut self,
+        module: &Module<'static>,
+        base: &Expr,
+        index: u32,
+        span: Span,
+    ) -> Option<Typed> {
+        if let Some((ty, at)) = self.place_of_expr(module, base) {
+            if let Some((info, at)) = self.tuple_address(ty, at) {
+                let elem = self.tuple_field(info, index, span)?;
+                let at = self.tuple_field_address(info, at, index)?;
+                return self.load(elem, at);
+            }
+        }
+        let value = self.expr(module, base, None)?;
+        let DuxType::Tuple(info) = value.ty else {
+            self.unsupported(
+                span,
+                &format!("reading `.{index}` on a `{}`", value.ty.name()),
+            );
+            return None;
+        };
+        let elem = self.tuple_field(info, index, span)?;
+        let slot = self.alloca(value.ty, "tuple");
+        let _ = self.builder.build_store(slot, value.basic()?).ok()?;
+        let at = self.tuple_field_address(info, slot, index)?;
+        self.load(elem, at)
+    }
+
     /// One line of the line table: every subsequent instruction carries the
     /// span's line and column until the next statement claims one.
     fn set_location(&mut self, span: Span) {
@@ -6188,6 +6425,8 @@ impl Emitter {
             Expr::ArrayLiteral { elements, span, .. } => {
                 self.array_literal(module, elements, expected, *span)
             }
+            Expr::Tuple { elements, span } => self.tuple_literal(module, elements, expected, *span),
+            Expr::Member { base, index, span } => self.member_expr(module, base, *index, *span),
             Expr::RepeatedArray { value, len, span } => {
                 self.repeated_array(module, value, len, expected, *span)
             }
@@ -8389,6 +8628,16 @@ impl Emitter {
                 );
                 None
             }
+            DuxType::Tuple(info) => {
+                self.unsupported(
+                    span,
+                    &format!(
+                        "printing a `{}` whole (print its members, one at a time)",
+                        info.spelled
+                    ),
+                );
+                None
+            }
             _ => value.basic().map(|one| vec![one.into()]),
         }
     }
@@ -8956,6 +9205,7 @@ fn spec_for(ty: DuxType) -> Option<&'static str> {
         DuxType::Ptr | DuxType::Pointer(_) | DuxType::Fn(_) => "p",
         DuxType::Array(..)
         | DuxType::Struct(..)
+        | DuxType::Tuple(..)
         | DuxType::Enum(_)
         | DuxType::Slice(_)
         | DuxType::Error => return None,
@@ -8964,7 +9214,7 @@ fn spec_for(ty: DuxType) -> Option<&'static str> {
 
 fn expression_name(expr: &Expr) -> &'static str {
     match expr {
-        Expr::Member { .. } => "a tuple member (lands at M3)",
+        Expr::Member { .. } => "a tuple member",
         Expr::Range { .. } => "a range (lands at M3)",
         Expr::Path { .. } => "a qualified path",
         Expr::StructLiteral { .. } => "a struct value (lands at M3)",
@@ -9179,6 +9429,11 @@ impl Scan {
             | Expr::Ident { .. }
             | Expr::Error { .. } => {}
             Expr::Field { base, .. } | Expr::Member { base, .. } => self.expr(base),
+            Expr::Tuple { elements, .. } => {
+                for element in elements {
+                    self.expr(element);
+                }
+            }
             Expr::Index { base, index, .. } => {
                 self.expr(base);
                 self.expr(index);
@@ -9363,7 +9618,7 @@ fn typed_of(value: BasicValueEnum<'static>, ty: DuxType) -> Typed {
         Typed::pointer(value.into_pointer_value(), ty)
     } else if ty == DuxType::Str
         || ty.slice_element().is_some()
-        || matches!(ty, DuxType::Struct(_) | DuxType::Enum(_))
+        || matches!(ty, DuxType::Struct(_) | DuxType::Enum(_) | DuxType::Tuple(_))
     {
         Typed {
             core: Core::Aggregate(value.into_struct_value()),

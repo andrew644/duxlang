@@ -91,7 +91,7 @@ fn a_call_that_supplies_the_wrong_number_of_arguments_is_e0112() {
 }
 
 #[test]
-fn a_milestone_gap_in_the_arguments_silences_the_arity_check() {
+fn a_tuple_is_one_value_and_travels_as_one_argument() {
     assert_eq!(
         codes(
             "fn add(a: i32, b: i32) -> i32 {
@@ -103,9 +103,9 @@ fn main() {
 }
 "
         ),
-        // the tuple literal is an E0007 milestone gap owned by the parser;
-        // the resolver must not cascade an E0112 on top of it.
-        Vec::<&'static str>::new()
+        // one tuple is one value, so one argument next to two parameters is
+        // an arity error and the checker says so.
+        vec!["E0112"]
     );
 }
 

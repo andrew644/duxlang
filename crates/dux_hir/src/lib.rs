@@ -410,6 +410,11 @@ impl<'a> Resolver<'a> {
                 }
             }
             Expr::Member { base, .. } => self.expr(base),
+            Expr::Tuple { elements, .. } => {
+                for element in elements {
+                    self.expr(element);
+                }
+            }
             Expr::ArrayLiteral { elements, .. } => {
                 for element in elements {
                     self.expr(element);

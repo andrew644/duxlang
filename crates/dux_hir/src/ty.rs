@@ -110,6 +110,9 @@ pub enum Ty {
     Array(Box<Ty>),
     /// `[]T`: a `{ data, len }` view over elements of `T`.
     Slice(Box<Ty>),
+    /// `(A, B)`: anonymous, positional, a value that copies. Structural like
+    /// the `type` aliases it can be made of — two written the same are one.
+    Tuple(Vec<Ty>),
     Struct(String),
     /// A declared `enum`, with the arguments it was made of: `Shape` carries
     /// none, `Option<i32>` carries the one. Nominal, like a record.
@@ -149,6 +152,10 @@ impl Ty {
             Ty::FloatConst(value) => format!("float literal {value}"),
             Ty::Array(element) => format!("[{}]", element.name()),
             Ty::Slice(element) => format!("[]{}", element.name()),
+            Ty::Tuple(elements) => format!(
+                "({})",
+                elements.iter().map(Ty::name).collect::<Vec<_>>().join(", ")
+            ),
             Ty::Struct(name) => name.clone(),
             Ty::Instance { name, args } if args.is_empty() => name.clone(),
             Ty::Instance { name, args } => format!(
@@ -247,6 +254,9 @@ impl Ty {
                 }
             }
             Ty::FloatConst(_) => Ty::F64,
+            Ty::Tuple(elements) => {
+                Ty::Tuple(elements.iter().map(Ty::defaulted).collect())
+            }
             other => other.clone(),
         }
     }
@@ -878,7 +888,10 @@ impl<'a> Checker<'a> {
             Type::Slice { element, .. } => {
                 Ty::Slice(Box::new(self.resolve_type_in(element, depth + 1, params)))
             }
-            Type::Tuple { .. } | Type::Function { .. } | Type::ConstArgument { .. } => Ty::Opaque,
+            Type::Tuple { elements, .. } => {
+                Ty::Tuple(elements.iter().map(|element| self.resolve_type_in(element, depth + 1, params)).collect())
+            }
+            Type::Function { .. } | Type::ConstArgument { .. } => Ty::Opaque,
             Type::Error { .. } => Ty::Opaque,
         }
     }
@@ -1262,6 +1275,14 @@ impl<'a> Checker<'a> {
                     self.mismatch(span, to, &value);
                 }
                 to.clone()
+            }
+            (Ty::Tuple(mine), Ty::Tuple(theirs)) if mine.len() == theirs.len() => {
+                let theirs = theirs.clone();
+                let mut parts = Vec::new();
+                for (element, want) in mine.iter().zip(theirs.iter()) {
+                    parts.push(self.coerce(element.clone(), want, span));
+                }
+                Ty::Tuple(parts)
             }
             (_, to) => {
                 let from = value.defaulted();
@@ -2609,9 +2630,48 @@ impl<'a> Checker<'a> {
                 }
                 Ty::Opaque
             }
-            Expr::Member { base, .. } => {
-                let _ = self.infer(base);
-                Ty::Opaque
+            Expr::Member { base, index, span } => {
+                let base_ty = self.infer(base);
+                match base_ty {
+                    Ty::Tuple(elements) => match elements.get(*index as usize) {
+                        Some(element) => element.clone(),
+                        None => {
+                            self.error(
+                                code::TYPE_MISMATCH,
+                                format!(
+                                    "a `{}` has no member `.{index}`",
+                                    Ty::Tuple(elements).name()
+                                ),
+                                *span,
+                            );
+                            Ty::Opaque
+                        }
+                    },
+                    Ty::Opaque => Ty::Opaque,
+                    other => {
+                        self.error(
+                            code::TYPE_MISMATCH,
+                            format!("there is no positional access on `{}`", other.name()),
+                            *span,
+                        );
+                        Ty::Opaque
+                    }
+                }
+            }
+            Expr::Tuple { elements, span } => {
+                let wanted: Vec<Option<Ty>> = match expected {
+                    Some(Ty::Tuple(parts)) if parts.len() == elements.len() => {
+                        parts.iter().map(|part| Some(part.clone())).collect()
+                    }
+                    _ => vec![None; elements.len()],
+                };
+                let parts: Vec<Ty> = elements
+                    .iter()
+                    .zip(wanted)
+                    .map(|(element, want)| self.typed(element, want.as_ref()).defaulted())
+                    .collect();
+                let _ = span;
+                Ty::Tuple(parts)
             }
             Expr::ArrayLiteral { elements, span } => self.array_literal(elements, *span, expected),
             Expr::RepeatedArray { value, len, span } => {

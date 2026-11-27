@@ -422,6 +422,14 @@ fn dump_expr(expr: &Expr) -> String {
             end.as_ref().map(|e| dump_expr(e)).unwrap_or_default()
         ),
         Expr::Member { base, index, .. } => format!("{}.{}", dump_expr(base), index),
+        Expr::Tuple { elements, .. } => {
+            let spelled: Vec<String> = elements.iter().map(dump_expr).collect();
+            if spelled.len() == 1 {
+                format!("({},)", spelled[0])
+            } else {
+                format!("({})", spelled.join(", "))
+            }
+        }
         Expr::ArrayLiteral { elements, .. } => format!(
             "[{}]",
             elements.iter().map(dump_expr).collect::<Vec<_>>().join(", ")

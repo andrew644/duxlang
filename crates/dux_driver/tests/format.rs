@@ -69,16 +69,13 @@ fn every_formatable_example_survives_a_format_round_trip() {
         "strings.dux",
         "sum_types.dux",
         "generics.dux",
+        "types.dux",
     ] {
         assert!(
             formatted.contains(&must_format.to_string()),
             "{must_format} must format"
         );
     }
-    assert!(
-        rejected.contains(&"types.dux".to_string()),
-        "types.dux has a milestone gap the formatter must not silently drop"
-    );
 }
 
 #[test]

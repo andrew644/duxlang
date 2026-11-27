@@ -1688,15 +1688,14 @@ impl<'a> Parser<'a> {
                     let mut elements = vec![inner];
                     while self.at_punct(Punct::Comma) {
                         self.bump();
+                        if self.at_punct(Punct::RParen) {
+                            break;
+                        }
                         elements.push(self.expr());
                     }
                     let end = self.expect_punct(Punct::RParen, "expected `)` to close the tuple");
-                    self.diagnostics.push(
-                        Diagnostic::error(CODE_UNSUPPORTED_YET, "tuple literals are not supported by this compiler build yet")
-                            .with_span(token.span.merge(end))
-                            .with_note("this is a milestone limitation, not a language decision"),
-                    );
-                    return Expr::Error {
+                    return Expr::Tuple {
+                        elements,
                         span: token.span.merge(end),
                     };
                 }
@@ -2639,13 +2638,31 @@ mod tests {
     }
 
     #[test]
-    fn an_unlowerable_expression_reports_one_milestone_diagnostic() {
-        let (_program, diagnostics) = parse_text("fn f() -> i32 {\n    return (1, 2)\n}");
-        assert_eq!(
-            diagnostics.iter().map(|d| d.code).collect::<Vec<_>>(),
-            vec![CODE_UNSUPPORTED_YET],
-            "a tuple value is a milestone gap, and one diagnostic is enough"
+    fn tuple_values_parse_with_their_members() {
+        let (program, diagnostics) = parse_text(
+            "fn f() {\n    pair := (1, 2)\n    one := (3,)\n    first := pair.0\n    pair.1 = 5\n}",
         );
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        let f = program.find_function("f").unwrap();
+        let Stmt::Binding { value: Some(Expr::Tuple { elements, .. }), .. } = &f.body.stmts[0]
+        else {
+            panic!("a tuple value binds its elements");
+        };
+        assert_eq!(elements.len(), 2);
+        let Stmt::Binding { value: Some(Expr::Tuple { elements, .. }), .. } = &f.body.stmts[1]
+        else {
+            panic!("a trailing comma keeps a one-element tuple a tuple");
+        };
+        assert_eq!(elements.len(), 1);
+        let Stmt::Binding { value: Some(Expr::Member { index, .. }), .. } = &f.body.stmts[2]
+        else {
+            panic!("a positional read is a member access");
+        };
+        assert_eq!(*index, 0);
+        let Stmt::Assign { target, .. } = &f.body.stmts[3] else {
+            panic!("a positional write is an assignment to a member");
+        };
+        assert!(matches!(target, Expr::Member { index: 1, .. }));
     }
 
     #[test]

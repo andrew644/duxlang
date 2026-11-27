@@ -326,6 +326,10 @@ pub enum Expr {
         index: u32,
         span: Span,
     },
+    Tuple {
+        elements: Vec<Expr>,
+        span: Span,
+    },
     ArrayLiteral {
         elements: Vec<Expr>,
         span: Span,
@@ -403,6 +407,7 @@ impl Expr {
             | Expr::Index { span, .. }
             | Expr::Range { span, .. }
             | Expr::Member { span, .. }
+            | Expr::Tuple { span, .. }
             | Expr::ArrayLiteral { span, .. }
             | Expr::RepeatedArray { span, .. }
             | Expr::Path { span, .. }

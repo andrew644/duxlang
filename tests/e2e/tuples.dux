@@ -1,0 +1,39 @@
+package main
+
+fn min_max(lo: i32, hi: i32) -> (i32, i32) {
+    if lo < hi {
+        return (lo, hi)
+    }
+    return (hi, lo)
+}
+
+fn shift(pair: (i32, i32), by: i32) -> (i32, i32) {
+    return (pair.0 + by, pair.1 + by)
+}
+
+fn main() {
+    pair := (1, 2)
+    println($"{pair.0} {pair.1}")
+    wide: (i64, i64) = (7, 9)
+    println($"{wide.0} {wide.1}")
+    bounds := min_max(9, 4)
+    println($"{bounds.0}..{bounds.1}")
+    moved := shift(bounds, 100)
+    println($"{moved.0} {moved.1}")
+    pair.0 = 42
+    println($"{pair.0}")
+    nested := ((1, 2), 3)
+    println($"{nested.0.1} {nested.1}")
+    picked := true
+    chosen := if picked { (1, 2) } else { (3, 4) }
+    println($"{chosen.0} {chosen.1}")
+    mixed := (1, "text", 2.5)
+    println($"{mixed.0} {mixed.1} {mixed.2}")
+    single := (5,)
+    println($"{single.0}")
+    copy := pair
+    copy.1 = 99
+    println($"{pair.1} {copy.1}")
+    wide.1 = 10
+    println($"{wide.0} {wide.1}")
+}

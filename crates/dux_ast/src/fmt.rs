@@ -655,6 +655,17 @@ impl Printer {
             Expr::Member { base, index, .. } => {
                 format!("{}.{}", self.expr(base, level), index)
             }
+            Expr::Tuple { elements, .. } => {
+                let spelled: Vec<String> = elements
+                    .iter()
+                    .map(|element| self.expr(element, level))
+                    .collect();
+                if spelled.len() == 1 {
+                    format!("({},)", spelled[0])
+                } else {
+                    format!("({})", spelled.join(", "))
+                }
+            }
             Expr::ArrayLiteral { elements, .. } => format!(
                 "[{}]",
                 elements

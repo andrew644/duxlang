@@ -595,7 +595,21 @@ impl<'a> Lexer<'a> {
 
         self.eat_digits(|c| c.is_ascii_digit());
         let mut is_float = false;
-        if self.peek() == Some(b'.') && matches!(self.peek_at(1), Some(b) if b.is_ascii_digit()) {
+        // A digit run written flush against a `.` is a tuple member, not the
+        // head of a float: `t.0.1` is two positions, while `0.75` and the
+        // `0.5` in `x .0.5` (spaced off the dot) are what they spell.
+        let after_member_dot = self
+            .tokens
+            .last()
+            .is_some_and(|last| last.span.end() == self.base + start as u32)
+            && matches!(
+                self.tokens.last().map(|last| &last.kind),
+                Some(TokenKind::Punct(Punct::Dot))
+            );
+        if !after_member_dot
+            && self.peek() == Some(b'.')
+            && matches!(self.peek_at(1), Some(b) if b.is_ascii_digit())
+        {
             is_float = true;
             self.cursor += 1;
             self.eat_digits(|c| c.is_ascii_digit());
@@ -955,6 +969,26 @@ mod tests {
         assert_eq!(lexed.tokens[1].literal, Some(Literal::Int(1024)));
         assert_eq!(lexed.tokens[2].literal, Some(Literal::Float(0.75)));
         assert_eq!(lexed.tokens[3].literal, Some(Literal::Float(1000.0)));
+    }
+
+    #[test]
+    fn a_digit_run_after_a_dot_is_a_member_not_a_float() {
+        let mut sources = SourceMap::new();
+        let file = sources.add("t.dux", "t.0.1");
+        let lexed = lex(&sources, file);
+        let kinds: Vec<_> = lexed.tokens.iter().map(|t| t.kind).collect();
+        assert_eq!(
+            kinds,
+            vec![
+                TokenKind::Ident,
+                TokenKind::Punct(Punct::Dot),
+                TokenKind::Int,
+                TokenKind::Punct(Punct::Dot),
+                TokenKind::Int,
+                TokenKind::Eof,
+            ],
+            "`t.0.1` walks two positions, it does not read a float"
+        );
     }
 
     #[test]

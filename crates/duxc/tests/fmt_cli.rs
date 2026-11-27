@@ -105,15 +105,21 @@ fn a_broken_file_fails_fmt_and_stays_untouched() {
 #[test]
 fn a_milestone_gap_that_would_degrade_the_ast_refuses_formatting() {
     let dir = scratch("fmt_gap");
-    let file = dir.join("pairs.dux");
-    std::fs::write(&file, "fn main() {\n    pair := (1, 2)\n}\n").unwrap();
+    let file = dir.join("streams.dux");
+    std::fs::write(
+        &file,
+        "fn main() {\n    for stream() {\n        println(\"x\")\n    }\n}\n",
+    )
+    .unwrap();
 
     let run = duxc(&["fmt", file.to_str().unwrap()]);
     assert_eq!(run.code, 1);
     assert!(run.stderr.contains("E0007"), "{}", run.stderr);
     assert!(
-        std::fs::read_to_string(&file).unwrap().contains("(1, 2)"),
-        "the formatter must never emit a file with the tuple erased"
+        std::fs::read_to_string(&file)
+            .unwrap()
+            .contains("for stream()"),
+        "the formatter must never emit a file with the refused loop rewritten"
     );
 }
 

@@ -2,7 +2,6 @@
 
 ## Language gaps (the compiler refuses these today, usually with E0007)
 
-- [ ] Tuples: literals and `.0` member access reach machine code (the parser reads them; codegen reports "tuple literals are not supported yet")
 - [ ] `?` propagation operator (currently written `match … { Err(e) => return Err(e) }`)
 - [ ] `.runes()` — UTF-8 decode for `string` (M5 remaining gap)
 - [ ] `defer` in a branch or loop body (eager capture works at block level; nested/looped positions still report E0007)

@@ -1356,3 +1356,48 @@ fn main() {
         "a fixed slot still checks: {found:?}"
     );
 }
+
+#[test]
+fn tuples_check_element_wise_and_positionally() {
+    let clean = "fn shift(pair: (i32, i64), by: i32) -> (i32, i64) {
+    return (pair.0 + by, pair.1)
+}
+
+fn main() {
+    wide: (i64, i64) = (1, 2)
+    wide.1 = 9
+    first := wide.0
+    small := (1, true)
+    second := small.1
+    if second {
+        wide.0 = first
+    }
+}";
+    assert_eq!(codes(clean), Vec::<&'static str>::new());
+}
+
+#[test]
+fn a_member_outside_the_tuple_is_said() {
+    let source = "fn main() {
+    pair := (1, 2)
+    println($\"{}\", pair.5)
+}";
+    assert_eq!(codes(source), vec![dux_diag::code::TYPE_MISMATCH]);
+}
+
+#[test]
+fn a_tuple_that_disagrees_with_its_annotation_is_said() {
+    let source = "fn main() {
+    wide: (i64, i64, i64) = (1, 2)
+}";
+    assert_eq!(codes(source), vec![dux_diag::code::TYPE_MISMATCH]);
+}
+
+#[test]
+fn positional_access_walks_nothing_but_a_tuple() {
+    let source = "fn main() {
+    n := 1
+    println($\"{}\", n.0)
+}";
+    assert_eq!(codes(source), vec![dux_diag::code::TYPE_MISMATCH]);
+}
