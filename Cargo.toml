@@ -10,6 +10,7 @@ members = [
     "crates/dux_codegen",
     "crates/dux_cinterop",
     "crates/dux_driver",
+    "crates/dux_lsp",
     "crates/duxc",
 ]
 
@@ -31,4 +32,5 @@ dux_parser = { path = "crates/dux_parser" }
 dux_hir = { path = "crates/dux_hir" }
 dux_codegen = { path = "crates/dux_codegen" }
 dux_cinterop = { path = "crates/dux_cinterop" }
+dux_lsp = { path = "crates/dux_lsp" }
 inkwell = { version = "0.11.0", default-features = false, features = ["llvm23-1"] }

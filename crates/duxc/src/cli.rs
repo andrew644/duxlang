@@ -18,6 +18,7 @@ COMMANDS:
                       lends its *_test.dux files, and no path means here
     fmt [paths]       rewrite .dux files in their canonical form (drops comments)
     cimports <file>   report what the C importer saw, and everything it left out
+    lsp               serve an editor over stdin and stdout (LSP, stdio)
 
 OPTIONS:
     -o <path>         write the result to <path>
@@ -68,6 +69,7 @@ pub enum Command {
         args: Vec<String>,
         target: Option<String>,
     },
+    Lsp,
     Fmt {
         paths: Vec<PathBuf>,
         check: bool,
@@ -260,6 +262,7 @@ pub fn parse<I: IntoIterator<Item = OsString>>(argv: I) -> Result<Command, Usage
                 verbose,
             })
         }
+        "lsp" => Ok(Command::Lsp),
         "cimports" => {
             let mut file = None;
             let mut json = false;

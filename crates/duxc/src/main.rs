@@ -80,6 +80,13 @@ fn main() -> ExitCode {
                 }
             }
         }
+        Command::Lsp => match dux_lsp::stdio() {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                let _ = writeln!(err, "the language server stopped: {e}");
+                ExitCode::FAILURE
+            }
+        },
         Command::Fmt { paths, check } => fmt(&paths, check, &mut err),
         Command::Cimports { file, json } => cimports(&file, json, &mut err),
         Command::Test {

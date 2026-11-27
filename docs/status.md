@@ -182,6 +182,17 @@ each remaining gap is waiting for. A gap is a milestone, never a verdict.
   and an `lldb -batch` smoke test stops the running program and reads
   those variables.
 
+## The editor's road
+
+`duxc lsp` is the language server: JSON-RPC over stdin and stdout,
+framed the way the protocol asks. A document that opens or changes is
+read the way a build reads it, and the compiler's own diagnostics are
+published against it — code, message, place. Hover says what a name is:
+a function's signature, a record spelled out, the binding a local came
+from. Go-to-definition lands on the name as it was written, and an
+imported name lives where the import pointed: the answer crosses into
+the other file.
+
 ## Testing today
 
 `#[test] fn name()` marks a test; `dux test [paths]` compiles one

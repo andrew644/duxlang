@@ -94,6 +94,15 @@ pub fn analyze(path: &std::path::Path) -> Result<Analyzed, Failure> {
             format!("cannot read {}: {e}", path.display()),
         )])
     })?;
+    analyze_text(path, text)
+}
+
+/// Analyze a program whose entry text is already in hand — the editor's
+/// unsaved buffer, say. The path still matters: it is where the module
+/// roots, the prelude and the manifest are looked for; only the entry
+/// file's contents come from the caller instead of the disk.
+pub fn analyze_text(path: &Path, text: String) -> Result<Analyzed, Failure> {
+    let path = &entry_file(path);
     let mut sources = SourceMap::new();
     let file = sources.add(path.display().to_string(), text);
     let lexed = dux_lexer::lex(&sources, file);

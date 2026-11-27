@@ -80,6 +80,14 @@ impl SourceMap {
             .unwrap_or("<unknown>")
     }
 
+    /// Which file carries this name, if any is open at all.
+    pub fn find(&self, name: &str) -> Option<FileId> {
+        self.files
+            .iter()
+            .position(|f| f.name == name)
+            .map(|at| FileId(at as u32))
+    }
+
     pub fn is_empty(&self) -> bool {
         self.files.is_empty()
     }

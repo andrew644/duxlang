@@ -12,3 +12,7 @@ path = "src/main.rs"
 dux_source = { workspace = true }
 dux_diag = { workspace = true }
 dux_driver = { path = "../dux_driver" }
+dux_lsp = { workspace = true }
+
+[dev-dependencies]
+serde_json = "1"
