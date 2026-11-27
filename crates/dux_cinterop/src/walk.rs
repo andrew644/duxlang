@@ -133,8 +133,18 @@ extern "C" fn visit(cursor: CXCursor, _parent: CXCursor, data: CXClientData) -> 
             underlying: from_type(unsafe { clang::clang_getTypedefDeclUnderlyingType(cursor) }),
         })),
         k if k == clang::CXCursor_EnumDecl => Some(CDecl::Enum(enumeration(cursor, &named))),
+        // A variable declared inside a function body belongs to that body,
+        // not to the header's interface; it never reaches the report.
+        k if k == clang::CXCursor_VarDecl
+            && unsafe { clang::clang_getCursorSemanticParent(cursor) }.kind
+                == clang::CXCursor_FunctionDecl =>
+        {
+            None
+        }
         k if k == clang::CXCursor_VarDecl => Some(CDecl::Variable(CVariable {
             name: named,
+            file_local: (unsafe { clang::clang_Cursor_getStorageClass(cursor) })
+                == clang::CX_SC_Static,
             ty: from_type(unsafe { clang::clang_getCursorType(cursor) }),
         })),
         k if k == clang::CXCursor_MacroDefinition => {

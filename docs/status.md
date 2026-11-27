@@ -15,7 +15,7 @@ each remaining gap is waiting for. A gap is a milestone, never a verdict.
 | `sum_types.dux` | compiles, runs; variants, payloads, guards, or-patterns, ranges and exhaustiveness all reach machine code, and the dispatch is the `switch` on the tag | — |
 | `option_result.dux` | the predeclared `Option`/`Result` lower and match today, and `std/prelude` now hands every program `unwrap_or`, `is_some` and `is_none` | `std/fs` (file reading over `extern`), `.bytes()`, `.trim()`, and `unwrap`, which stops the program (the panic runtime) |
 | `generics.dux` | compiles, runs — `max<i32>`, `Pair<i32, string>`, `Either<string, i32>` matched, `zeros<4>()`, `sum(&[1, 2, 3])`, and `HashMap<string, i32>` with `insert`, `get(..).unwrap_or(..)` and `len`, the table and the method being prelude Dux | — |
-| `c_interop.dux` | compiles and runs, every line of it: `stdio.h`, `string.h`, `stdlib.h`, `time.h` and a header-only `stb_image.h` fill their namespaces through libclang, the `time.h` namespace is a second `mod` with its own `tm` record, the compiled translation unit carries the definitions `static inline` headers promise, `#[c_link]` and `#[c_pkgconfig]` reach the link line, and the hand-written `#[c_name]` extern finds its symbol in a header the program named | the owned-copy `to_cstr` and global variables (all reported by `duxc cimports`, none silent) |
+| `c_interop.dux` | compiles and runs, every line of it: `stdio.h`, `string.h`, `stdlib.h`, `time.h` and a header-only `stb_image.h` fill their namespaces through libclang, the `time.h` namespace is a second `mod` with its own `tm` record, the compiled translation unit carries the definitions `static inline` headers promise, `#[c_link]` and `#[c_pkgconfig]` reach the link line, and the hand-written `#[c_name]` extern finds its symbol in a header the program named | the owned-copy `to_cstr` (everything else the headers held back is reported by `duxc cimports`, none silent) |
 
 ## Deliberate runtime gaps today
 
@@ -100,12 +100,14 @@ each remaining gap is waiting for. A gap is a milestone, never a verdict.
   optimization level and the module links into the program, so `static
   inline` definitions and header-only libraries need nothing but the include.
   `duxc cimports file.dux [--json]` answers what crossed and names everything
-  the header kept back — a global variable, a nonconstant macro, a macro
+  the header kept back — a `static` variable, a nonconstant macro, a macro
   body that is more than an expression — with a reason each. A function-like
   macro whose body *is* an expression over its parameters — arithmetic,
   comparisons, `?:`, literals — crosses as a generic Dux function, the same
-  duck-typed call the macro gave its users. What waits on later passes: the
-  `std/fs`-style conveniences built on top.
+  duck-typed call the macro gave its users. An `extern` variable crosses as a
+  `#[c_name]` global: a window on the C definition, read and written in
+  place through the namespace that imports it. What waits on later passes:
+  the `std/fs`-style conveniences built on top.
 - **A library is named by the declaration that needs it.** `#[link(name = "m")]
   extern "C" { fn sqrtf(x: f32) -> f32 }` is how `std/math` says where its
   symbol lives, and the link line carries `-l m` because of it. A name a C

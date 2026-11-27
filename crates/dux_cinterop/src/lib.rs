@@ -130,6 +130,9 @@ pub struct CFunction {
 #[derive(Clone, Debug, PartialEq)]
 pub struct CVariable {
     pub name: String,
+    /// A `static` variable belongs to whichever translation unit includes
+    /// the header; no symbol reaches the link, so no Dux name can hold it.
+    pub file_local: bool,
     pub ty: CType,
 }
 

@@ -25,7 +25,7 @@ use inkwell::debug_info::{
     AsDIScope, DICompileUnit, DIFile, DIFlags, DIFlagsConstants, DISubprogram, DWARFEmissionKind,
     DWARFSourceLanguage, DebugInfoBuilder,
 };
-use inkwell::module::Module;
+use inkwell::module::{Linkage, Module};
 use inkwell::targets::TargetData;
 use inkwell::types::{
     BasicMetadataTypeEnum, BasicType, BasicTypeEnum, FloatType, FunctionType, IntType, StructType,
@@ -5623,6 +5623,16 @@ impl Emitter {
             Expr::Paren { inner, .. } => self.place_of_expr(module, inner),
             Expr::Ident { name, .. } => self.slot_of(name),
             Expr::Field { base, name, .. } => {
+                if let Expr::Ident { name: place, .. } = base.as_ref() {
+                    if self.slot_of(place).is_none()
+                        && !self.known(&name.name)
+                        && !self.known(&format!("{place}{}", name.name))
+                    {
+                        if let Some(found) = self.qualified_slot(place, &name.name) {
+                            return Some(found);
+                        }
+                    }
+                }
                 let (ty, at) = self.place_of_expr(module, base)?;
                 let (info, at) = self.record_address(ty, at)?;
                 let (index, field_ty) = self.field_of(info, &name.name, name.span)?;
@@ -6378,6 +6388,9 @@ impl Emitter {
                 let named = format!("{place}.{name}");
                 if let Some(value) = self.consts.get(&named).cloned() {
                     return Some(self.const_reference(&value, None, span));
+                }
+                if let Some((ty, at)) = self.qualified_slot(place, name) {
+                    return self.load(ty, at);
                 }
             }
         }
@@ -9572,6 +9585,30 @@ impl Emitter {
             );
             return;
         };
+        let imported = decl
+            .attributes
+            .iter()
+            .find(|attribute| attribute.name == "c_name");
+        if let Some(attribute) = imported {
+            // A `#[c_name]` global is a window on storage the C world
+            // owns: no initializer, no private copy, the symbol the
+            // header promised. The definition lives in some translation
+            // unit, and an unresolved use says so at the link.
+            let Some(AttributeArgument::Literal(symbol)) = attribute.arguments.first() else {
+                self.unsupported(decl.span, "a `#[c_name]` without the symbol it names");
+                return;
+            };
+            let global = match module.get_global(symbol) {
+                Some(found) => found,
+                None => {
+                    let declared = module.add_global(ty.llvm(self.context), None, symbol);
+                    declared.set_linkage(Linkage::External);
+                    declared
+                }
+            };
+            self.globals.insert(name, (ty, global));
+            return;
+        }
         let initializer = match &decl.value {
             None => ty.llvm(self.context).const_zero(),
             Some(value) => {
@@ -9829,9 +9866,37 @@ impl Emitter {
         if let Some(&(ty, slot)) = self.scopes.iter().rev().find_map(|scope| scope.get(name)) {
             return Some((ty, slot));
         }
-        self.globals
-            .get(name)
-            .map(|(ty, global)| (*ty, global.as_pointer_value()))
+        if let Some(found) = self.globals.get(name) {
+            return Some((found.0, found.1.as_pointer_value()));
+        }
+        // A bare name inside a module means the module's own, and a
+        // `global` declared there answers to the name it was written with.
+        if !self.home.is_empty() {
+            if let Some((ty, global)) = self.globals.get(&format!("{}{name}", self.home)) {
+                return Some((*ty, global.as_pointer_value()));
+            }
+        }
+        None
+    }
+
+    /// `demo.shared`: a `global` read through the module that declares it.
+    /// The name is the flattened one the declaration carries out of its
+    /// module, and a base that means a local, a global of this module's
+    /// own, or a type is no module at all.
+    fn qualified_slot(&self, place: &str, name: &str) -> Option<(DuxType, PointerValue<'static>)> {
+        if self.known(place) || self.consts.contains_key(place) {
+            return None;
+        }
+        [
+            format!("{}{}.{name}", self.home, place),
+            format!("{place}.{name}"),
+        ]
+        .into_iter()
+        .find_map(|key| {
+            self.globals
+                .get(&key)
+                .map(|(ty, global)| (*ty, global.as_pointer_value()))
+        })
     }
 }
 

@@ -25,4 +25,7 @@ fn main() {
     p := demo.pair { a: 3, b: 4 }
     println($"pair={}", p.a + p.b)
     println($"doubled={}", demo.CD_DOUBLE(21))
+    println($"shared={}", demo.cdemo_shared)
+    demo.cdemo_shared = 5
+    println($"shared={}", demo.cdemo_shared)
 }

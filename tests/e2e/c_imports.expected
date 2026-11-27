@@ -4,3 +4,5 @@ limit=42
 green=5
 pair=7
 doubled=42
+shared=0
+shared=5

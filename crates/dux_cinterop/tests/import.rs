@@ -163,8 +163,8 @@ fn the_mapping_table_crosses_what_it_promises() {
         "the typedef names a record that now exists:\n{text}"
     );
     assert!(
-        !text.contains("dux_counter"),
-        "extern variables wait:\n{text}"
+        text.contains("#[c_name(\"dux_counter\")] global dux_counter: c_int"),
+        "an extern variable crosses as a window on the C storage:\n{text}"
     );
 }
 
@@ -262,8 +262,8 @@ fn nothing_that_did_not_cross_is_quietly_waiting() {
         "and it says why: {missed:?}"
     );
     assert!(
-        named("dux_counter"),
-        "a global variable is named, not hidden: {missed:?}"
+        !named("dux_counter"),
+        "the extern variable crossed, so it is no one's loss: {missed:?}"
     );
 }
 

@@ -1,9 +1,5 @@
 # TODO
 
-## C interop (M6 "remaining: reported, none silent")
-
-- [ ] Import global variables from headers
-
 ## M7 — toolchain maturity
 
 - [ ] Full DWARF type DIEs for user types; `DW_LANG_C99` DIEs for imported C types so lldb prints them

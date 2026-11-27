@@ -34,6 +34,7 @@ fn spell_with(
     let mut out = String::new();
     let mut externals: Vec<&CFunction> = Vec::new();
     let mut types: Vec<(String, String)> = Vec::new();
+    let mut globals: Vec<(String, String)> = Vec::new();
     let mut constants: Vec<(String, String)> = Vec::new();
     let mut emitted: std::collections::HashSet<String> = std::collections::HashSet::new();
     // A macro that shares a C function's name is that function's alias in
@@ -102,10 +103,33 @@ fn spell_with(
                 }
             }
             CDecl::Variable(global) => {
-                missed.push(crate::Skipped {
-                    name: global.name.clone(),
-                    reason: "global variables are still waiting".to_string(),
-                });
+                if global.file_local {
+                    missed.push(crate::Skipped {
+                        name: global.name.clone(),
+                        reason: "the variable belongs to one translation unit".to_string(),
+                    });
+                } else if !is_plain_name(&global.name) {
+                    missed.push(crate::Skipped {
+                        name: global.name.clone(),
+                        reason: "the name is not one Dux can write".to_string(),
+                    });
+                } else {
+                    match variable_spelling(&ctx, &global.ty) {
+                        Ok(text) => {
+                            let named = safe(&global.name);
+                            keep(
+                                &mut emitted,
+                                &mut globals,
+                                global.name.clone(),
+                                format!("#[c_name(\"{}\")] global {named}: {text}", global.name),
+                            )
+                        }
+                        Err(reason) => missed.push(crate::Skipped {
+                            name: global.name.clone(),
+                            reason: reason.to_string(),
+                        }),
+                    }
+                }
             }
             CDecl::Macro(macro_value) => {
                 if matches!(&macro_value.value, MacroValue::Function { .. })
@@ -141,6 +165,11 @@ fn spell_with(
         }
     }
     for (name, text) in types {
+        crossed.push(name);
+        out.push_str(&text);
+        out.push('\n');
+    }
+    for (name, text) in globals {
         crossed.push(name);
         out.push_str(&text);
         out.push('\n');
@@ -195,6 +224,21 @@ fn spell_with(
         out.push('\n');
     }
     out
+}
+
+/// A global crosses when Dux can name its type and hold its storage: the
+/// variable is then a window on the C definition, read and written in
+/// place. Arrays and function pointers have no `global` shape yet, and a
+/// record with no body has no size to give the window.
+fn variable_spelling(ctx: &Ctx, ty: &CType) -> Result<String, &'static str> {
+    match resolve(ty) {
+        CType::Array(..) => Err("a global array has no Dux shape yet"),
+        CType::FuncPtr { .. } => Err("a global of function-pointer type has no Dux shape yet"),
+        CType::Struct(name) | CType::Union(name) if ctx.opaque.contains(name) => {
+            Err("its record type stays behind the C boundary")
+        }
+        _ => spelling(ctx, ty).ok_or("its type has no Dux spelling"),
+    }
 }
 
 /// Record a declaration under the name it defines, once. C gives one name

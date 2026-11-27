@@ -488,7 +488,7 @@ fn cimports_names_what_crossed_and_what_the_header_kept_back() {
         "the namespace reports itself:\n{said}"
     );
     assert!(
-        said.contains("cedge_visits - global variables are still waiting"),
+        said.contains("cedge_visits - the variable belongs to one translation unit"),
         "a name that did not cross says why:\n{said}"
     );
     let json = Command::new(env!("CARGO_BIN_EXE_duxc"))
