@@ -545,6 +545,72 @@ fn the_normative_control_flow_example_runs_every_loop_and_a_match() {
 }
 
 #[test]
+fn the_debugger_stops_on_dux_lines_and_prints_dux_values() {
+    let fixture = Path::new(FIXTURE_DIR).join("debug_types.dux");
+    let source = std::fs::read_to_string(&fixture).expect("the fixture is readable");
+    let printed = source
+        .lines()
+        .position(|line| line.trim_start().starts_with("println"))
+        .expect("the fixture prints something")
+        + 1;
+    let scratch = Path::new(SCRATCH_DIR).join("lldb-smoke");
+    let _ = std::fs::remove_dir_all(&scratch);
+    std::fs::create_dir_all(&scratch).expect("scratch is writable");
+    let object = scratch.join("program");
+    let build = Command::new(env!("CARGO_BIN_EXE_duxc"))
+        .arg("build")
+        .arg(&fixture)
+        .arg("-o")
+        .arg(&object)
+        .arg("--out-dir")
+        .arg(&scratch)
+        .output()
+        .expect("the compiler runs");
+    assert_eq!(
+        build.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+    let debugger = ["lldb-23", "lldb"]
+        .iter()
+        .map(|tool| {
+            Command::new(tool)
+                .arg("-b")
+                .args([
+                    "-o",
+                    &format!("breakpoint set --file debug_types.dux --line {printed}"),
+                ])
+                .args(["-o", "run"])
+                .args(["-o", "frame variable"])
+                .args(["-o", "continue"])
+                .arg(&object)
+                .output()
+        })
+        .find_map(|attempt| attempt.ok())
+        .expect("lldb is runnable");
+    let saw = String::from_utf8_lossy(&debugger.stdout).into_owned();
+    assert!(
+        debugger.status.success(),
+        "lldb failed:{}",
+        String::from_utf8_lossy(&debugger.stderr)
+    );
+    for wanted in [
+        "debug_types.dux:",
+        "(Vec3) big = (x = 2, y = 4, z = 6)",
+        "(int[3]) cells = ([0] = 4, [1] = 5, [2] = 6)",
+        "length = 2",
+        "Tick = (0 = 9)",
+        "exited with status = 0",
+    ] {
+        assert!(
+            saw.contains(wanted),
+            "the debugger never showed {wanted}:\n{saw}"
+        );
+    }
+}
+
+#[test]
 fn the_debug_info_describes_the_program_the_way_a_debugger_reads_it() {
     let fixture = Path::new(FIXTURE_DIR).join("debug_types.dux");
     let scratch = Path::new(SCRATCH_DIR).join("debug-types");
