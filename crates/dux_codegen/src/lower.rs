@@ -5835,11 +5835,9 @@ impl Emitter {
                 .ok()
                 .map(|cell| {
                     let byte = this.builder.build_load(i8_type, cell, name).ok()?;
-                    Some(
-                        this.builder
-                            .build_int_cast(byte.into_int_value(), i64_type, "wide")
-                            .ok()?,
-                    )
+                    this.builder
+                        .build_int_cast(byte.into_int_value(), i64_type, "wide")
+                        .ok()
                 })
         };
         let lead = byte_at(self, here, "byte")??;
