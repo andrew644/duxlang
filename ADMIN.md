@@ -73,3 +73,8 @@ compiles and links against `libraylib.so.550` with zero unresolved symbols,
 and the binary runs into raylib's own platform init. This machine is headless,
 so opening the actual window — a maroon circle following the mouse under the
 text `move the mouse` — needs a desktop:
+
+**DONE, thank you** (verified 2026-11-27): the user ran `example/raylib/hello.dux`
+on a desktop box and the window opens and behaves — the maroon circle follows
+the mouse under the text. The whole housekeeping list is closed; nothing waits
+on a display any more.
