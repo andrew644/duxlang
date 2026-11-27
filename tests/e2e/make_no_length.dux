@@ -1,0 +1,7 @@
+//@expect-error E0112
+package main
+
+fn main() {
+    xs := make(i32)
+    println("never")
+}

@@ -1,0 +1,8 @@
+//@expect-error E0112
+package main
+
+fn main() {
+    p := new(i32)
+    free(p, p)
+    println("never")
+}

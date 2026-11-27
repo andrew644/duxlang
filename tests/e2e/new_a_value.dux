@@ -1,0 +1,7 @@
+//@expect-error E0201
+package main
+
+fn main() {
+    p := new(5)
+    println("never")
+}

@@ -1,0 +1,8 @@
+//@expect-error E0201
+package main
+
+fn main() {
+    n: i64 = 5
+    del(n)
+    println("never")
+}

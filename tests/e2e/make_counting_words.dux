@@ -1,0 +1,7 @@
+//@expect-error E0201
+package main
+
+fn main() {
+    xs := make(i32, "four")
+    println("never")
+}

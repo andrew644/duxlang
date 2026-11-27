@@ -3058,18 +3058,138 @@ impl<'a> Checker<'a> {
         );
     }
 
-    /// The type named as a builtin's first argument, as in `new(Vec3)`.
-    fn type_argument(&mut self, argument: Option<&Expr>) -> Option<Ty> {
-        let Some(Expr::Ident { name, span }) = argument else {
-            return None;
+    /// `new(T)` and `make(T, n)` name a type, not a value: the first argument
+    /// must be a type, `new` takes nothing else and `make` one length, and
+    /// what `make` counts must be counted in numbers.
+    fn allocation_call(&mut self, name: &str, args: &[Expr], span: Span) -> Ty {
+        let wants = if name == "new" { 1 } else { 2 };
+        if args.len() != wants {
+            self.report(
+                span,
+                Diagnostic::error(
+                    code::WRONG_ARITY,
+                    if name == "new" {
+                        "`new` wants exactly one type: what to allocate".to_string()
+                    } else {
+                        "`make` wants a type and a length: what to allocate and how many"
+                            .to_string()
+                    },
+                ),
+            );
+        }
+        let element = match args.first() {
+            Some(Expr::Ident { name, span }) => {
+                let written = Type::Named {
+                    name: name.clone(),
+                    args: Vec::new(),
+                    span: *span,
+                };
+                // A name that resolves to nothing is a parameter the body
+                // was written under — the resolver is the pass that decides
+                // whether a name means anything at all.
+                self.resolve_type(&written)
+            }
+            Some(argument) => {
+                self.report(
+                    argument.span(),
+                    Diagnostic::error(
+                        code::TYPE_MISMATCH,
+                        format!("`{name}` wants a type to allocate, and this is a value"),
+                    ),
+                );
+                let _ = self.infer(argument);
+                return Ty::Opaque;
+            }
+            None => {
+                self.report(
+                    span,
+                    Diagnostic::error(
+                        code::WRONG_ARITY,
+                        format!("`{name}` wants a type to allocate"),
+                    ),
+                );
+                return Ty::Opaque;
+            }
         };
-        let written = Type::Named {
-            name: name.clone(),
-            args: Vec::new(),
-            span: *span,
+        if name == "make" {
+            if args.len() != 2 {
+                for argument in args.iter().skip(1) {
+                    let _ = self.infer(argument);
+                }
+                return Ty::Slice(Box::new(element));
+            }
+            let length = self.infer(&args[1]);
+            if !matches!(
+                length,
+                Ty::I8
+                    | Ty::I16
+                    | Ty::I32
+                    | Ty::I64
+                    | Ty::U8
+                    | Ty::U16
+                    | Ty::U32
+                    | Ty::U64
+                    | Ty::IntConst(_)
+            ) {
+                self.report(
+                    args[1].span(),
+                    Diagnostic::error(
+                        code::TYPE_MISMATCH,
+                        format!(
+                            "`make` counts elements, and `{}` is not a number",
+                            length.name()
+                        ),
+                    ),
+                );
+            }
+            return Ty::Slice(Box::new(element));
+        }
+        Ty::Targeted(Box::new(element))
+    }
+
+    /// `free` gives back what `new` took and `del` what `make` took; a
+    /// program that hands either something else — or more than one thing —
+    /// hears about it before anything runs.
+    fn release_call(&mut self, name: &str, args: &[Expr], span: Span) -> Ty {
+        if args.len() != 1 {
+            self.report(
+                span,
+                Diagnostic::error(
+                    code::WRONG_ARITY,
+                    format!(
+                        "`{name}` takes one owner, and this hands over {}",
+                        args.len()
+                    ),
+                ),
+            );
+            for argument in args {
+                let _ = self.infer(argument);
+            }
+            return Ty::Unit;
+        }
+        let held = self.infer(&args[0]);
+        let fits = match name {
+            "free" => matches!(held, Ty::Ptr | Ty::Targeted(_)),
+            _ => matches!(held, Ty::Slice(_) | Ty::Ptr | Ty::Str),
         };
-        let resolved = self.resolve_type(&written);
-        (resolved != Ty::Opaque).then_some(resolved)
+        if !fits {
+            self.report(
+                args[0].span(),
+                Diagnostic::error(
+                    code::TYPE_MISMATCH,
+                    format!(
+                        "`{name}` gives back {}, and `{}` holds none",
+                        if name == "free" {
+                            "what `new` allocated"
+                        } else {
+                            "what `make` or a string operation allocated"
+                        },
+                        held.name()
+                    ),
+                ),
+            );
+        }
+        Ty::Unit
     }
 
     fn call(&mut self, callee: &Expr, args: &[Expr], span: Span, expected: Option<&Ty>) -> Ty {
@@ -3085,15 +3205,10 @@ impl<'a> Checker<'a> {
             // `new(T)` and `make(T, n)` name a type, not a value, so their
             // result is known without checking the first argument.
             if matches!(name.as_str(), "new" | "make") && !self.functions.contains_key(name) {
-                if let Some(element) = self.type_argument(args.first()) {
-                    for argument in args.iter().skip(1) {
-                        let _ = self.infer(argument);
-                    }
-                    return match name.as_str() {
-                        "new" => Ty::Targeted(Box::new(element)),
-                        _ => Ty::Slice(Box::new(element)),
-                    };
-                }
+                return self.allocation_call(name, args, span);
+            }
+            if matches!(name.as_str(), "free" | "del") && !self.functions.contains_key(name) {
+                return self.release_call(name, args, span);
             }
             let named = self.at_home(name, |spelling| {
                 self.functions.contains_key(spelling)

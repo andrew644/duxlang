@@ -1533,3 +1533,146 @@ fn main() {
 }";
     assert_eq!(codes(source), vec![dux_diag::code::TYPE_MISMATCH]);
 }
+
+#[test]
+fn free_releases_only_what_new_made() {
+    assert_eq!(
+        codes(
+            "package main
+fn main() {
+    p := new(i32)
+    free(p)
+}"
+        ),
+        Vec::<&str>::new()
+    );
+    assert_eq!(
+        codes(
+            "package main
+fn main() {
+    n: i32 = 5
+    free(n)
+}"
+        ),
+        vec![dux_diag::code::TYPE_MISMATCH],
+        "a number owns nothing to release"
+    );
+    assert_eq!(
+        codes(
+            "package main
+fn main() {
+    p := new(i32)
+    free(p, p)
+}"
+        ),
+        vec![dux_diag::code::WRONG_ARITY],
+        "one owner per call; the second free comes later"
+    );
+}
+
+#[test]
+fn del_gives_back_only_what_was_made() {
+    assert_eq!(
+        codes(
+            "package main
+fn main() {
+    xs := make(i32, 4)
+    del(xs)
+}"
+        ),
+        Vec::<&str>::new()
+    );
+    assert_eq!(
+        codes(
+            "package main
+fn main() {
+    n: i64 = 5
+    del(n)
+}"
+        ),
+        vec![dux_diag::code::TYPE_MISMATCH],
+        "`del` takes a heap view, not a number"
+    );
+}
+
+#[test]
+fn allocation_wants_a_type_and_a_count() {
+    assert_eq!(
+        codes(
+            "package main
+fn main() {
+    p := new(5)
+}"
+        ),
+        vec![dux_diag::code::TYPE_MISMATCH],
+        "`new` allocates a type, and 5 is a value"
+    );
+    assert_eq!(
+        codes(
+            "package main
+fn main() {
+    p := new(i32, 2)
+}"
+        ),
+        vec![dux_diag::code::WRONG_ARITY],
+        "`new` makes exactly one cell"
+    );
+    assert_eq!(
+        codes(
+            "package main
+fn main() {
+    xs := make(i32)
+}"
+        ),
+        vec![dux_diag::code::WRONG_ARITY],
+        "`make` counts what it allocates"
+    );
+    assert_eq!(
+        codes(
+            "package main
+fn main() {
+    xs := make(i32, \"four\")
+}"
+        ),
+        vec![dux_diag::code::TYPE_MISMATCH],
+        "elements are counted in numbers"
+    );
+}
+
+#[test]
+fn a_pointer_written_through_needs_its_target() {
+    assert_eq!(
+        codes(
+            "package main
+fn main() {
+    p := new(i32)
+    *p = 7
+    free(p)
+}"
+        ),
+        Vec::<&str>::new()
+    );
+    assert_eq!(
+        codes(
+            "package main
+fn main() {
+    p := new(i32)
+    *p = \"text\"
+    free(p)
+}"
+        ),
+        vec![dux_diag::code::TYPE_MISMATCH],
+        "an i32 cell holds no string"
+    );
+    assert_eq!(
+        codes(
+            "package main
+fn main() {
+    n: i32 = 5
+    q := *n
+}"
+        ),
+        vec![dux_diag::code::TYPE_MISMATCH],
+        "only a pointer points somewhere to write through"
+    );
+}

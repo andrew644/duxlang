@@ -1,0 +1,8 @@
+//@expect-error E0201
+package main
+
+fn main() {
+    n: i32 = 5
+    free(n)
+    println("never")
+}

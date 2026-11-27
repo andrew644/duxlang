@@ -1,8 +1,5 @@
 # TODO
 
-## M7 — toolchain maturity
-
-- [ ] Grow the negative-test corpus (bad `match` arms, layout, conversions all have seeds; pointers/allocations do not)
 
 ## M8 — ecosystem
 
