@@ -3,7 +3,6 @@
 ## Language gaps (the compiler refuses these today, usually with E0007)
 
 - [ ] Debug allocator: guard pages and a per-block allocation location table (M3 gap)
-- [ ] `free(NULL)` as a silent no-op (M5 gap) — pin the chosen semantics with an e2e test
 
 ## C interop (M6 "remaining: reported, none silent")
 

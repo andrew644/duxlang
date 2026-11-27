@@ -1,0 +1,14 @@
+//@stderr_empty
+// Freeing nothing is a silent no-op, as in C: a null pointer handed back to
+// the allocator is simply let go, in a debug build and in a release one.
+
+package main
+
+fn main() {
+    p := 0 as rawptr
+    free(p)
+    q := new(i64)
+    free(q)
+    defer free(p)
+    println("silent")
+}
