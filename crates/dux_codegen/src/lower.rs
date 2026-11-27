@@ -2763,10 +2763,12 @@ impl Emitter {
         self.block_body_owning(module, block, bound, false);
     }
 
-    /// `owns_defers` marks the plain `{ .. }` statements whose exit is their
-    /// own: a `defer` written directly inside one runs when that block runs
-    /// out. Branches and loop bodies do not own defers; a `defer` written in
-    /// one is still the gap it was.
+    /// `owns_defers` marks the blocks whose exit is their own — a plain
+    /// `{ .. }` statement, a branch arm, a loop body: a `defer` written
+    /// directly inside one runs when that block runs out. A block that ends
+    /// mid-flight, on a `return` or a `break`, has already handed its chain
+    /// to the exit that left; the paths standing where codegen resumes never
+    /// registered it.
     fn block_body_owning(
         &mut self,
         module: &Module<'static>,
@@ -2795,6 +2797,8 @@ impl Emitter {
         // that owns its defers fires what it captured on the way out.
         if owns_defers && !self.dead {
             self.fire_before(module, base, true);
+        } else if owns_defers {
+            self.defers.truncate(base);
         }
         self.restore_context(outer);
         self.scopes.pop();
@@ -3217,6 +3221,8 @@ impl Emitter {
             dux_ast::MatchBody::Expr(expr) => self.expr(module, expr, expected),
             dux_ast::MatchBody::Block(block) => {
                 self.scopes.push(HashMap::new());
+                let base = self.defers.len();
+                self.defer_blocks.push((base, self.scopes.len()));
                 let tail = block.stmts.len().saturating_sub(1);
                 let value = match block.stmts.last() {
                     Some(Stmt::Expr { expr, .. }) => Some(expr),
@@ -3235,11 +3241,27 @@ impl Emitter {
                     Some(expr) if !self.dead => self.expr(module, expr, expected),
                     _ => None,
                 };
+                self.defer_blocks.pop();
+                if !self.dead {
+                    self.fire_before(module, base, true);
+                } else {
+                    self.defers.truncate(base);
+                }
                 self.scopes.pop();
                 outcome
             }
             dux_ast::MatchBody::Stmt(stmt) => {
+                self.scopes.push(HashMap::new());
+                let base = self.defers.len();
+                self.defer_blocks.push((base, self.scopes.len()));
                 self.stmt(module, stmt);
+                self.defer_blocks.pop();
+                if !self.dead {
+                    self.fire_before(module, base, true);
+                } else {
+                    self.defers.truncate(base);
+                }
+                self.scopes.pop();
                 None
             }
         }
@@ -3792,12 +3814,12 @@ impl Emitter {
                 let is_break = matches!(stmt, Stmt::Break { .. });
                 match self.loops.last().copied() {
                     Some(loop_) => {
-                        if self.defers.len() > loop_.defer_base {
-                            self.unsupported(
-                                *span,
-                                "leaving a loop body that has deferred work: the defer chain lands at M3",
-                            );
-                        }
+                        // A `break` or `continue` leaves the loop body while
+                        // deferred work registered directly in it is still
+                        // armed: replay that chain on the way out. The
+                        // replay is only this path's, so the chain stands
+                        // for the paths that carry on through the body.
+                        self.fire_before(module, loop_.defer_base, false);
                         let target = if is_break {
                             loop_.exit
                         } else {
@@ -4115,17 +4137,9 @@ impl Emitter {
 
         self.builder.position_at_end(then_block);
         self.dead = false;
-        self.scopes.push(HashMap::new());
         // The bindings a pattern condition made live for the `then` arm alone,
         // which is where the checker can see them too.
-        self.declare_bindings(&bound);
-        for stmt in &then_branch.stmts {
-            if self.dead {
-                break;
-            }
-            self.stmt(module, stmt);
-        }
-        self.scopes.pop();
+        self.block_body_owning(module, then_branch, &bound, true);
         self.br(merge);
 
         self.builder.position_at_end(else_block);
@@ -4137,7 +4151,7 @@ impl Emitter {
                 self.br(merge);
             }
             Some(Stmt::Block { block, .. }) => {
-                self.block_body(module, block);
+                self.block_body_owning(module, block, &[], true);
                 self.br(merge);
             }
             Some(other) => {
@@ -4739,7 +4753,7 @@ impl Emitter {
             exit: exit_block,
             defer_base: self.defers.len(),
         });
-        self.block_body_bound(module, body, &bound);
+        self.block_body_owning(module, body, &bound, true);
         self.loops.pop();
         self.br(cond_block);
 
@@ -4759,7 +4773,7 @@ impl Emitter {
             exit: exit_block,
             defer_base: self.defers.len(),
         });
-        self.block_body(module, body);
+        self.block_body_owning(module, body, &[], true);
         self.loops.pop();
         self.br(body_block);
 
@@ -4796,7 +4810,7 @@ impl Emitter {
             exit: exit_block,
             defer_base: self.defers.len(),
         });
-        self.block_body(module, body);
+        self.block_body_owning(module, body, &[], true);
         self.loops.pop();
         self.br(step_block);
 
@@ -4943,7 +4957,7 @@ impl Emitter {
             exit: exit_block,
             defer_base: self.defers.len(),
         });
-        self.block_body(module, body);
+        self.block_body_owning(module, body, &[], true);
         self.loops.pop();
         self.br(step_block);
 
@@ -5086,7 +5100,7 @@ impl Emitter {
             exit: exit_block,
             defer_base: self.defers.len(),
         });
-        self.block_body(module, body);
+        self.block_body_owning(module, body, &[], true);
         self.loops.pop();
         self.br(step_block);
 

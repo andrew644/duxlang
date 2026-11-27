@@ -506,8 +506,8 @@ fn milestone_gaps_report_e0007_with_the_milestone_in_the_message() {
             "positions belong to arrays",
         ),
         (
-            "package main\nfn main() { if true { defer println(\"x\") } }",
-            "top of a function",
+            "package main\nfn main() { x := 1\n    defer x = 3 }",
+            "deferring anything but a call",
         ),
     ];
     for (source, needle) in cases {

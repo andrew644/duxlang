@@ -1,0 +1,62 @@
+//@stderr_empty
+// `defer` reaches branch arms, loop bodies, and match arms: the block that
+// runs out fires what it captured, and a `break` or `continue` replays what
+// is still armed on its own way out.
+
+package main
+
+fn note(msg: string) {
+    println(msg)
+}
+
+fn early(k: i64) {
+    while k > 0 {
+        defer note("while arm")
+        {
+            defer note("nested arm")
+        }
+        if k == 1 {
+            return
+        }
+        k = k - 1
+    }
+    println("while done")
+}
+
+fn main() {
+    c := true
+    if c {
+        defer note("then arm")
+        note("in then")
+    } else {
+        defer note("else arm")
+    }
+    println("after branch")
+    for _ in 0..3 {
+        defer note("fired")
+    }
+    n := 0
+    loop {
+        defer note("loop arm")
+        n = n + 1
+        if n == 2 {
+            break
+        }
+    }
+    for i in 0..3 {
+        if i == 1 {
+            defer note("nested continue")
+            continue
+        }
+    }
+    early(2)
+    m := 5
+    match m {
+        5 => {
+            defer note("match arm")
+            note("in match")
+        }
+        _ => note("other")
+    }
+    println("end")
+}
