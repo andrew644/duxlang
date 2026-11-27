@@ -1,0 +1,34 @@
+//@stderr_empty
+// `.runes()` decodes UTF-8 into code points: a `[]rune` the context owns,
+// and each rune prints as the number that code point is.
+
+package main
+
+fn main() {
+    text := "héllo ⚔!"
+    runes := text.runes()
+    for r in runes {
+        print($"{r} ")
+    }
+    println("")
+    println($"{runes.len()}")
+    del(runes)
+    empty := ""
+    nothing := empty.runes()
+    println($"{nothing.len()}")
+    del(nothing)
+    naive := "naïve".runes()
+    println($"{naive[2]}")
+    del(naive)
+    for b in text.bytes() {
+        print($"{b} ")
+    }
+    println("")
+    spellings := text.runes()
+    if spellings.len() == text.len() {
+        println("one byte each")
+    } else {
+        println($"{text.len()} bytes, {spellings.len()} runes")
+    }
+    del(spellings)
+}

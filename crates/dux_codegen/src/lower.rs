@@ -5707,6 +5707,371 @@ impl Emitter {
         Some(self.view(info.elem, data, len))
     }
 
+    /// `.runes()`: the code points the string's UTF-8 bytes spell. The buffer
+    /// holds as many runes as there are bytes — no sequence spells more than
+    /// one per byte — and the view handed back narrows to what was decoded.
+    /// A lead whose continuations are missing writes the replacement rune and
+    /// steps one byte; a stray continuation byte belongs to no rune on its
+    /// own and steps silently.
+    fn decode_runes(
+        &mut self,
+        at: PointerValue<'static>,
+        span: Span,
+    ) -> Option<Typed> {
+        let text = self.load(DuxType::Str, at)?;
+        let (data, length) = self.slice_parts(text)?;
+        let i64_type = self.context.i64_type();
+        let i8_type = self.context.i8_type();
+        let i32_type = self.context.i32_type();
+        let bytes = self
+            .builder
+            .build_int_mul(length, i64_type.const_int(4, false), "runes")
+            .ok()?;
+        let buffer = self.allocate(span, bytes, 4)?;
+        let cursor = self.alloca(DuxType::I64, "runes.at");
+        let written = self.alloca(DuxType::I64, "runes.written");
+        let _ = self.builder.build_store(cursor, i64_type.const_zero());
+        let _ = self.builder.build_store(written, i64_type.const_zero());
+        let head = self.new_block("runes.head");
+        let body = self.new_block("runes.body");
+        let exit = self.new_block("runes.done");
+        self.br(head);
+        self.builder.position_at_end(head);
+        self.dead = false;
+        let here = self
+            .builder
+            .build_load(i64_type, cursor, "at")
+            .ok()?
+            .into_int_value();
+        let more = self
+            .builder
+            .build_int_compare(IntPredicate::ULT, here, length, "more")
+            .ok()?;
+        let _ = self
+            .builder
+            .build_conditional_branch(more, body, exit)
+            .ok()?;
+        self.builder.position_at_end(body);
+        let here = self
+            .builder
+            .build_load(i64_type, cursor, "at")
+            .ok()?
+            .into_int_value();
+        let byte_at = |this: &mut Self, position: IntValue<'static>, name: &str| {
+            unsafe { this.builder.build_gep(i8_type, data, &[position], name) }.ok().map(|cell| {
+                let byte = this.builder.build_load(i8_type, cell, name).ok()?;
+                Some(
+                    this.builder
+                        .build_int_cast(byte.into_int_value(), i64_type, "wide")
+                        .ok()?,
+                )
+            })
+        };
+        let lead = byte_at(self, here, "byte")??;
+        let mask = |this: &mut Self, value: IntValue<'static>, bits: u64| {
+            this.builder
+                .build_and(value, i64_type.const_int(bits, false), "mask")
+                .ok()
+        };
+        let ascii = self
+            .builder
+            .build_int_compare(IntPredicate::ULT, lead, i64_type.const_int(0x80, false), "ascii")
+            .ok()?;
+        let one = self.new_block("runes.one");
+        let checks = self.new_block("runes.checks");
+        let _ = self
+            .builder
+            .build_conditional_branch(ascii, one, checks)
+            .ok()?;
+        self.builder.position_at_end(checks);
+        let two_head = mask(self, lead, 0xE0)?;
+        let is_two = self
+            .builder
+            .build_int_compare(IntPredicate::EQ, two_head, i64_type.const_int(0xC0, false), "two")
+            .ok()?;
+        let two = self.new_block("runes.two");
+        let three_checks = self.new_block("runes.three.checks");
+        let _ = self
+            .builder
+            .build_conditional_branch(is_two, two, three_checks)
+            .ok()?;
+        self.builder.position_at_end(three_checks);
+        let three_head = mask(self, lead, 0xF0)?;
+        let is_three = self
+            .builder
+            .build_int_compare(IntPredicate::EQ, three_head, i64_type.const_int(0xE0, false), "three")
+            .ok()?;
+        let three = self.new_block("runes.three");
+        let four_checks = self.new_block("runes.four.checks");
+        let _ = self
+            .builder
+            .build_conditional_branch(is_three, three, four_checks)
+            .ok()?;
+        self.builder.position_at_end(four_checks);
+        let four_head = mask(self, lead, 0xF8)?;
+        let is_four = self
+            .builder
+            .build_int_compare(IntPredicate::EQ, four_head, i64_type.const_int(0xF0, false), "four")
+            .ok()?;
+        let four = self.new_block("runes.four");
+        let stray = self.new_block("runes.stray");
+        let _ = self
+            .builder
+            .build_conditional_branch(is_four, four, stray)
+            .ok()?;
+        // A lead of the wrong shape: a continuation byte with no rune in
+        // front of it steps over itself, and anything else no byte can start
+        // becomes the replacement.
+        self.builder.position_at_end(stray);
+        let stray_head = mask(self, lead, 0xC0)?;
+        let is_stray = self
+            .builder
+            .build_int_compare(IntPredicate::EQ, stray_head, i64_type.const_int(0x80, false), "stray")
+            .ok()?;
+        let skip = self.new_block("runes.skip");
+        let bogus = self.new_block("runes.bogus");
+        let _ = self
+            .builder
+            .build_conditional_branch(is_stray, skip, bogus)
+            .ok()?;
+        let step = |this: &mut Self, rune: Option<IntValue<'static>>, after: u64| {
+            if let Some(rune) = rune {
+                let count = this
+                    .builder
+                    .build_load(i64_type, written, "written")
+                    .ok()?
+                    .into_int_value();
+                let cell = unsafe { this.builder.build_gep(i32_type, buffer, &[count], "slot") }.ok()?;
+                let small = this
+                    .builder
+                    .build_int_truncate(rune, i32_type, "rune")
+                    .ok()?;
+                let _ = this.builder.build_store(cell, small).ok()?;
+                let grown = this
+                    .builder
+                    .build_int_add(count, i64_type.const_int(1, false), "wrote")
+                    .ok()?;
+                let _ = this.builder.build_store(written, grown).ok()?;
+            }
+            let onward = this
+                .builder
+                .build_int_add(here, i64_type.const_int(after, false), "next")
+                .ok()?;
+            let _ = this.builder.build_store(cursor, onward).ok()?;
+            this.br(head);
+            Some(())
+        };
+        let replacement = i64_type.const_int(0xFFFD, false);
+        self.builder.position_at_end(skip);
+        step(self, None, 1)?;
+        self.builder.position_at_end(bogus);
+        step(self, Some(replacement), 1)?;
+        // One ASCII byte is the whole rune.
+        self.builder.position_at_end(one);
+        step(self, Some(lead), 1)?;
+        // Two bytes: `110xxxxx 10xxxxxx`.
+        self.builder.position_at_end(two);
+        let need = self
+            .builder
+            .build_int_add(here, i64_type.const_int(1, false), "need")
+            .ok()?;
+        let value = self.new_block("runes.two.value");
+        let bail = self.new_block("runes.two.bail");
+        self.runes_continuation(need, length, data, value, bail)?;
+        self.builder.position_at_end(value);
+        let next = byte_at(self, need, "follow")??;
+        let high = self
+            .builder
+            .build_and(lead, i64_type.const_int(0x1F, false), "high")
+            .ok()?;
+        let high = self
+            .builder
+            .build_left_shift(high, i64_type.const_int(6, false), "high")
+            .ok()?;
+        let low = self
+            .builder
+            .build_and(next, i64_type.const_int(0x3F, false), "low")
+            .ok()?;
+        let rune = self.builder.build_or(high, low, "rune").ok()?;
+        step(self, Some(rune), 2)?;
+        self.builder.position_at_end(bail);
+        step(self, Some(replacement), 1)?;
+        // Three bytes: `1110xxxx 10xxxxxx 10xxxxxx`.
+        self.builder.position_at_end(three);
+        let first = self
+            .builder
+            .build_int_add(here, i64_type.const_int(1, false), "need")
+            .ok()?;
+        let second = self
+            .builder
+            .build_int_add(here, i64_type.const_int(2, false), "need")
+            .ok()?;
+        let value = self.new_block("runes.three.value");
+        let bail = self.new_block("runes.three.bail");
+        let onward = self.new_block("runes.three.second");
+        self.runes_continuation(first, length, data, onward, bail)?;
+        self.builder.position_at_end(onward);
+        self.runes_continuation(second, length, data, value, bail)?;
+        self.builder.position_at_end(value);
+        let one_more = byte_at(self, first, "follow")??;
+        let two_more = byte_at(self, second, "follow")??;
+        let high = self
+            .builder
+            .build_and(lead, i64_type.const_int(0x0F, false), "high")
+            .ok()?;
+        let high = self
+            .builder
+            .build_left_shift(high, i64_type.const_int(12, false), "high")
+            .ok()?;
+        let middle = self
+            .builder
+            .build_and(one_more, i64_type.const_int(0x3F, false), "middle")
+            .ok()?;
+        let middle = self
+            .builder
+            .build_left_shift(middle, i64_type.const_int(6, false), "middle")
+            .ok()?;
+        let low = self
+            .builder
+            .build_and(two_more, i64_type.const_int(0x3F, false), "low")
+            .ok()?;
+        let rune = self
+            .builder
+            .build_or(self.builder.build_or(high, middle, "rune").ok()?, low, "rune")
+            .ok()?;
+        step(self, Some(rune), 3)?;
+        self.builder.position_at_end(bail);
+        step(self, Some(replacement), 1)?;
+        // Four bytes: `11110xxx 10xxxxxx 10xxxxxx 10xxxxxx`.
+        self.builder.position_at_end(four);
+        let first = self
+            .builder
+            .build_int_add(here, i64_type.const_int(1, false), "need")
+            .ok()?;
+        let second = self
+            .builder
+            .build_int_add(here, i64_type.const_int(2, false), "need")
+            .ok()?;
+        let third = self
+            .builder
+            .build_int_add(here, i64_type.const_int(3, false), "need")
+            .ok()?;
+        let value = self.new_block("runes.four.value");
+        let bail = self.new_block("runes.four.bail");
+        let onward = self.new_block("runes.four.second");
+        let farther = self.new_block("runes.four.third");
+        self.runes_continuation(first, length, data, onward, bail)?;
+        self.builder.position_at_end(onward);
+        self.runes_continuation(second, length, data, farther, bail)?;
+        self.builder.position_at_end(farther);
+        self.runes_continuation(third, length, data, value, bail)?;
+        self.builder.position_at_end(value);
+        let one_more = byte_at(self, first, "follow")??;
+        let two_more = byte_at(self, second, "follow")??;
+        let three_more = byte_at(self, third, "follow")??;
+        let high = self
+            .builder
+            .build_and(lead, i64_type.const_int(0x07, false), "high")
+            .ok()?;
+        let high = self
+            .builder
+            .build_left_shift(high, i64_type.const_int(18, false), "high")
+            .ok()?;
+        let middle = self
+            .builder
+            .build_and(one_more, i64_type.const_int(0x3F, false), "middle")
+            .ok()?;
+        let middle = self
+            .builder
+            .build_left_shift(middle, i64_type.const_int(12, false), "middle")
+            .ok()?;
+        let lower = self
+            .builder
+            .build_and(two_more, i64_type.const_int(0x3F, false), "lower")
+            .ok()?;
+        let lower = self
+            .builder
+            .build_left_shift(lower, i64_type.const_int(6, false), "lower")
+            .ok()?;
+        let low = self
+            .builder
+            .build_and(three_more, i64_type.const_int(0x3F, false), "low")
+            .ok()?;
+        let rune = self
+            .builder
+            .build_or(
+                self.builder.build_or(high, middle, "rune").ok()?,
+                self.builder.build_or(lower, low, "rune").ok()?,
+                "rune",
+            )
+            .ok()?;
+        step(self, Some(rune), 4)?;
+        self.builder.position_at_end(bail);
+        step(self, Some(replacement), 1)?;
+        self.builder.position_at_end(exit);
+        self.dead = false;
+        let count = self
+            .builder
+            .build_load(i64_type, written, "count")
+            .ok()?
+            .into_int_value();
+        Some(self.view(DuxType::I32, buffer, count))
+    }
+
+    /// One continuation byte of a multi-byte rune: where `need` is a
+    /// continuation byte the sequence carries on into `holds`; a missing byte
+    /// or a byte that stopped being one sends the sequence to `bails`.
+    fn runes_continuation(
+        &mut self,
+        need: IntValue<'static>,
+        length: IntValue<'static>,
+        data: PointerValue<'static>,
+        holds: BasicBlock<'static>,
+        bails: BasicBlock<'static>,
+    ) -> Option<()> {
+        let peek = self.new_block("runes.peek");
+        let room = self
+            .builder
+            .build_int_compare(IntPredicate::ULT, need, length, "room")
+            .ok()?;
+        let _ = self
+            .builder
+            .build_conditional_branch(room, peek, bails)
+            .ok()?;
+        self.builder.position_at_end(peek);
+        let cell = unsafe {
+            self.builder
+                .build_gep(self.context.i8_type(), data, &[need], "peek")
+        }
+        .ok()?;
+        let byte = self
+            .builder
+            .build_load(self.context.i8_type(), cell, "follow")
+            .ok()?;
+        let wide = self
+            .builder
+            .build_int_cast(byte.into_int_value(), self.context.i64_type(), "wide")
+            .ok()?;
+        let mask = self
+            .builder
+            .build_and(wide, self.context.i64_type().const_int(0xC0, false), "mask")
+            .ok()?;
+        let holds_it = self
+            .builder
+            .build_int_compare(
+                IntPredicate::EQ,
+                mask,
+                self.context.i64_type().const_int(0x80, false),
+                "follows",
+            )
+            .ok()?;
+        let _ = self
+            .builder
+            .build_conditional_branch(holds_it, holds, bails)
+            .ok()?;
+        Some(())
+    }
+
     /// `[a..b]`: the same elements, a shorter count. A missing bound is the
     /// end of the view.
     fn subslice(
@@ -8019,6 +8384,11 @@ impl Emitter {
             let at = base_at?;
             return Some(Typed::pointer(at, bytes));
         }
+        // `s.runes()` decodes the UTF-8 into the code points it spells, a
+        // `[]rune` the context owns.
+        if name.name == "runes" && args.is_empty() && base_ty == DuxType::Str {
+            return self.decode_runes(base_at?, span);
+        }
         // A receiver is a record or a sum type, and either may be the one an
         // `impl` extends.
         let owner = match (self.record_of(base_ty), self.enum_of(base_ty)) {
@@ -9552,6 +9922,10 @@ impl Scan {
                     }
                     Expr::Ident { name, .. } => self.calls.push(name.clone()),
                     Expr::Field { base, name, .. } => {
+                        // `.runes()` decodes into a buffer the context owns.
+                        if name.name == "runes" {
+                            self.allocates = true;
+                        }
                         self.calls.push(name.name.clone());
                         self.expr(base);
                     }

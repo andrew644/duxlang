@@ -2,7 +2,6 @@
 
 ## Language gaps (the compiler refuses these today, usually with E0007)
 
-- [ ] `.runes()` — UTF-8 decode for `string` (M5 remaining gap)
 - [ ] `defer` in a branch or loop body (eager capture works at block level; nested/looped positions still report E0007)
 - [ ] Bounds checks in debug builds with a trap and a source location (`-bounds-check=on|off|auto`, DESIGN §243; M2 gap)
 - [ ] Debug allocator: guard pages and a per-block allocation location table (M3 gap)

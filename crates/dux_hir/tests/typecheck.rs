@@ -1094,6 +1094,35 @@ fn main() {
 }
 
 #[test]
+fn runes_decode_into_a_view_over_the_code_points() {
+    assert_eq!(
+        codes(
+            "package main
+fn main() {
+    text := \"héllo\"
+    runes := text.runes()
+    count: usize = runes.len()
+    second: rune = runes[1]
+    for r in runes {
+        print($\"{r}\")
+    }
+    println($\"{count} {second}\")
+    del(runes)
+}"
+        ),
+        Vec::<&str>::new()
+    );
+    let found = codes(
+        "package main
+fn main() {
+    text := \"hello\"
+    bad: bool = text.runes()
+}",
+    );
+    assert_eq!(found, vec![dux_diag::code::TYPE_MISMATCH]);
+}
+
+#[test]
 fn bytes_reach_text_for_free_and_text_gives_up_its_address() {
     assert_eq!(
         codes(

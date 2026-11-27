@@ -3118,6 +3118,11 @@ impl<'a> Checker<'a> {
             if name.name == "bytes" && args.is_empty() && matches!(&base, Ty::Str) {
                 return Ty::Slice(Box::new(Ty::U8));
             }
+            // `.runes()` decodes the UTF-8 into code points: a view over
+            // `rune`, and `rune` is an `i32` by another name.
+            if name.name == "runes" && args.is_empty() && matches!(&base, Ty::Str) {
+                return Ty::Slice(Box::new(Ty::I32));
+            }
             // A sum type is a type an `impl` may extend too, and its arguments
             // say what the `impl`'s parameters stand for. A sum type with no
             // method of that name stays silent: the standard library's methods
