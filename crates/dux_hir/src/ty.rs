@@ -594,6 +594,10 @@ fn builtin_result(name: &str) -> Option<Ty> {
         // before any type an `impl` can name exists. What counts as hashable
         // is the lowering's question, per concrete type.
         "hash" => Some(Ty::U64),
+        // Both assertions stop the program where the condition says no;
+        // `debug_assert` only speaks in a debug build, which is the lowering's
+        // question, not the checker's.
+        "assert" | "debug_assert" => Some(Ty::Unit),
         _ => None,
     }
 }

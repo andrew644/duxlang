@@ -14,6 +14,8 @@ COMMANDS:
     check <file>      lex, parse, resolve and type check; report diagnostics, no code generation
     build <file>      compile and link an executable
     run <file>        compile, link and execute, forwarding program arguments
+    test [paths]      compile and run each #[test] function alone; a directory
+                      lends its *_test.dux files, and no path means here
     fmt [paths]       rewrite .dux files in their canonical form (drops comments)
     cimports <file>   report what the C importer saw, and everything it left out
 
@@ -28,6 +30,7 @@ OPTIONS:
     --emit=obj        keep the object file
     --emit=exe        link an executable (default)
     --check           with fmt: report unformatted files, change nothing
+    -v                with test: show each test's own output even when it passed
     --json            with cimports: machine-readable report
     --help            show this message
 ";
@@ -69,6 +72,11 @@ pub enum Command {
     Cimports {
         file: PathBuf,
         json: bool,
+    },
+    Test {
+        files: Vec<PathBuf>,
+        out_dir: PathBuf,
+        verbose: bool,
     },
 }
 
@@ -212,6 +220,33 @@ pub fn parse<I: IntoIterator<Item = OsString>>(argv: I) -> Result<Command, Usage
             }
             Ok(Command::Fmt { paths, check })
         }
+        "test" | "t" => {
+            let mut files = Vec::new();
+            let mut out_dir = PathBuf::from(dux_defaults::OUT_DIR);
+            let mut verbose = false;
+            let mut index = 0;
+            while index < rest.len() {
+                let arg = rest[index].as_str();
+                index += 1;
+                match arg {
+                    "--out-dir" => out_dir = PathBuf::from(value(rest, &mut index, "--out-dir")?),
+                    "-v" | "--verbose" => verbose = true,
+                    "--help" | "-h" => return Ok(Command::Help),
+                    other if other.starts_with('-') && other.len() > 1 => {
+                        return Err(UsageError::ExpectedOption(other.to_string()))
+                    }
+                    other => files.push(PathBuf::from(other)),
+                }
+            }
+            if files.is_empty() {
+                files.push(PathBuf::from("."));
+            }
+            Ok(Command::Test {
+                files,
+                out_dir,
+                verbose,
+            })
+        }
         "cimports" => {
             let mut file = None;
             let mut json = false;
@@ -274,6 +309,33 @@ mod tests {
     fn version_and_help_need_no_file() {
         assert_eq!(parse(argv(&["version"])), Ok(Command::Version));
         assert_eq!(parse(argv(&["--help"])), Ok(Command::Help));
+    }
+
+    #[test]
+    fn test_defaults_to_here_and_takes_a_verbosity() {
+        assert_eq!(
+            parse(argv(&["test"])),
+            Ok(Command::Test {
+                files: vec![PathBuf::from(".")],
+                out_dir: PathBuf::from(dux_defaults::OUT_DIR),
+                verbose: false,
+            })
+        );
+        assert_eq!(
+            parse(argv(&[
+                "t",
+                "-v",
+                "tests",
+                "one.dux",
+                "--out-dir",
+                "scratch"
+            ])),
+            Ok(Command::Test {
+                files: vec![PathBuf::from("tests"), PathBuf::from("one.dux")],
+                out_dir: PathBuf::from("scratch"),
+                verbose: true,
+            })
+        );
     }
 
     #[test]

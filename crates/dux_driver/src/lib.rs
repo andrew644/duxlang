@@ -1,8 +1,10 @@
-use dux_ast::{AttributeArgument, Decl, Ident, Import, ModuleDecl, Program};
+use dux_ast::{
+    AttributeArgument, Block, Decl, Expr, FnDecl, Ident, Import, ModuleDecl, Program, Stmt,
+};
 use dux_codegen::{CompiledModule, OptLevel, Options};
 use dux_diag::{code, render, Diagnostic, Severity};
 use dux_parser::parse;
-use dux_source::FileId;
+use dux_source::{FileId, Span};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
@@ -354,7 +356,28 @@ fn compile(request: &BuildRequest) -> Result<(Analyzed, CompiledModule, BuiltArt
             diagnostics: analyzed.diagnostics,
         });
     }
-    let bitcode = build_c_bitcode(&analyzed.c_units, &request.out_dir)?;
+    let module = match generate(&analyzed, &analyzed.program, request) {
+        Ok(module) => module,
+        Err(diagnostics) => {
+            return Err(Failure {
+                sources: analyzed.sources,
+                diagnostics,
+            })
+        }
+    };
+    let artifact = package(&module, request, &output_stem(request.source))?;
+    Ok((analyzed, module, artifact))
+}
+
+/// Lower a program to a module. The program may not be the one the source
+/// says — a test harness hands in a program it built itself.
+fn generate(
+    analyzed: &Analyzed,
+    program: &Program,
+    request: &BuildRequest,
+) -> Result<CompiledModule, Vec<Diagnostic>> {
+    let bitcode =
+        build_c_bitcode(&analyzed.c_units, &request.out_dir).map_err(|f| f.diagnostics)?;
     let options = Options {
         debug_allocator: request.opt_level == dux_codegen::OptLevel::None,
         bounds_checks: request
@@ -363,37 +386,32 @@ fn compile(request: &BuildRequest) -> Result<(Analyzed, CompiledModule, BuiltArt
         opt_level: request.opt_level,
         bitcode,
     };
-    let module =
-        match CompiledModule::build_with_line_tables(&analyzed.program, options, &analyzed.sources)
-        {
-            Ok(module) => module,
-            Err(diagnostics) => {
-                return Err(Failure {
-                    sources: analyzed.sources,
-                    diagnostics,
-                })
-            }
-        };
+    CompiledModule::build_with_line_tables(program, options, &analyzed.sources)
+}
+
+/// Write a module's object file and name the executable that will carry it.
+fn package(
+    module: &CompiledModule,
+    request: &BuildRequest,
+    stem: &str,
+) -> Result<BuiltArtifact, Failure> {
     std::fs::create_dir_all(&request.out_dir).map_err(|e| {
         Failure::bare(vec![Diagnostic::error(
             code::SOURCE_IO,
             format!("cannot create {}: {e}", request.out_dir.display()),
         )])
     })?;
-    let object = request
-        .out_dir
-        .join(format!("{}.o", output_stem(request.source)));
-    let executable = request.out_dir.join(output_stem(request.source));
+    let object = request.out_dir.join(format!("{stem}.o"));
+    let executable = request.out_dir.join(stem);
     module
         .write_object(&object)
         .map_err(|e| Failure::bare(vec![e.to_diagnostic()]))?;
-    let artifact = BuiltArtifact {
+    Ok(BuiltArtifact {
         object,
         executable,
         ir: module.ir_text(),
         data_layout: module.data_layout(),
-    };
-    Ok((analyzed, module, artifact))
+    })
 }
 
 pub fn build(
@@ -425,6 +443,171 @@ pub fn build(
         Emit::Ast => unreachable!("`--emit=ast` returns before code generation"),
     }
     Ok(artifact)
+}
+
+/// The `#[test]` functions a program declares, in the order they were
+/// written. A test that takes parameters or answers something is not a test;
+/// the program hears about it before anything runs.
+fn test_functions(analyzed: &Analyzed) -> Result<Vec<(String, Span)>, Failure> {
+    let mut tests = Vec::new();
+    let mut complaints = Vec::new();
+    for function in analyzed.program.functions() {
+        if !function
+            .attributes
+            .iter()
+            .any(|attribute| attribute.name == "test")
+        {
+            continue;
+        }
+        if !function.params.is_empty() || function.return_ty.is_some() {
+            complaints.push(
+                Diagnostic::error(
+                    code::BAD_MAIN_SIGNATURE,
+                    format!(
+                        "`{}` is marked `#[test]`, which takes no parameters and returns nothing",
+                        function.name.name
+                    ),
+                )
+                .with_span(function.span),
+            );
+        }
+        tests.push((function.name.name.clone(), function.span));
+    }
+    if !complaints.is_empty() {
+        return Err(Failure::bare(complaints));
+    }
+    Ok(tests)
+}
+
+/// The program that runs one test: the source's declarations without its
+/// `main`, and a generated `main` whose whole body is calling the test. The
+/// test runs exactly as `duxc run` would run it — same context, same debug
+/// runtime, same exit through `atexit` — and the executable is alone, so
+/// whatever it prints and leaks belongs to that one test.
+fn test_harness(program: &Program, name: &str, span: Span) -> Program {
+    let mut decls: Vec<Decl> = program
+        .decls
+        .iter()
+        .filter(|decl| !matches!(decl, Decl::Fn(function) if function.name.name == "main"))
+        .cloned()
+        .collect();
+    decls.push(Decl::Fn(FnDecl {
+        attributes: Vec::new(),
+        name: Ident::new("main", span),
+        type_params: Vec::new(),
+        params: Vec::new(),
+        return_ty: None,
+        body: Block {
+            stmts: vec![Stmt::Expr {
+                expr: Expr::Call {
+                    callee: Box::new(Expr::Ident {
+                        name: name.to_string(),
+                        span,
+                    }),
+                    args: Vec::new(),
+                    span,
+                },
+                span,
+            }],
+            span,
+        },
+        span,
+    }));
+    Program {
+        package: program.package.clone(),
+        imports: program.imports.clone(),
+        decls,
+    }
+}
+
+/// Compile one executable per `#[test]` function and run each alone. A test
+/// that stops by signal still reports itself; the tests after it run. The
+/// answer is (passed, failed).
+pub fn run_tests(
+    source: &Path,
+    out_dir: &Path,
+    verbose: bool,
+    stdout: &mut impl std::io::Write,
+) -> Result<(usize, usize), Failure> {
+    let mut analyzed = analyze(source)?;
+    // A test file is entered through its tests, not through a `main` it is
+    // not expected to have; the harness supplies the entry either way.
+    analyzed
+        .diagnostics
+        .retain(|diagnostic| diagnostic.code != code::NO_MAIN);
+    if analyzed.has_errors() {
+        return Err(Failure {
+            sources: analyzed.sources,
+            diagnostics: analyzed.diagnostics,
+        });
+    }
+    let tests = test_functions(&analyzed)?;
+    if tests.is_empty() {
+        return Err(Failure::bare(vec![Diagnostic::error(
+            code::NO_MAIN,
+            format!("{} has no #[test] functions to run", source.display()),
+        )]));
+    }
+    let request = BuildRequest {
+        source,
+        out_dir: out_dir.to_path_buf(),
+        emit: Emit::Execute,
+        opt_level: OptLevel::None,
+        bounds_check: BoundsCheck::Auto,
+    };
+    let stem = output_stem(source);
+    let mut passed = 0;
+    let mut failed = 0;
+    for (name, span) in &tests {
+        let program = test_harness(&analyzed.program, name, *span);
+        let module = match generate(&analyzed, &program, &request) {
+            Ok(module) => module,
+            Err(diagnostics) => {
+                return Err(Failure {
+                    sources: analyzed.sources,
+                    diagnostics,
+                })
+            }
+        };
+        let artifact = package(&module, &request, &format!("{stem}-{name}"))?;
+        link(&artifact, &libraries(&program))?;
+        let output = std::process::Command::new(&artifact.executable)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .output()
+            .map_err(|e| {
+                Failure::bare(vec![Diagnostic::error(
+                    code::LINK_FAILED,
+                    format!("cannot execute {}: {e}", artifact.executable.display()),
+                )])
+            })?;
+        let status = exit_code(&output.status);
+        let said = String::from_utf8_lossy(&output.stdout).into_owned();
+        let complained = String::from_utf8_lossy(&output.stderr).into_owned();
+        // The debug runtime speaks its leak report at the exit of every test
+        // process, and a test that finishes with memory still held has
+        // answered wrongly even though its exit code says otherwise.
+        let leaked = complained.contains("dux: leaked");
+        if status == 0 && !leaked {
+            passed += 1;
+            writeln!(stdout, "test {name} ... ok").map_err(|e| io_failure(source, e))?;
+        } else {
+            failed += 1;
+            if status == 0 {
+                writeln!(stdout, "test {name} ... FAILED (leaked memory)")
+                    .map_err(|e| io_failure(source, e))?;
+            } else {
+                writeln!(stdout, "test {name} ... FAILED (exit {status})")
+                    .map_err(|e| io_failure(source, e))?;
+            }
+        }
+        if status != 0 || leaked || verbose {
+            for line in said.lines().chain(complained.lines()) {
+                writeln!(stdout, "  | {line}").map_err(|e| io_failure(source, e))?;
+            }
+        }
+    }
+    Ok((passed, failed))
 }
 
 fn emit_ast(

@@ -1,0 +1,9 @@
+//@exit 2
+//@stderr dux: assertion failed
+package main
+
+fn main() {
+    println("before")
+    assert(1 == 2)
+    println("never after a failed assertion")
+}

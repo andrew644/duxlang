@@ -173,4 +173,16 @@ each remaining gap is waiting for. A gap is a milestone, never a verdict.
   records by their C names — and every binding, parameter and loop variable
   announces itself, so `lldb` prints `(Vec3) big = { x = 2, y = 4, z = 6 }`
   and `(Point) p = { x = 3, y = 4 }` straight out of the running program.
-  A `dux test` runner and an `lldb -batch` smoke join at M7.
+  and an `lldb -batch` smoke test stops the running program and reads
+  those variables.
+
+## Testing today
+
+`#[test] fn name()` marks a test; `dux test [paths]` compiles one
+executable per test — the file's declarations plus a generated `main`
+that calls only that test — and runs each alone. A trap, a bad exit or
+a leak report in the debug runtime's parting words all fail the test;
+everything else keeps running. A directory lends its `*_test.dux`
+files, and no path means the current one. `assert(cond)` stops the
+program where the condition says no in every build; `debug_assert`
+stands aside under `--release`.

@@ -1,0 +1,22 @@
+package main
+
+fn doubled(x: i32) -> i32 {
+    return x * 2
+}
+
+#[test]
+fn doubling_doubles() {
+    assert(doubled(21) == 42)
+}
+
+#[test]
+fn heap_answers_once_released() {
+    cell := new(i32)
+    *cell = 7
+    assert(*cell == 7)
+    free(cell)
+}
+
+fn main() {
+    println("main never runs under dux test")
+}

@@ -1,0 +1,11 @@
+package main
+
+#[test]
+fn keeps_its_word() {
+    assert(1 + 1 == 2)
+}
+
+#[test]
+fn breaks_its_word() {
+    assert(1 + 1 == 3)
+}

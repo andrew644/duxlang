@@ -1,0 +1,7 @@
+package main
+
+#[test]
+fn forgets_to_release() {
+    lost := new(i32)
+    *lost = 1
+}

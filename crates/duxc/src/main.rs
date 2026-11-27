@@ -70,7 +70,65 @@ fn main() -> ExitCode {
         }
         Command::Fmt { paths, check } => fmt(&paths, check, &mut err),
         Command::Cimports { file, json } => cimports(&file, json, &mut err),
+        Command::Test {
+            files,
+            out_dir,
+            verbose,
+        } => test(&files, &out_dir, verbose, &mut err),
     }
+}
+
+fn test(files: &[PathBuf], out_dir: &Path, verbose: bool, err: &mut impl Write) -> ExitCode {
+    let mut passed = 0;
+    let mut failed = 0;
+    let mut seen = 0;
+    for path in files {
+        for file in test_files(path) {
+            seen += 1;
+            match dux_driver::run_tests(&file, out_dir, verbose, &mut std::io::stdout()) {
+                Ok((p, f)) => {
+                    passed += p;
+                    failed += f;
+                }
+                Err(problem) => {
+                    problem.report(err);
+                    return ExitCode::FAILURE;
+                }
+            }
+        }
+    }
+    if seen == 0 {
+        let _ = writeln!(err, "error: no test files to run");
+        return ExitCode::FAILURE;
+    }
+    let _ = writeln!(std::io::stdout(), "{passed} passed, {failed} failed");
+    if failed == 0 {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
+    }
+}
+
+/// A named file is itself; a directory lends its `*_test.dux` files, sorted
+/// so the run order is the same every time.
+fn test_files(path: &Path) -> Vec<PathBuf> {
+    if !path.is_dir() {
+        return vec![path.to_path_buf()];
+    }
+    let mut found: Vec<PathBuf> = std::fs::read_dir(path)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|candidate| {
+            candidate.extension().is_some_and(|end| end == "dux")
+                && candidate
+                    .file_stem()
+                    .is_some_and(|stem| stem.to_string_lossy().ends_with("_test"))
+        })
+        .collect();
+    found.sort();
+    found
 }
 
 fn cimports(file: &Path, json: bool, err: &mut impl Write) -> ExitCode {

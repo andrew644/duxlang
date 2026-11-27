@@ -41,7 +41,19 @@ pub fn resolve(program: &Program) -> Resolution {
 }
 
 const UNIVERSE: &[&str] = &[
-    "print", "println", "new", "make", "free", "del", "hash", "context", "Some", "None", "Ok",
+    "print",
+    "println",
+    "new",
+    "make",
+    "free",
+    "del",
+    "hash",
+    "context",
+    "assert",
+    "debug_assert",
+    "Some",
+    "None",
+    "Ok",
     "Err",
 ];
 

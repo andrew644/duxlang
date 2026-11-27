@@ -4,6 +4,7 @@ use std::process::Command;
 const FIXTURE_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../tests/e2e");
 const EXAMPLE_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../example");
 const SCRATCH_DIR: &str = env!("CARGO_TARGET_TMPDIR");
+const TESTSRC_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../tests/testsrc");
 
 #[derive(Debug)]
 struct Spec {
@@ -541,6 +542,98 @@ fn the_normative_control_flow_example_runs_every_loop_and_a_match() {
         run.stdout,
         "i=1\ni=2\ni=3\n10 20 30 \n[0]=10 [1]=20 [2]=30 \ntick tick tick \ntock tock tock \n\
          x=5\nodd medium\nbody\nruns first\nruns second\n"
+    );
+}
+
+fn dux_test(tag: &str, args: &[&str]) -> (String, String, i32) {
+    let out_dir = Path::new(SCRATCH_DIR).join(format!("dux-test-cache-{tag}"));
+    let _ = std::fs::remove_dir_all(&out_dir);
+    let run = Command::new(env!("CARGO_BIN_EXE_duxc"))
+        .arg("test")
+        .arg("--out-dir")
+        .arg(out_dir.to_str().expect("utf-8 scratch"))
+        .args(args)
+        .output()
+        .expect("the compiler runs");
+    (
+        String::from_utf8_lossy(&run.stdout).into_owned(),
+        String::from_utf8_lossy(&run.stderr).into_owned(),
+        run.status.code().unwrap_or(-1),
+    )
+}
+
+#[test]
+fn dux_test_runs_each_test_alone_and_main_stays_home() {
+    let fixture = Path::new(TESTSRC_DIR).join("passing_test.dux");
+    let (said, complained, code) = dux_test("passing", &[fixture.to_str().expect("utf-8 path")]);
+    assert_eq!(code, 0, "stdout:{said}stderr:{complained}");
+    assert_eq!(
+        said,
+        "test doubling_doubles ... ok\ntest heap_answers_once_released ... ok\n2 passed, 0 failed\n"
+    );
+}
+
+#[test]
+fn dux_test_reports_a_failed_assertion_and_keeps_running_the_rest() {
+    let fixture = Path::new(TESTSRC_DIR).join("failing_test.dux");
+    let (said, _complained, code) = dux_test("failing", &[fixture.to_str().expect("utf-8 path")]);
+    assert_eq!(code, 1, "stdout:{said}");
+    assert_eq!(
+        said,
+        format!(
+            "test keeps_its_word ... ok\ntest breaks_its_word ... FAILED (exit 2)\n  \
+             | dux: assertion failed at {}:10\n1 passed, 1 failed\n",
+            fixture.display()
+        )
+    );
+}
+
+#[test]
+fn dux_test_fails_a_test_that_holds_memory_after_finishing() {
+    let fixture = Path::new(TESTSRC_DIR).join("leaky_test.dux");
+    let (said, _complained, code) = dux_test("leaky", &[fixture.to_str().expect("utf-8 path")]);
+    assert_eq!(code, 1, "stdout:{said}");
+    assert_eq!(
+        said,
+        format!(
+            "test forgets_to_release ... FAILED (leaked memory)\n  \
+             | dux:   leaked 4 bytes, allocated at {}:5\n  \
+             | dux: leaked 1 allocation(s), 4 byte(s)\n0 passed, 1 failed\n",
+            fixture.display()
+        )
+    );
+}
+
+#[test]
+fn dux_test_lends_a_directory_its_test_files_in_order() {
+    let (said, _complained, code) = dux_test("directory", &[TESTSRC_DIR]);
+    assert_eq!(code, 1, "stdout:{said}");
+    let lines: Vec<&str> = said
+        .lines()
+        .filter(|line| line.starts_with("test ") || line.ends_with("failed"))
+        .collect();
+    assert_eq!(
+        lines,
+        [
+            "test keeps_its_word ... ok",
+            "test breaks_its_word ... FAILED (exit 2)",
+            "test debug_sleeps_and_assert_stays_up ... FAILED (exit 2)",
+            "test forgets_to_release ... FAILED (leaked memory)",
+            "test doubling_doubles ... ok",
+            "test heap_answers_once_released ... ok",
+            "3 passed, 3 failed",
+        ]
+    );
+}
+
+#[test]
+fn dux_test_says_so_when_a_file_has_no_tests() {
+    let fixture = Path::new(FIXTURE_DIR).join("debug_types.dux");
+    let (said, complained, code) = dux_test("none", &[fixture.to_str().expect("utf-8 path")]);
+    assert_eq!(code, 1, "stdout:{said}");
+    assert!(
+        complained.contains("has no #[test] functions to run"),
+        "stderr:{complained}"
     );
 }
 

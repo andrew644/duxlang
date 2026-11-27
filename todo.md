@@ -2,7 +2,6 @@
 
 ## M7 — toolchain maturity
 
-- [ ] `dux test` subcommand: test discovery, runner, per-run leak report
 - [ ] Grow the negative-test corpus (bad `match` arms, layout, conversions all have seeds; pointers/allocations do not)
 
 ## M8 — ecosystem

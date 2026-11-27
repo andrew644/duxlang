@@ -3763,6 +3763,58 @@ impl Emitter {
         self.dead = true;
     }
 
+    /// `assert(cond)` stops the program where the condition says no, and
+    /// `debug_assert` says the same until a release build decides the check
+    /// is not worth its price. The condition still runs in a release build;
+    /// only the stopping stands aside.
+    fn assert_builtin(
+        &mut self,
+        module: &Module<'static>,
+        name: &str,
+        args: &[Expr],
+        span: Span,
+    ) -> Option<Typed> {
+        if args.len() != 1 {
+            self.unsupported(span, &format!("`{name}` with anything but one condition"));
+            return None;
+        }
+        let condition = self.expr(module, &args[0], None)?;
+        if condition.ty != DuxType::Bool {
+            self.diagnostics.push(
+                Diagnostic::error(
+                    code::TYPE_MISMATCH,
+                    format!(
+                        "`{name}` reads a bool condition, and `{}` is not one",
+                        condition.ty.name()
+                    ),
+                )
+                .with_span(span),
+            );
+            return None;
+        }
+        let test = condition.int_value()?;
+        let checked = name == "assert" || self.debug_allocator;
+        if !checked || self.dead {
+            return Some(Typed::void());
+        }
+        let carries_on = self.new_block("assert.ok");
+        let broken = self.new_block("assert.trap");
+        if self
+            .builder
+            .build_conditional_branch(test, carries_on, broken)
+            .is_err()
+        {
+            return None;
+        }
+        self.builder.position_at_end(broken);
+        let file = self.sources.name_of(span.file).to_string();
+        let line = self.sources.line_col(span.file, span.start).0;
+        self.trap(module, &format!("dux: assertion failed at {file}:{line}\n"));
+        self.builder.position_at_end(carries_on);
+        self.dead = false;
+        Some(Typed::void())
+    }
+
     /// The debug bounds check: when the answer says the index landed outside
     /// its view, the program stops where it broke the rule, and the message
     /// names the line the index was written on. A checked index stays whole
@@ -8872,6 +8924,9 @@ impl Emitter {
         }
         if name == "hash" && !self.functions.contains_key(name) {
             return self.hash_builtin(module, args, span);
+        }
+        if (name == "assert" || name == "debug_assert") && !self.functions.contains_key(name) {
+            return self.assert_builtin(module, name, args, span);
         }
         if self.generic_fns.contains_key(name) {
             return self.generic_call(module, name, &[], args, span);

@@ -1,0 +1,10 @@
+//@exit 2
+//@stderr dux: assertion failed
+//@debug_only
+package main
+
+fn main() {
+    println("before")
+    debug_assert(1 + 1 == 3)
+    println("never after a failed debug assertion")
+}
