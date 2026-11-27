@@ -1,0 +1,34 @@
+//@stderr_empty
+package main
+
+// pkg-config is a source of libraries, not just hints: `--cflags` feeds the
+// importer's translation unit and `--libs` feeds the link, so the machine's
+// own zlib (here, zlib-ng, with its `-DWITH_GZFILEOP`) is the one imported,
+// compiled against and linked.
+
+#[c_include("zlib.h")]
+#[c_pkgconfig("zlib")]
+mod z;
+
+fn main() {
+    text := "dux compresses through pkg-config, pkg-config, pkg-config"
+    raw := text.bytes()
+    room := z.compressBound(raw.len() as c_ulong)
+    packed := make(u8, room)
+    size: c_ulong = room
+    code := z.compress2((&packed[0]) as *c_uchar, &size, (&raw[0]) as *c_uchar, raw.len() as c_ulong, 6)
+    back := make(u8, raw.len())
+    whole: c_ulong = raw.len() as c_ulong
+    code2 := z.uncompress((&back[0]) as *c_uchar, &whole, (&packed[0]) as *c_uchar, size)
+    same := code == 0 && code2 == 0 && whole == raw.len() as c_ulong
+    if same {
+        for at in 0..raw.len() {
+            if back[at] != raw[at] {
+                same = false
+            }
+        }
+    }
+    println($"code={} {} bytes back={} whole={}", code, code2, whole, same)
+    del(packed)
+    del(back)
+}

@@ -9099,9 +9099,9 @@ impl Emitter {
         // `s.bytes()` is the view the string already is: the same address and
         // the same count, over `u8`.
         if name.name == "bytes" && args.is_empty() && base_ty == DuxType::Str {
-            let bytes = DuxType::Slice(Box::leak(Box::new(DuxType::U8)));
-            let at = base_at?;
-            return Some(Typed::pointer(at, bytes));
+            let text = self.load(DuxType::Str, base_at?)?;
+            let (data, length) = self.slice_parts(text)?;
+            return Some(self.view(DuxType::U8, data, length));
         }
         // `s.runes()` decodes the UTF-8 into the code points it spells, a
         // `[]rune` the context owns.

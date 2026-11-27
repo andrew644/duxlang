@@ -3130,6 +3130,7 @@ impl<'a> Checker<'a> {
                     | Ty::U32
                     | Ty::U64
                     | Ty::IntConst(_)
+                    | Ty::C(_)
             ) {
                 self.report(
                     args[1].span(),

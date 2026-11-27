@@ -808,10 +808,12 @@ fn link(artifact: &BuiltArtifact, libraries: &[String]) -> Result<(), Failure> {
         .arg("-o")
         .arg(&artifact.executable)
         .stderr(std::process::Stdio::inherit());
-    // A library is named by the declaration that needs it, never by the link
-    // line as a whole: `#[link(name = "m")]` says where a symbol lives.
-    for library in libraries {
-        command.arg(format!("-l{library}"));
+    // A library is named by the declaration that needs it, never by a link
+    // line the user writes: `#[link(name = "m")]` says where a symbol lives,
+    // and a `#[c_pkgconfig]` package answers with the linker's own tokens —
+    // `-lz`, `-L/usr/local/lib`, all of it — which pass through as said.
+    for argument in libraries {
+        command.arg(argument);
     }
     let status = command.status().map_err(|e| {
         Failure::bare(vec![Diagnostic::error(
@@ -990,8 +992,11 @@ fn libraries(program: &Program) -> Vec<String> {
                 let AttributeArgument::Named(key, value) = argument else {
                     continue;
                 };
-                if key == "name" && !named.iter().any(|known| known == value) {
-                    named.push(value.clone());
+                if key == "name" {
+                    let flag = format!("-l{value}");
+                    if !named.contains(&flag) {
+                        named.push(flag);
+                    }
                 }
             }
         }
@@ -1003,8 +1008,9 @@ fn libraries(program: &Program) -> Vec<String> {
         for attribute in &module.attributes {
             if attribute.name == "c_link" {
                 if let Some(library) = attribute.string_argument() {
-                    if !named.iter().any(|known| known == library) {
-                        named.push(library.to_string());
+                    let flag = format!("-l{library}");
+                    if !named.contains(&flag) {
+                        named.push(flag);
                     }
                 }
             }
@@ -1012,10 +1018,8 @@ fn libraries(program: &Program) -> Vec<String> {
                 if let Some(package) = attribute.string_argument() {
                     if let Ok(tokens) = pkg_config(package, "libs") {
                         for token in tokens {
-                            if let Some(library) = token.strip_prefix("-l") {
-                                if !named.iter().any(|known| known == library) {
-                                    named.push(library.to_string());
-                                }
+                            if !named.contains(&token) {
+                                named.push(token);
                             }
                         }
                     }
