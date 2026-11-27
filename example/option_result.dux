@@ -1,7 +1,5 @@
 package main
 
-import "std/fs"
-
 // These two are predeclared in universe scope -- ordinary enums, no magic:
 //
 //     enum Option<T> { Some(T), None }
@@ -28,16 +26,15 @@ fn parse_slot(s: string) -> Result<i32, ParseError> {
     return Ok(value)
 }
 
-fn load_slot(path: string) -> Result<i32, string> {
-    // Propagation is a match + return today: `?` / `or else` sugar is deferred
-    // (README open item 5). `return` has type `never`, so it types as a match arm.
-    text := match fs.read_to_string(path) {
-        Ok(t)  => t,
-        Err(e) => return Err($"cannot read {path}: {e}"),
-    }
-    return match parse_slot(text.trim()) {
-        Ok(v)  => Ok(v),
-        Err(e) => Err($"bad slot in {path}: {e}"),
+// Remapping one error type into another is a match today: `?` / `or else`
+// sugar is a DESIGN open item. A `return` has type `never`, so it types as
+// a match arm. (`load_slot` takes text already off the disk; reading files
+// waits for a standard library.)
+fn load_slot(text: string, source: string) -> Result<i32, string> {
+    return match parse_slot(text) {
+        Ok(v)                           => Ok(v),
+        Err(ParseError::NotANumber)     => Err($"`{source}` holds no number"),
+        Err(ParseError::OutOfRange)     => Err($"`{source}` is off the board"),
     }
 }
 
@@ -46,9 +43,17 @@ fn find(needle: string) -> Option<i32> {
 }
 
 fn main() {
-    match load_slot("slot1.txt") {
+    match load_slot("42", "slot1") {
         Ok(n)  => println($"slot = {n}"),
-        Err(e) => println($"error: {e}"),
+        Err(e) => { println($"error: {e}"); del(e) },
+    }
+    match load_slot("one hundred", "slot2") {
+        Ok(n)  => println($"slot = {n}"),
+        Err(e) => { println($"error: {e}"); del(e) },
+    }
+    match load_slot("123", "slot3") {
+        Ok(n)  => println($"slot = {n}"),
+        Err(e) => { println($"error: {e}"); del(e) },
     }
 
     // Pattern conditions are the one piece of sugar we want early: match one
@@ -58,14 +63,16 @@ fn main() {
     }
 
     opt := find("needle")
-    println($"value={}", opt.unwrap_or(-1))
-    match opt {
+    missed := find("broom")
+
+    // `unwrap_or` is a match by another name, and there is no method
+    // syntax on a sum type yet -- the match is the language.
+    println($"value={}", match opt { Some(v) => v, None => 0 - 1 })
+    match missed {
         Some(v) => println($"found {v}"),
-        None    => println("nothing"),
+        None    => println("nothing found"),
     }
+    println($"forced={}", match opt { Some(v) => v, None => 0 })
 
-    // unwrap() panics on None: print + trap, no unwinding, defers do not run.
-    println($"forced={}", opt.unwrap())
-
-    _ := parse_slot("nope")          // ignoring a Result is a warning, so say so on purpose
+    _ := parse_slot("nope")            // ignoring a Result is a warning, so say so on purpose
 }

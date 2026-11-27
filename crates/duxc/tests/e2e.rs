@@ -328,6 +328,32 @@ fn a_built_binary_carries_the_line_table() {
 }
 
 #[test]
+fn the_normative_option_and_result_example_runs_the_whole_way_through() {
+    let sample = Path::new(EXAMPLE_DIR).join("option_result.dux");
+    let scratch = Path::new(SCRATCH_DIR).join("example_option_result");
+    let _ = std::fs::remove_dir_all(&scratch);
+    let output = Command::new(env!("CARGO_BIN_EXE_duxc"))
+        .arg("run")
+        .arg(&sample)
+        .arg("--out-dir")
+        .arg(&scratch)
+        .output()
+        .expect("duxc is runnable");
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    assert_eq!(output.status.code(), Some(0), "stdout: {stdout}");
+    assert_eq!(
+        stderr, "",
+        "the Option/Result example compiles cleanly and holds no memory:\n{stderr}"
+    );
+    assert_eq!(
+        stdout,
+        "slot = 42\nerror: `slot2` holds no number\nerror: `slot3` is off the board\n\
+         parsed 42\nvalue=7\nnothing found\nforced=7\n"
+    );
+}
+
+#[test]
 fn every_example_dumps_its_ast_so_milestone_gaps_never_hide_the_tree() {
     let scratch = Path::new(SCRATCH_DIR).join("ast-dumps");
     let _ = std::fs::remove_dir_all(&scratch);

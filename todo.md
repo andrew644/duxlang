@@ -10,6 +10,4 @@
 
 ## Test & docs housekeeping
 
-- [ ] Update the M4 row of the DESIGN.md milestone table — the work has landed (sum types, `match`, `Option`/`Result`, niche, exhaustiveness, negative tests) but the row still reads open
-- [ ] Add pinned-stdout e2e tests for `sum_types.dux` and `option_result.dux` (named as M4's acceptance; neither is in `tests/e2e`); make `option_result.dux` self-contained first — it reads `slot1.txt`, which is not in the repo
 - [ ] Run `example/raylib/hello.dux` on a desktop box to verify the window actually opens (build/link already verified headless; see ADMIN.md §5)
