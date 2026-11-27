@@ -484,7 +484,17 @@ pub fn run(
         .write_all(&output.stdout)
         .map_err(|e| Failure::bare(vec![io_diagnostic(e)]))?;
     let _ = stdout.flush();
-    Ok(output.status.code().unwrap_or(-1))
+    // A program killed by a signal reports itself the way a shell would:
+    // 128 plus the signal, so `duxc run` on a segfault says 139.
+    Ok(exit_code(&output.status))
+}
+
+fn exit_code(status: &std::process::ExitStatus) -> i32 {
+    use std::os::unix::process::ExitStatusExt;
+    match status.code() {
+        Some(code) => code,
+        None => 128 + status.signal().unwrap_or(0),
+    }
 }
 
 /// Compile every C translation unit to bitcode, or point at the cached
@@ -754,8 +764,7 @@ fn fill_c_modules(
             }
         }
         let namespace = module.name.name.as_str();
-        let (text, unspellable, mut crossed) =
-            dux_cinterop::spell_report(namespace, &declarations);
+        let (text, unspellable, mut crossed) = dux_cinterop::spell_report(namespace, &declarations);
         missed.extend(unspellable);
         missed.sort_by(|one, other| one.name.cmp(&other.name));
         missed.dedup();

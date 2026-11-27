@@ -135,9 +135,7 @@ pub fn parse<I: IntoIterator<Item = OsString>>(argv: I) -> Result<Command, Usage
                     "--out-dir" => out_dir = PathBuf::from(value(rest, &mut index, "--out-dir")?),
                     "--release" => release = true,
                     "--help" | "-h" => return Ok(Command::Help),
-                    other if is_bounds_check(other) => {
-                        bounds_check = parse_bounds_check(other)?
-                    }
+                    other if is_bounds_check(other) => bounds_check = parse_bounds_check(other)?,
                     other if other.starts_with("--emit=") => {
                         emit = match other.trim_start_matches("--emit=") {
                             "ir" | "llvm-ir" => Emit::Ir,
@@ -184,9 +182,7 @@ pub fn parse<I: IntoIterator<Item = OsString>>(argv: I) -> Result<Command, Usage
                 match arg {
                     "--out-dir" => out_dir = PathBuf::from(value(rest, &mut index, "--out-dir")?),
                     "--release" => release = true,
-                    other if is_bounds_check(other) => {
-                        bounds_check = parse_bounds_check(other)?
-                    }
+                    other if is_bounds_check(other) => bounds_check = parse_bounds_check(other)?,
                     other if file.is_none() && !other.starts_with('-') => {
                         file = Some(PathBuf::from(other))
                     }
@@ -258,9 +254,7 @@ fn is_bounds_check(arg: &str) -> bool {
 }
 
 fn parse_bounds_check(arg: &str) -> Result<BoundsCheck, UsageError> {
-    let word = arg
-        .split_once('=')
-        .map_or("", |(_, word)| word);
+    let word = arg.split_once('=').map_or("", |(_, word)| word);
     BoundsCheck::parse(word).ok_or_else(|| UsageError::BadBounds(word.to_string()))
 }
 

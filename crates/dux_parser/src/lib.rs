@@ -1,8 +1,8 @@
 use dux_ast::{
     AssignOp, Attribute, AttributeArgument, BinaryOp, Block, ConstDecl, Decl, EnumDecl, Expr,
     ExternBlock, Field, FieldPattern, FnDecl, ForKind, GlobalDecl, Ident, ImplDecl, Import,
-    InterpolationPart, MatchArm, MatchBody, ModuleDecl, Param, Pattern, Program, StrKind,
-    StructDecl, Stmt, Type, TypeAliasDecl, TypeParam, UnaryOp, Variant, VariantBody,
+    InterpolationPart, MatchArm, MatchBody, ModuleDecl, Param, Pattern, Program, Stmt, StrKind,
+    StructDecl, Type, TypeAliasDecl, TypeParam, UnaryOp, Variant, VariantBody,
 };
 use dux_diag::Diagnostic;
 use dux_lexer::{Keyword, Literal, Punct, Token, TokenKind};
@@ -143,7 +143,10 @@ impl<'a> Parser<'a> {
                             if bare && token.is_punct(Punct::Semicolon) {
                                 self.bump();
                             } else if !bare {
-                                self.error(&token, "an attribute must be followed by a declaration");
+                                self.error(
+                                    &token,
+                                    "an attribute must be followed by a declaration",
+                                );
                                 self.recover_to_top_level();
                             } else {
                                 self.error(
@@ -203,7 +206,6 @@ impl<'a> Parser<'a> {
             _ => return None,
         })
     }
-
 
     fn recover_to_top_level(&mut self) {
         if !self.at_end() {
@@ -311,7 +313,10 @@ impl<'a> Parser<'a> {
                     _ => None,
                 },
             };
-            let named = key.filter(|_| self.peek_at(1).is_some_and(|next| next.is_punct(Punct::Assign)));
+            let named = key.filter(|_| {
+                self.peek_at(1)
+                    .is_some_and(|next| next.is_punct(Punct::Assign))
+            });
             if let Some(key) = named {
                 self.bump();
                 self.bump();
@@ -324,7 +329,10 @@ impl<'a> Parser<'a> {
                     Some(Literal::Int(value)) => {
                         arguments.push(AttributeArgument::Named(key, value.to_string()))
                     }
-                    _ => self.error(&value, "expected a string or integer value for the argument"),
+                    _ => self.error(
+                        &value,
+                        "expected a string or integer value for the argument",
+                    ),
                 }
             } else {
                 self.bump();
@@ -345,7 +353,10 @@ impl<'a> Parser<'a> {
                 self.bump();
             }
         }
-        self.expect_punct(Punct::RParen, "expected `)` to close the attribute arguments");
+        self.expect_punct(
+            Punct::RParen,
+            "expected `)` to close the attribute arguments",
+        );
         arguments
     }
 
@@ -468,7 +479,11 @@ impl<'a> Parser<'a> {
                 VariantBody::Empty
             };
             let span = variant_start.merge(self.peek().span);
-            variants.push(Variant { name: variant, body, span });
+            variants.push(Variant {
+                name: variant,
+                body,
+                span,
+            });
             if self.at_punct(Punct::Comma) || self.at_punct(Punct::Semicolon) {
                 self.bump();
             }
@@ -509,7 +524,10 @@ impl<'a> Parser<'a> {
         self.bump();
         let name = self.expect_ident("global name");
         let (ty, value) = self.typed_initializer(false);
-        let span = value.as_ref().map(|v| start.merge(v.span())).unwrap_or(start);
+        let span = value
+            .as_ref()
+            .map(|v| start.merge(v.span()))
+            .unwrap_or(start);
         GlobalDecl {
             attributes,
             name,
@@ -532,7 +550,10 @@ impl<'a> Parser<'a> {
         }
         if required {
             let token = self.peek().clone();
-            self.error(&token, "a constant needs a value: `const NAME: Type = value`");
+            self.error(
+                &token,
+                "a constant needs a value: `const NAME: Type = value`",
+            );
             return (ty, Some(Expr::Error { span: token.span }));
         }
         (ty, None)
@@ -625,7 +646,10 @@ impl<'a> Parser<'a> {
             }
             self.expect_punct(Punct::RBrace, "expected `}` to close the module")
         } else {
-            self.expect_punct(Punct::Semicolon, "expected `;` or `{` after the module name")
+            self.expect_punct(
+                Punct::Semicolon,
+                "expected `;` or `{` after the module name",
+            )
         };
         ModuleDecl {
             attributes,
@@ -642,7 +666,10 @@ impl<'a> Parser<'a> {
         let abi = match &abi_token.literal {
             Some(Literal::Text(text)) => text.clone(),
             _ => {
-                self.error(&abi_token, "an extern block names its ABI: `extern \"C\" { .. }`");
+                self.error(
+                    &abi_token,
+                    "an extern block names its ABI: `extern \"C\" { .. }`",
+                );
                 "<error>".to_string()
             }
         };
@@ -656,7 +683,10 @@ impl<'a> Parser<'a> {
                 functions.push(self.function_with(inner, false));
             } else {
                 let token = self.peek().clone();
-                self.error(&token, "an extern block contains only function declarations");
+                self.error(
+                    &token,
+                    "an extern block contains only function declarations",
+                );
                 self.bump();
             }
             if self.cursor == before {
@@ -728,7 +758,10 @@ impl<'a> Parser<'a> {
         if token.is_keyword(Keyword::Fn) {
             self.bump();
             let mut params = Vec::new();
-            self.expect_punct(Punct::LParen, "expected `(` after `fn` in a function pointer type");
+            self.expect_punct(
+                Punct::LParen,
+                "expected `(` after `fn` in a function pointer type",
+            );
             while !self.at_punct(Punct::RParen) && !self.at_end() {
                 params.push(self.ty());
                 if self.at_punct(Punct::Comma) {
@@ -809,7 +842,9 @@ impl<'a> Parser<'a> {
         self.bump();
         let mut name = token.text(self.sources).to_string();
         while self.at_punct(Punct::Dot)
-            && self.peek_at(1).is_some_and(|next| next.kind == TokenKind::Ident)
+            && self
+                .peek_at(1)
+                .is_some_and(|next| next.kind == TokenKind::Ident)
         {
             self.bump();
             let segment = self.peek().clone();
@@ -909,7 +944,10 @@ impl<'a> Parser<'a> {
                 } else {
                     None
                 };
-                let span = value.as_ref().map(|e| token.span.merge(e.span())).unwrap_or(token.span);
+                let span = value
+                    .as_ref()
+                    .map(|e| token.span.merge(e.span()))
+                    .unwrap_or(token.span);
                 Stmt::Return { value, span }
             }
             TokenKind::Keyword(Keyword::Break) => {
@@ -1245,9 +1283,12 @@ impl<'a> Parser<'a> {
             }
             let Some(offset) = inner[index + 1..].find('}') else {
                 self.diagnostics.push(
-                    Diagnostic::error(CODE_UNEXPECTED_TOKEN, "an interpolated hole is missing its `}`")
-                        .with_span(start)
-                        .with_note("a literal `{{` is written `{{{{`"),
+                    Diagnostic::error(
+                        CODE_UNEXPECTED_TOKEN,
+                        "an interpolated hole is missing its `}`",
+                    )
+                    .with_span(start)
+                    .with_note("a literal `{{` is written `{{{{`"),
                 );
                 plain.push_str(&inner[index..]);
                 break;
@@ -1272,7 +1313,11 @@ impl<'a> Parser<'a> {
             };
             parts.push(InterpolationPart::Hole {
                 written,
-                span: Span::new(start.file, hole_start as u32, (hole_end - hole_start) as u32),
+                span: Span::new(
+                    start.file,
+                    hole_start as u32,
+                    (hole_end - hole_start) as u32,
+                ),
             });
             index = close + 1;
         }
@@ -1309,7 +1354,9 @@ impl<'a> Parser<'a> {
                     "an `if` in value position needs a final `else` arm",
                 )
                 .with_span(span)
-                .with_note("only a `match` with a wildcard may be the last expression without `else`"),
+                .with_note(
+                    "only a `match` with a wildcard may be the last expression without `else`",
+                ),
             );
             None
         };
@@ -1461,7 +1508,8 @@ impl<'a> Parser<'a> {
                             break;
                         }
                     }
-                    let end = self.expect_punct(Punct::RParen, "expected `)` to close the argument list");
+                    let end =
+                        self.expect_punct(Punct::RParen, "expected `)` to close the argument list");
                     let span = expr.span().merge(end);
                     expr = Expr::Call {
                         callee: Box::new(expr),
@@ -1489,7 +1537,8 @@ impl<'a> Parser<'a> {
                     let args = self.type_argument_list();
                     let end = self.last_span;
                     expr = if self.at_struct_literal() {
-                        let mut literal = self.struct_literal(path_spelling(&qualifier, &name), start);
+                        let mut literal =
+                            self.struct_literal(path_spelling(&qualifier, &name), start);
                         if let Expr::StructLiteral { args: slot, .. } = &mut literal {
                             *slot = args;
                         }
@@ -1514,7 +1563,9 @@ impl<'a> Parser<'a> {
                         span,
                     };
                 }
-                TokenKind::Punct(Punct::Dot) if self.peek_at(1).is_some_and(|t| t.kind == TokenKind::Int) => {
+                TokenKind::Punct(Punct::Dot)
+                    if self.peek_at(1).is_some_and(|t| t.kind == TokenKind::Int) =>
+                {
                     self.bump();
                     let index_token = self.peek().clone();
                     let index = match &index_token.literal {
@@ -1586,21 +1637,30 @@ impl<'a> Parser<'a> {
             TokenKind::Int => {
                 self.bump();
                 match token.literal {
-                    Some(Literal::Int(value)) => Expr::Int { value, span: token.span },
+                    Some(Literal::Int(value)) => Expr::Int {
+                        value,
+                        span: token.span,
+                    },
                     _ => Expr::Error { span: token.span },
                 }
             }
             TokenKind::Float => {
                 self.bump();
                 match token.literal {
-                    Some(Literal::Float(value)) => Expr::Float { value, span: token.span },
+                    Some(Literal::Float(value)) => Expr::Float {
+                        value,
+                        span: token.span,
+                    },
                     _ => Expr::Error { span: token.span },
                 }
             }
             TokenKind::Char => {
                 self.bump();
                 match token.literal {
-                    Some(Literal::Char(value)) => Expr::Char { value, span: token.span },
+                    Some(Literal::Char(value)) => Expr::Char {
+                        value,
+                        span: token.span,
+                    },
                     _ => Expr::Error { span: token.span },
                 }
             }
@@ -1616,18 +1676,28 @@ impl<'a> Parser<'a> {
                     _ => StrKind::CString,
                 };
                 match token.literal {
-                    Some(Literal::Text(text)) => Expr::Str { text, kind, span: token.span },
+                    Some(Literal::Text(text)) => Expr::Str {
+                        text,
+                        kind,
+                        span: token.span,
+                    },
                     _ => Expr::Error { span: token.span },
                 }
             }
             TokenKind::Keyword(Keyword::If) => self.if_expression(),
             TokenKind::Keyword(Keyword::True) => {
                 self.bump();
-                Expr::Bool { value: true, span: token.span }
+                Expr::Bool {
+                    value: true,
+                    span: token.span,
+                }
             }
             TokenKind::Keyword(Keyword::False) => {
                 self.bump();
-                Expr::Bool { value: false, span: token.span }
+                Expr::Bool {
+                    value: false,
+                    span: token.span,
+                }
             }
             TokenKind::Ident => {
                 self.bump();
@@ -1650,7 +1720,10 @@ impl<'a> Parser<'a> {
                 if self.at_struct_literal() {
                     return self.struct_literal(name, token.span);
                 }
-                Expr::Ident { name, span: token.span }
+                Expr::Ident {
+                    name,
+                    span: token.span,
+                }
             }
             TokenKind::Punct(Punct::LBracket) => {
                 self.bump();
@@ -1682,7 +1755,8 @@ impl<'a> Parser<'a> {
                     }
                     elements.push(self.expr());
                 }
-                let end = self.expect_punct(Punct::RBracket, "expected `]` to close the array value");
+                let end =
+                    self.expect_punct(Punct::RBracket, "expected `]` to close the array value");
                 Expr::ArrayLiteral {
                     elements,
                     span: token.span.merge(end),
@@ -1707,7 +1781,10 @@ impl<'a> Parser<'a> {
                         span: token.span.merge(end),
                     };
                 }
-                let end = self.expect_punct(Punct::RParen, "expected `)` to close the parenthesised expression");
+                let end = self.expect_punct(
+                    Punct::RParen,
+                    "expected `)` to close the parenthesised expression",
+                );
                 Expr::Paren {
                     inner: Box::new(inner),
                     span: token.span.merge(end),
@@ -1715,8 +1792,11 @@ impl<'a> Parser<'a> {
             }
             TokenKind::Eof => {
                 self.diagnostics.push(
-                    Diagnostic::error(CODE_UNEXPECTED_EOF, "expected an expression, found end of input")
-                        .with_span(token.span),
+                    Diagnostic::error(
+                        CODE_UNEXPECTED_EOF,
+                        "expected an expression, found end of input",
+                    )
+                    .with_span(token.span),
                 );
                 Expr::Error { span: token.span }
             }
@@ -2016,7 +2096,10 @@ impl<'a> Parser<'a> {
             TokenKind::Punct(Punct::LParen) => {
                 self.bump();
                 let inner = self.pattern();
-                self.expect_punct(Punct::RParen, "expected `)` to close the parenthesised pattern");
+                self.expect_punct(
+                    Punct::RParen,
+                    "expected `)` to close the parenthesised pattern",
+                );
                 inner
             }
             TokenKind::Ident => {
@@ -2148,9 +2231,18 @@ impl<'a> Parser<'a> {
         let token = self.peek().clone();
         self.bump();
         match token.literal {
-            Some(Literal::Int(value)) => Expr::Int { value, span: token.span },
-            Some(Literal::Float(value)) => Expr::Float { value, span: token.span },
-            Some(Literal::Char(value)) => Expr::Char { value, span: token.span },
+            Some(Literal::Int(value)) => Expr::Int {
+                value,
+                span: token.span,
+            },
+            Some(Literal::Float(value)) => Expr::Float {
+                value,
+                span: token.span,
+            },
+            Some(Literal::Char(value)) => Expr::Char {
+                value,
+                span: token.span,
+            },
             Some(Literal::Text(text)) => Expr::Str {
                 text,
                 kind: match token.kind {
@@ -2161,8 +2253,14 @@ impl<'a> Parser<'a> {
                 span: token.span,
             },
             _ => match token.kind {
-                TokenKind::Keyword(Keyword::True) => Expr::Bool { value: true, span: token.span },
-                TokenKind::Keyword(Keyword::False) => Expr::Bool { value: false, span: token.span },
+                TokenKind::Keyword(Keyword::True) => Expr::Bool {
+                    value: true,
+                    span: token.span,
+                },
+                TokenKind::Keyword(Keyword::False) => Expr::Bool {
+                    value: false,
+                    span: token.span,
+                },
                 _ => Expr::Error { span: token.span },
             },
         }
@@ -2360,8 +2458,11 @@ impl<'a> Parser<'a> {
             message.into()
         };
         self.diagnostics.push(
-            Diagnostic::error(CODE_UNEXPECTED_TOKEN, format!("{message}, found {}", token.kind.describe()))
-                .with_span(token.span),
+            Diagnostic::error(
+                CODE_UNEXPECTED_TOKEN,
+                format!("{message}, found {}", token.kind.describe()),
+            )
+            .with_span(token.span),
         );
     }
 
@@ -2394,9 +2495,6 @@ impl<'a> Parser<'a> {
     }
 }
 
-
-
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2411,11 +2509,7 @@ mod tests {
     }
 
     fn codes(text: &str) -> Vec<&'static str> {
-        parse_text(text)
-            .1
-            .iter()
-            .map(|d| d.code)
-            .collect()
+        parse_text(text).1.iter().map(|d| d.code).collect()
     }
 
     #[test]
@@ -2431,7 +2525,11 @@ mod tests {
         let main = program.find_function("main").expect("main");
         assert!(main.params.is_empty());
         assert!(main.return_ty.is_none());
-        let Stmt::Expr { expr: Expr::Call { callee, args, .. }, .. } = &main.body.stmts[0] else {
+        let Stmt::Expr {
+            expr: Expr::Call { callee, args, .. },
+            ..
+        } = &main.body.stmts[0]
+        else {
             panic!("expected a call statement: {:?}", main.body.stmts[0]);
         };
         let Expr::Ident { name, .. } = &**callee else {
@@ -2453,14 +2551,19 @@ mod tests {
         assert_eq!(vec3.fields[0].name.name, "x");
         let shape = program.find_enum("Shape").expect("Shape");
         assert_eq!(shape.variants.len(), 3);
-        assert!(matches!(shape.variants[0].body, VariantBody::Tuple(ref payload) if payload.len() == 1));
-        assert!(matches!(shape.variants[1].body, VariantBody::Named(ref fields) if fields.len() == 1));
+        assert!(
+            matches!(shape.variants[0].body, VariantBody::Tuple(ref payload) if payload.len() == 1)
+        );
+        assert!(
+            matches!(shape.variants[1].body, VariantBody::Named(ref fields) if fields.len() == 1)
+        );
         assert!(matches!(shape.variants[2].body, VariantBody::Empty));
     }
 
     #[test]
     fn const_and_global_carry_their_type_and_value() {
-        let (program, diagnostics) = parse_text("const KI: usize = 1024\nglobal hits: i32 = 0\nglobal scratch: [i32; 8]\n");
+        let (program, diagnostics) =
+            parse_text("const KI: usize = 1024\nglobal hits: i32 = 0\nglobal scratch: [i32; 8]\n");
         assert!(diagnostics.is_empty(), "{diagnostics:?}");
         let Decl::Const(ki) = &program.decls[0] else {
             panic!("expected a const, found {:?}", program.decls[0]);
@@ -2474,7 +2577,10 @@ mod tests {
         let Decl::Global(scratch) = &program.decls[2] else {
             panic!("expected a global");
         };
-        assert!(scratch.value.is_none(), "a bare `global` is zero-initialised");
+        assert!(
+            scratch.value.is_none(),
+            "a bare `global` is zero-initialised"
+        );
     }
 
     #[test]
@@ -2496,7 +2602,10 @@ mod tests {
         );
         assert_eq!(
             block.attributes[1].arguments,
-            vec![AttributeArgument::Named("name".to_string(), "m".to_string())]
+            vec![AttributeArgument::Named(
+                "name".to_string(),
+                "m".to_string()
+            )]
         );
         assert_eq!(block.functions.len(), 1);
         assert!(
@@ -2639,7 +2748,8 @@ mod tests {
 
     #[test]
     fn nested_blocks_are_statements() {
-        let (program, diagnostics) = parse_text("fn f() {\n    a := 1\n    {\n        b := 2\n    }\n}");
+        let (program, diagnostics) =
+            parse_text("fn f() {\n    a := 1\n    {\n        b := 2\n    }\n}");
         assert!(diagnostics.is_empty(), "{diagnostics:?}");
         let function = program.find_function("f").unwrap();
         assert!(matches!(function.body.stmts[1], Stmt::Block { .. }));
@@ -2652,17 +2762,26 @@ mod tests {
         );
         assert!(diagnostics.is_empty(), "{diagnostics:?}");
         let f = program.find_function("f").unwrap();
-        let Stmt::Binding { value: Some(Expr::Tuple { elements, .. }), .. } = &f.body.stmts[0]
+        let Stmt::Binding {
+            value: Some(Expr::Tuple { elements, .. }),
+            ..
+        } = &f.body.stmts[0]
         else {
             panic!("a tuple value binds its elements");
         };
         assert_eq!(elements.len(), 2);
-        let Stmt::Binding { value: Some(Expr::Tuple { elements, .. }), .. } = &f.body.stmts[1]
+        let Stmt::Binding {
+            value: Some(Expr::Tuple { elements, .. }),
+            ..
+        } = &f.body.stmts[1]
         else {
             panic!("a trailing comma keeps a one-element tuple a tuple");
         };
         assert_eq!(elements.len(), 1);
-        let Stmt::Binding { value: Some(Expr::Member { index, .. }), .. } = &f.body.stmts[2]
+        let Stmt::Binding {
+            value: Some(Expr::Member { index, .. }),
+            ..
+        } = &f.body.stmts[2]
         else {
             panic!("a positional read is a member access");
         };
@@ -2713,9 +2832,18 @@ mod tests {
             &arms[1].pattern,
             Pattern::Or { alternatives, .. } if alternatives.len() == 3
         ));
-        assert!(matches!(arms[2].pattern, Pattern::Range { inclusive: true, .. }));
+        assert!(matches!(
+            arms[2].pattern,
+            Pattern::Range {
+                inclusive: true,
+                ..
+            }
+        ));
         assert!(matches!(&arms[3].pattern, Pattern::Name { name, .. } if name.name == "x"));
-        assert!(arms[3].guard.is_some(), "the `if` after a pattern is a guard");
+        assert!(
+            arms[3].guard.is_some(),
+            "the `if` after a pattern is a guard"
+        );
         assert!(matches!(arms[4].pattern, Pattern::Wildcard { .. }));
         assert!(matches!(arms[0].body, MatchBody::Expr(Expr::Str { .. })));
     }
@@ -2816,7 +2944,10 @@ mod tests {
 
     fn value_of_return(program: &Program) -> &Expr {
         let function = program.find_function("f").expect("f");
-        let Stmt::Return { value: Some(value), .. } = &function.body.stmts[0] else {
+        let Stmt::Return {
+            value: Some(value), ..
+        } = &function.body.stmts[0]
+        else {
             panic!("expected a return of a value");
         };
         value
@@ -2854,7 +2985,10 @@ mod tests {
         let function = program.find_function("f").unwrap();
         assert_eq!(function.body.stmts.len(), 2);
         let Stmt::Expr { .. } = &function.body.stmts[1] else {
-            panic!("the second statement must be the call: {:?}", function.body.stmts[1])
+            panic!(
+                "the second statement must be the call: {:?}",
+                function.body.stmts[1]
+            )
         };
     }
 
@@ -2869,8 +3003,7 @@ mod tests {
 
     #[test]
     fn all_three_binding_forms_are_distinct() {
-        let (program, diagnostics) =
-            parse_text("fn f() { a := 1; b: i64 = 2; c: i64 }");
+        let (program, diagnostics) = parse_text("fn f() { a := 1; b: i64 = 2; c: i64 }");
         assert!(diagnostics.is_empty(), "{diagnostics:?}");
         let main = program.find_function("f").unwrap();
         let bindings: Vec<_> = main
@@ -2878,11 +3011,16 @@ mod tests {
             .stmts
             .iter()
             .map(|s| match s {
-                Stmt::Binding { name, ty, value, .. } => (name.name.as_str(), ty.is_some(), value.is_some()),
+                Stmt::Binding {
+                    name, ty, value, ..
+                } => (name.name.as_str(), ty.is_some(), value.is_some()),
                 other => panic!("expected binding, found {other:?}"),
             })
             .collect();
-        assert_eq!(bindings, vec![("a", false, true), ("b", true, true), ("c", true, false)]);
+        assert_eq!(
+            bindings,
+            vec![("a", false, true), ("b", true, true), ("c", true, false)]
+        );
     }
 
     #[test]
@@ -2910,7 +3048,10 @@ mod tests {
         else {
             panic!("`*` must bind tighter than `+`: {rhs:?}");
         };
-        assert!(matches!(**inner, Expr::Cast { .. }), "`as` must bind tightest");
+        assert!(
+            matches!(**inner, Expr::Cast { .. }),
+            "`as` must bind tightest"
+        );
     }
 
     #[test]
@@ -2918,8 +3059,20 @@ mod tests {
         let (program, diagnostics) = parse_text("fn f() { x := 0; x += 1; x = 2 }");
         assert!(diagnostics.is_empty(), "{diagnostics:?}");
         let main = program.find_function("f").unwrap();
-        assert!(matches!(main.body.stmts[1], Stmt::Assign { op: AssignOp::Add, .. }));
-        assert!(matches!(main.body.stmts[2], Stmt::Assign { op: AssignOp::Set, .. }));
+        assert!(matches!(
+            main.body.stmts[1],
+            Stmt::Assign {
+                op: AssignOp::Add,
+                ..
+            }
+        ));
+        assert!(matches!(
+            main.body.stmts[2],
+            Stmt::Assign {
+                op: AssignOp::Set,
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -2992,7 +3145,10 @@ mod tests {
             panic!("a call")
         };
         let Expr::Path {
-            qualifier, name, args, ..
+            qualifier,
+            name,
+            args,
+            ..
         } = callee.as_ref()
         else {
             panic!("a path written with its type arguments")
@@ -3018,7 +3174,10 @@ mod tests {
         let Expr::Field { base, name, .. } = callee.as_ref() else {
             panic!("a member walked off a type")
         };
-        let Expr::Path { qualifier, args, .. } = base.as_ref() else {
+        let Expr::Path {
+            qualifier, args, ..
+        } = base.as_ref()
+        else {
             panic!("the type the call walks off")
         };
         assert_eq!(
@@ -3049,16 +3208,33 @@ mod tests {
         );
         assert!(diagnostics.is_empty(), "{diagnostics:?}");
         let statements = &program.find_function("f").unwrap().body.stmts;
-        assert!(matches!(&statements[0], Stmt::If { else_branch: Some(_), .. }));
+        assert!(matches!(
+            &statements[0],
+            Stmt::If {
+                else_branch: Some(_),
+                ..
+            }
+        ));
         assert!(matches!(&statements[1], Stmt::While { .. }));
-        let Stmt::For { kind: ForKind::ThreeClause { .. }, .. } = &statements[2] else {
+        let Stmt::For {
+            kind: ForKind::ThreeClause { .. },
+            ..
+        } = &statements[2]
+        else {
             panic!("expected a three clause for, found {:?}", statements[2]);
         };
-        let Stmt::For { kind: ForKind::In { index, .. }, .. } = &statements[4] else {
+        let Stmt::For {
+            kind: ForKind::In { index, .. },
+            ..
+        } = &statements[4]
+        else {
             panic!("expected an index+value for, found {:?}", statements[4]);
         };
         assert!(index.is_some(), "`for i, v in xs` binds both");
-        assert!(matches!(&statements[5], Stmt::Loop { .. }), "`for {{ }}` is a loop");
+        assert!(
+            matches!(&statements[5], Stmt::Loop { .. }),
+            "`for {{ }}` is a loop"
+        );
         assert!(matches!(&statements[6], Stmt::Break { .. }));
         assert!(matches!(&statements[7], Stmt::Continue { .. }));
         assert!(matches!(
@@ -3236,7 +3412,3 @@ mod tests {
         );
     }
 }
-
-
-
-

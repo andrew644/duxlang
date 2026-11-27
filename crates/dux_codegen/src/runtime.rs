@@ -6,16 +6,18 @@
 //!
 //! Two default allocators are available:
 //!
-//! * the **debug allocator** heads every block with a live/dead magic word and
-//!   the payload size. Releasing checks the magic, so a double free or a
-//!   release of memory this allocator never handed out is caught at the point
-//!   of the bug instead of in a later crash. It counts live allocations and
-//!   bytes, and reports what is still live when the program exits.
+//! * the **debug allocator** maps every block with `mmap` and parks a guard
+//!   page immediately after the payload: a write past the end of a block hits
+//!   the guard and stops the program at once. Each block carries a header —
+//!   a live/dead magic word, the payload size, the mapping's base and extent —
+//!   so a release knows exactly what to hand back to `munmap`, and a magic
+//!   check or a lookup in the location table catches a double free and a
+//!   release of memory this allocator never handed out. Every allocation
+//!   lands in a location table — payload, size, and the `file:line` the call
+//!   site was written at — so the exit report names where each unreleased
+//!   block came from.
 //! * the **plain allocator** is a `malloc`/`free` wrapper used when the debug
 //!   allocator is off, so a release build pays nothing.
-//!
-//! Guard pages and a per-allocation location table are recorded as follow-ups
-//! in `roadmap.md`.
 
 use inkwell::builder::Builder;
 use inkwell::context::Context;
@@ -26,7 +28,13 @@ use inkwell::{AddressSpace, IntPredicate};
 
 const MAGIC_ALIVE: u64 = 0xA11C_0DE5_AFE0_0000;
 const MAGIC_DEAD: u64 = 0xDEAD_BEEF_0000_0000;
-const HEADER: u64 = 16;
+/// Magic, payload size, mapping base, mapping extent.
+const HEADER: u64 = 32;
+/// The page the guard is measured in: this build runs where 4096 is a page.
+const PAGE: u64 = 4096;
+/// Blocks the location table can hold. Past it allocations still run and
+/// still free, but the exit report can only give the tally, not the places.
+const TABLE_SLOTS: u64 = 16_384;
 const SIZE_MAX: u64 = u64::MAX;
 
 /// The allocation runtime of one generated module.
@@ -70,20 +78,56 @@ impl Runtime {
         );
         free.set_linkage(Linkage::Internal);
 
-        // The counters exist only for the debug allocator: a release build
-        // should not carry globals it never touches.
+        // The counters and the location table exist only for the debug
+        // allocator: a release build should not carry globals it never touches.
         let live = debug.then(|| counter(context, module, "dux.runtime.live"));
         let bytes = debug.then(|| counter(context, module, "dux.runtime.bytes"));
+        let table = debug.then(|| allocation_table(context, module));
+        let slots = debug.then(|| counter(context, module, "dux.runtime.table.next"));
+        let overflowed = debug.then(|| counter(context, module, "dux.runtime.table.full"));
         let malloc = declare(module, "malloc", ptr.fn_type(&[i64_type.into()], false));
         let libc_free = declare(
             module,
             "free",
             context.void_type().fn_type(&[ptr.into()], false),
         );
+        let mmap = declare(
+            module,
+            "mmap",
+            ptr.fn_type(
+                &[
+                    ptr.into(),
+                    i64_type.into(),
+                    context.i32_type().into(),
+                    context.i32_type().into(),
+                    context.i32_type().into(),
+                    i64_type.into(),
+                ],
+                false,
+            ),
+        );
+        let mprotect = declare(
+            module,
+            "mprotect",
+            context.i32_type().fn_type(
+                &[ptr.into(), i64_type.into(), context.i32_type().into()],
+                false,
+            ),
+        );
+        let munmap = declare(
+            module,
+            "munmap",
+            context
+                .i32_type()
+                .fn_type(&[ptr.into(), i64_type.into()], false),
+        );
         let oom = emit_oom(context, module, &builder);
         let trap = emit_trap(context, module, &builder);
 
-        emit_alloc(context, &builder, alloc, malloc, oom, live, bytes, debug);
+        emit_alloc(
+            context, &builder, alloc, malloc, mmap, mprotect, oom, table, slots, overflowed, live,
+            bytes, debug,
+        );
         let report = if debug {
             let (live, bytes) = (live.expect("counters"), bytes.expect("counters"));
             emit_free_debug(
@@ -91,11 +135,22 @@ impl Runtime {
                 module,
                 &builder,
                 free,
-                libc_free,
+                munmap,
+                table.expect("table"),
+                slots.expect("slots"),
+                overflowed.expect("overflowed"),
                 Some(live),
                 Some(bytes),
             );
-            Some(emit_report(context, module, &builder, live, bytes))
+            Some(emit_report(
+                context,
+                module,
+                &builder,
+                table.expect("table"),
+                slots.expect("slots"),
+                live,
+                bytes,
+            ))
         } else {
             emit_free_plain(context, &builder, free, libc_free);
             None
@@ -265,52 +320,236 @@ fn emit_alloc(
     builder: &Builder<'static>,
     alloc: FunctionValue<'static>,
     malloc: FunctionValue<'static>,
+    mmap: FunctionValue<'static>,
+    mprotect: FunctionValue<'static>,
     oom: FunctionValue<'static>,
+    table: Option<GlobalValue<'static>>,
+    slots: Option<GlobalValue<'static>>,
+    overflowed: Option<GlobalValue<'static>>,
     live: Option<GlobalValue<'static>>,
     bytes: Option<GlobalValue<'static>>,
     debug: bool,
 ) {
     let i64_type = context.i64_type();
+    let i32_type = context.i32_type();
     let entry = context.append_basic_block(alloc, "entry");
     let failed = context.append_basic_block(alloc, "failed");
     let body = context.append_basic_block(alloc, "body");
     builder.position_at_end(entry);
 
     let size = alloc.get_nth_param(1).unwrap().into_int_value();
-    let total = if debug {
+    let align = alloc.get_nth_param(2).unwrap().into_int_value();
+    let location = alloc.get_nth_param(3).unwrap().into_pointer_value();
+    if !debug {
+        let base = call_pointer(builder, malloc, &[size.into()], "block");
+        let null = builder.build_is_null(base, "null").expect("null");
         builder
-            .build_int_add(size, i64_type.const_int(HEADER, false), "total")
-            .expect("header")
-    } else {
-        size
-    };
-    let base = call_pointer(builder, malloc, &[total.into()], "block");
-    let null = builder.build_is_null(base, "null").expect("null");
+            .build_conditional_branch(null, failed, body)
+            .expect("branch");
+        builder.position_at_end(failed);
+        let _ = builder.build_call(oom, &[location.into()], "oom");
+        let _ = builder.build_unreachable();
+        builder.position_at_end(body);
+        builder.build_return(Some(&base)).expect("return");
+        return;
+    }
+
+    // The payload sits at the end of the writable region, flush against the
+    // guard page, so its size rounded up to at least a doubleword is what the
+    // mapping has to fit: rounding keeps the payload aligned to whatever the
+    // call site asked for.
+    let floor = i64_type.const_int(16, false);
+    let wide = builder
+        .build_int_compare(IntPredicate::UGE, align, floor, "wide")
+        .expect("wide");
+    let quantum = builder
+        .build_select(wide, align, floor, "quantum")
+        .expect("quantum")
+        .into_int_value();
+    let padded = builder
+        .build_int_add(size, quantum, "padded")
+        .expect("padded");
+    let one = i64_type.const_int(1, false);
+    let slop = builder.build_int_sub(padded, one, "slop").expect("slop");
+    let mask = builder.build_int_neg(quantum, "mask").expect("mask");
+    let room = builder.build_and(slop, mask, "room").expect("room");
+    let header = i64_type.const_int(HEADER, false);
+    let need = builder.build_int_add(room, header, "need").expect("need");
+    let page = i64_type.const_int(PAGE, false);
+    let page_slop = builder
+        .build_int_add(need, i64_type.const_int(PAGE - 1, false), "page slop")
+        .expect("page slop");
+    let page_mask = builder.build_int_neg(page, "page mask").expect("page mask");
+    let writable = builder
+        .build_and(page_slop, page_mask, "writable")
+        .expect("writable");
+    let extent = builder
+        .build_int_add(writable, page, "extent")
+        .expect("extent");
+
+    // mmap(null, extent, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0)
+    let map = call_pointer(
+        builder,
+        mmap,
+        &[
+            context
+                .ptr_type(AddressSpace::default())
+                .const_null()
+                .into(),
+            extent.into(),
+            i32_type.const_int(3, false).into(),
+            i32_type.const_int(0x22, false).into(),
+            i32_type.const_all_ones().into(),
+            i64_type.const_zero().into(),
+        ],
+        "mapping",
+    );
+    let bits = builder
+        .build_ptr_to_int(map, i64_type, "bits")
+        .expect("bits");
+    let refused = builder
+        .build_int_compare(IntPredicate::EQ, bits, i64_type.const_all_ones(), "refused")
+        .expect("refused");
     builder
-        .build_conditional_branch(null, failed, body)
+        .build_conditional_branch(refused, failed, body)
         .expect("branch");
 
     builder.position_at_end(failed);
-    let location = alloc.get_nth_param(3).unwrap();
     let _ = builder.build_call(oom, &[location.into()], "oom");
     let _ = builder.build_unreachable();
 
     builder.position_at_end(body);
-    if !debug {
-        builder.build_return(Some(&base)).expect("return");
-        return;
-    }
+    // mprotect(guard, PAGE, PROT_NONE) — the page after the payload is now a
+    // fault: an overrun stops the program where it happens.
+    let guard = unsafe {
+        builder
+            .build_gep(context.i8_type(), map, &[writable], "guard")
+            .expect("guard")
+    };
+    let _ = builder.build_call(
+        mprotect,
+        &[guard.into(), page.into(), i32_type.const_zero().into()],
+        "arm",
+    );
+    let back = builder.build_int_neg(room, "back").expect("back");
+    let memory = unsafe {
+        builder
+            .build_gep(context.i8_type(), guard, &[back], "memory")
+            .expect("memory")
+    };
+    let at_header = offset(builder, context, memory, SIZE_MAX - HEADER + 1, "header");
     builder
-        .build_store(base, i64_type.const_int(MAGIC_ALIVE, false))
+        .build_store(at_header, i64_type.const_int(MAGIC_ALIVE, false))
         .expect("magic");
     builder
-        .build_store(offset(builder, context, base, 8, "size"), size)
+        .build_store(offset(builder, context, at_header, 8, "size"), size)
         .expect("size");
-    bump(builder, context, live, i64_type.const_int(1, false), "live");
-    bump(builder, context, bytes, size, "bytes");
     builder
-        .build_return(Some(&offset(builder, context, base, HEADER, "memory")))
-        .expect("return");
+        .build_store(offset(builder, context, at_header, 16, "base"), map)
+        .expect("base");
+    builder
+        .build_store(offset(builder, context, at_header, 24, "extent"), extent)
+        .expect("extent");
+    record(
+        context, builder, table, slots, overflowed, memory, size, location,
+    );
+    bump(builder, context, live, one, "live");
+    bump(builder, context, bytes, size, "bytes");
+    builder.build_return(Some(&memory)).expect("return");
+}
+
+/// The location table's row shape: the payload, its size, and the
+/// `file:line` string of the allocation that made it.
+fn table_entry_type(context: &'static Context) -> StructType<'static> {
+    let ptr = context.ptr_type(AddressSpace::default());
+    context.struct_type(&[ptr.into(), context.i64_type().into(), ptr.into()], false)
+}
+
+fn allocation_table(context: &'static Context, module: &Module<'static>) -> GlobalValue<'static> {
+    let array = table_entry_type(context).array_type(TABLE_SLOTS as u32);
+    let global = module.add_global(array, None, "dux.runtime.table");
+    global.set_initializer(&array.const_zero());
+    global
+}
+
+fn slot_pointer(
+    context: &'static Context,
+    builder: &Builder<'static>,
+    table: GlobalValue<'static>,
+    slot: IntValue<'static>,
+    name: &str,
+) -> PointerValue<'static> {
+    let array = table_entry_type(context).array_type(TABLE_SLOTS as u32);
+    unsafe {
+        builder
+            .build_gep(
+                array,
+                table.as_pointer_value(),
+                &[context.i64_type().const_zero(), slot],
+                name,
+            )
+            .expect("row")
+    }
+}
+
+/// Note an allocation in the location table. A full table is recorded once
+/// and never blocks an allocation; it only costs the exit report its detail.
+#[allow(clippy::too_many_arguments)]
+fn record(
+    context: &'static Context,
+    builder: &Builder<'static>,
+    table: Option<GlobalValue<'static>>,
+    slots: Option<GlobalValue<'static>>,
+    overflowed: Option<GlobalValue<'static>>,
+    memory: PointerValue<'static>,
+    size: IntValue<'static>,
+    location: PointerValue<'static>,
+) {
+    let (Some(table), Some(slots), Some(overflowed)) = (table, slots, overflowed) else {
+        return;
+    };
+    let i64_type = context.i64_type();
+    let function = builder.get_insert_block().unwrap().get_parent().unwrap();
+    let insert = context.append_basic_block(function, "table.insert");
+    let overflow = context.append_basic_block(function, "table.overflow");
+    let beyond = context.append_basic_block(function, "table.beyond");
+    let current = read(builder, context, slots, "slot");
+    let spare = builder
+        .build_int_compare(
+            IntPredicate::ULT,
+            current,
+            i64_type.const_int(TABLE_SLOTS, false),
+            "spare",
+        )
+        .expect("spare");
+    builder
+        .build_conditional_branch(spare, insert, overflow)
+        .expect("branch");
+
+    builder.position_at_end(insert);
+    let row = slot_pointer(context, builder, table, current, "row");
+    builder.build_store(row, memory).expect("payload slot");
+    builder
+        .build_store(offset(builder, context, row, 8, "row size"), size)
+        .expect("size slot");
+    builder
+        .build_store(offset(builder, context, row, 16, "row place"), location)
+        .expect("location slot");
+    let successor = builder
+        .build_int_add(current, i64_type.const_int(1, false), "next slot")
+        .expect("next slot");
+    builder
+        .build_store(slots.as_pointer_value(), successor)
+        .expect("slot count");
+    builder.build_unconditional_branch(beyond).expect("beyond");
+
+    builder.position_at_end(overflow);
+    builder
+        .build_store(overflowed.as_pointer_value(), i64_type.const_int(1, false))
+        .expect("overflow flag");
+    builder.build_unconditional_branch(beyond).expect("beyond");
+
+    builder.position_at_end(beyond);
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -319,15 +558,22 @@ fn emit_free_debug(
     module: &Module<'static>,
     builder: &Builder<'static>,
     free: FunctionValue<'static>,
-    libc_free: FunctionValue<'static>,
+    munmap: FunctionValue<'static>,
+    table: GlobalValue<'static>,
+    slots: GlobalValue<'static>,
+    overflowed: GlobalValue<'static>,
     live: Option<GlobalValue<'static>>,
     bytes: Option<GlobalValue<'static>>,
 ) {
     let i64_type = context.i64_type();
     let entry = context.append_basic_block(free, "entry");
     let done = context.append_basic_block(free, "done");
-    let check = context.append_basic_block(free, "check");
+    let head = context.append_basic_block(free, "scan");
+    let advance = context.append_basic_block(free, "advance");
+    let unlisted = context.append_basic_block(free, "unlisted");
+    let in_band = context.append_basic_block(free, "in band");
     let bad = context.append_basic_block(free, "bad");
+    let erase = context.append_basic_block(free, "erase");
     let release = context.append_basic_block(free, "release");
     builder.position_at_end(entry);
     let memory = free.get_nth_param(1).unwrap().into_pointer_value();
@@ -335,12 +581,71 @@ fn emit_free_debug(
     // nothing has nothing to take back.
     let is_null = builder.build_is_null(memory, "null").expect("null");
     builder
-        .build_conditional_branch(is_null, done, check)
+        .build_conditional_branch(is_null, done, head)
         .expect("branch");
     builder.position_at_end(done);
     builder.build_return(None).expect("return");
 
-    builder.position_at_end(check);
+    // The location table is the authority on what is live: an unmapped
+    // block's header can be read by nothing, so the table — not memory
+    // behind the pointer — decides whether this pointer was handed out.
+    builder.position_at_end(head);
+    let slot = builder.build_phi(i64_type, "slot").expect("slot");
+    slot.add_incoming(&[(&i64_type.const_zero(), entry)]);
+    let row = slot_pointer(
+        context,
+        builder,
+        table,
+        slot.as_basic_value().into_int_value(),
+        "row",
+    );
+    let listed = builder
+        .build_load(context.ptr_type(AddressSpace::default()), row, "listed")
+        .expect("listed")
+        .into_pointer_value();
+    let hit = builder
+        .build_int_compare(IntPredicate::EQ, listed, memory, "hit")
+        .expect("hit");
+    builder
+        .build_conditional_branch(hit, erase, advance)
+        .expect("branch");
+
+    builder.position_at_end(advance);
+    let steps = builder
+        .build_int_add(
+            slot.as_basic_value().into_int_value(),
+            i64_type.const_int(1, false),
+            "steps",
+        )
+        .expect("steps");
+    let filled = read(builder, context, slots, "filled");
+    let more = builder
+        .build_int_compare(IntPredicate::ULT, steps, filled, "more")
+        .expect("more");
+    slot.add_incoming(&[(&steps, advance)]);
+    builder
+        .build_conditional_branch(more, head, unlisted)
+        .expect("branch");
+
+    // Not in the table: either the table filled and missed this block — then
+    // the header, which must be mapped for a live block, gets the last word —
+    // or this pointer never came from the allocator, or was already released.
+    // Either way the stale pointer is never read.
+    builder.position_at_end(unlisted);
+    let overflowing = read(builder, context, overflowed, "overflowing");
+    let hopeless = builder
+        .build_int_compare(
+            IntPredicate::EQ,
+            overflowing,
+            i64_type.const_zero(),
+            "hopeless",
+        )
+        .expect("hopeless");
+    builder
+        .build_conditional_branch(hopeless, bad, in_band)
+        .expect("branch");
+
+    builder.position_at_end(in_band);
     let header = offset(builder, context, memory, SIZE_MAX - HEADER + 1, "header");
     let magic = builder
         .build_load(i64_type, header, "magic")
@@ -367,7 +672,16 @@ fn emit_free_debug(
     );
     abort(context, module, builder);
 
+    builder.position_at_end(erase);
+    builder
+        .build_store(row, context.ptr_type(AddressSpace::default()).const_null())
+        .expect("erase");
+    builder
+        .build_unconditional_branch(release)
+        .expect("release");
+
     builder.position_at_end(release);
+    let header = offset(builder, context, memory, SIZE_MAX - HEADER + 1, "header");
     builder
         .build_store(header, i64_type.const_int(MAGIC_DEAD, false))
         .expect("poison");
@@ -379,9 +693,25 @@ fn emit_free_debug(
         )
         .expect("payload")
         .into_int_value();
+    let base = builder
+        .build_load(
+            context.ptr_type(AddressSpace::default()),
+            offset(builder, context, header, 16, "map base"),
+            "map base",
+        )
+        .expect("map base")
+        .into_pointer_value();
+    let extent = builder
+        .build_load(
+            i64_type,
+            offset(builder, context, header, 24, "map extent"),
+            "map extent",
+        )
+        .expect("map extent")
+        .into_int_value();
     drop_count(builder, context, live, i64_type.const_int(1, false), "live");
     drop_count(builder, context, bytes, payload, "bytes");
-    let _ = builder.build_call(libc_free, &[header.into()], "libc_free");
+    let _ = builder.build_call(munmap, &[base.into(), extent.into()], "munmap");
     builder.build_return(None).expect("return");
 }
 
@@ -402,10 +732,13 @@ fn emit_report(
     context: &'static Context,
     module: &Module<'static>,
     builder: &Builder<'static>,
+    table: GlobalValue<'static>,
+    slots: GlobalValue<'static>,
     live: GlobalValue<'static>,
     bytes: GlobalValue<'static>,
 ) -> FunctionValue<'static> {
-    // The report is only emitted when both counters exist.
+    // The report is only emitted when the location table and both counters
+    // exist.
     let report = module.add_function(
         "dux.runtime.report",
         context.void_type().fn_type(&[], false),
@@ -413,9 +746,89 @@ fn emit_report(
     );
     report.set_linkage(Linkage::Internal);
     let entry = context.append_basic_block(report, "entry");
+    let head = context.append_basic_block(report, "walk");
+    let say_row = context.append_basic_block(report, "say block");
+    let step = context.append_basic_block(report, "step");
+    let tally = context.append_basic_block(report, "tally");
     let say = context.append_basic_block(report, "say");
     let done = context.append_basic_block(report, "done");
+
+    // Every row the allocator still owns names itself: the tally alone says
+    // how much leaked, the table says from where.
     builder.position_at_end(entry);
+    let _ = builder.build_unconditional_branch(head);
+    builder.position_at_end(head);
+    let slot = builder.build_phi(context.i64_type(), "slot").expect("slot");
+    slot.add_incoming(&[(&context.i64_type().const_zero(), entry)]);
+    let row = slot_pointer(
+        context,
+        builder,
+        table,
+        slot.as_basic_value().into_int_value(),
+        "row",
+    );
+    let listed = builder
+        .build_load(context.ptr_type(AddressSpace::default()), row, "listed")
+        .expect("listed")
+        .into_pointer_value();
+    let gone = builder.build_is_null(listed, "gone").expect("gone");
+    builder
+        .build_conditional_branch(gone, step, say_row)
+        .expect("branch");
+
+    builder.position_at_end(say_row);
+    let payload_size = builder
+        .build_load(
+            context.i64_type(),
+            offset(builder, context, row, 8, "row payload"),
+            "row payload",
+        )
+        .expect("row payload");
+    let place = builder
+        .build_load(
+            context.ptr_type(AddressSpace::default()),
+            offset(builder, context, row, 16, "row place"),
+            "row place",
+        )
+        .expect("row place");
+    let where_format = builder
+        .build_global_string_ptr(
+            "dux:   leaked %lu bytes, allocated at %s\n",
+            "dux.leak.place",
+        )
+        .expect("place format")
+        .as_pointer_value();
+    let stderr = stream(context, module, builder, "stderr");
+    let _ = builder.build_call(
+        fprintf(context, module),
+        &[
+            stderr.into(),
+            where_format.into(),
+            payload_size.into(),
+            place.into(),
+        ],
+        "where",
+    );
+    let _ = builder.build_unconditional_branch(step);
+
+    builder.position_at_end(step);
+    let next = builder
+        .build_int_add(
+            slot.as_basic_value().into_int_value(),
+            context.i64_type().const_int(1, false),
+            "next",
+        )
+        .expect("next");
+    let filled = read(builder, context, slots, "filled");
+    let more = builder
+        .build_int_compare(IntPredicate::ULT, next, filled, "more")
+        .expect("more");
+    slot.add_incoming(&[(&next, step)]);
+    builder
+        .build_conditional_branch(more, head, tally)
+        .expect("branch");
+
+    builder.position_at_end(tally);
     let live_now = read(builder, context, live, "live");
     let clean = builder
         .build_int_compare(
@@ -428,7 +841,6 @@ fn emit_report(
     builder
         .build_conditional_branch(clean, done, say)
         .expect("branch");
-
     builder.position_at_end(say);
     let leaks = read(builder, context, live, "leaks");
     let trailing = read(builder, context, bytes, "trailing");

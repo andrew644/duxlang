@@ -22,16 +22,19 @@ each remaining gap is waiting for. A gap is a milestone, never a verdict.
 - **Concatenation temporaries are not reclaimed.** `a + b` and `$"{a} {b}"`
   allocate from the context, and only what is bound can be `del`'d. An arena
   behind the context — which is what the context is *for* — reclaims them in a
-  block; the malloc-backed debug allocator reports them at exit instead.
-- **No guard pages, no allocation table.** The debug allocator catches a
-  double free and reports what is still live at exit, but a wild pointer that
-  happens to look like one of ours is not caught, and the leak report gives a
-  count rather than the locations that leaked. Guard pages and a per-block
-  location table wait on the same milestone as the panic runtime.
-- **One trap, and it is the compiler's own.** A `match` whose arms could all
+  block; the debug allocator reports them at exit instead.
+- **Guard pages guard the tail.** The debug allocator maps every block flush
+  against a guard page, so a write past the end of a block faults where it
+  happens; a double free is caught against the per-block location table, and
+  the exit report names the `file:line` each unreleased block was allocated
+  at. A wild write *before* a block still lands in that block's own header,
+  and a program holding more than 16 384 blocks live at once loses the
+  per-location leak lines while keeping the tally.
+- **A trap stops the program with a message.** A `match` whose arms could all
   decline — which the checker rules out, so it means a bug — stops the program
-  with `dux: no \`match\` arm matched`. `panic`, `unwrap` and the debug-mode
-  bounds check wait on the same runtime as their messages.
+  with `dux: no \`match\` arm matched`; a debug-mode bounds check uses the same
+  trap and names the `file:line` the index was written at. `panic` and
+  `unwrap` still wait on that runtime for their own messages.
 - **A sum type is not printable yet.** A `$".."` hole takes numbers, `bool`s,
   text, pointers and records (a record says itself field by field, since the
   compiler knows its shape); a variant prints nothing until the prelude gives
@@ -111,14 +114,16 @@ each remaining gap is waiting for. A gap is a milestone, never a verdict.
   `Shape::Circle` of a module's own enum through the module's name, and the
   `std/..` files, which are ordinary modules now: `math.sqrt`, `fmt.println`
   and `strings.less` are what an `import "std/.."` brings.
-- **No bounds traps.** `dims[i]` is unchecked; the debug-mode bounds check
-  waits on the panic runtime.
-- **`defer` belongs to a function body or to a plain block.** A `{ .. }` block
-  fires what it captured, most recent first, on the way out; a `return` replays
-  the whole chain along its own path and leaves the stack standing for the paths
-  that did not return. A `defer` written in an `if` branch or a loop body still
-  reports E0007 honestly, and so does leaving a loop body with deferred work
-  pending.
+- **Bounds checks are for debug builds.** `xs[i]`, a string byte and a
+  `from..to` range are checked against the view's count in a debug build and
+  trap at the place the index was written; `--release` pays nothing, and
+  `-bounds-check=on|off|auto` says which.
+- **`defer` belongs to the block that wrote it.** A block — a function body,
+  a plain `{ .. }`, an `if` branch, a `match` arm, a loop body — owns what it
+  captured, fires it most recent first on the way out, and a `break` or a
+  `continue` leaving a loop body fires that body's defers before it goes. A
+  `return` replays the whole chain along its own path and leaves the stack
+  standing for the paths that did not return.
 - **A fixed array is not a parameter.** A result crosses the boundary whole:
   the callee reads the array out of wherever it was standing, the caller
   builds it standing in a slot of its own, so `zeros<4>() -> [f32; N]` answers

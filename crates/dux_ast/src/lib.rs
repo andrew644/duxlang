@@ -11,7 +11,10 @@ pub struct Ident {
 
 impl Ident {
     pub fn new(name: impl Into<String>, span: Span) -> Self {
-        Self { name: name.into(), span }
+        Self {
+            name: name.into(),
+            span,
+        }
     }
 }
 
@@ -159,7 +162,12 @@ impl BinaryOp {
     pub fn is_comparison(self) -> bool {
         matches!(
             self,
-            BinaryOp::Eq | BinaryOp::NotEq | BinaryOp::Lt | BinaryOp::Gt | BinaryOp::Le | BinaryOp::Ge
+            BinaryOp::Eq
+                | BinaryOp::NotEq
+                | BinaryOp::Lt
+                | BinaryOp::Gt
+                | BinaryOp::Le
+                | BinaryOp::Ge
         )
     }
 
@@ -187,13 +195,32 @@ impl BinaryOp {
 /// the checker knows whether the name names a variant.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Pattern {
-    Wildcard { span: Span },
+    Wildcard {
+        span: Span,
+    },
     /// The `else =>` tail, which matches whatever is left.
-    Else { span: Span },
-    Name { name: Ident, span: Span },
-    Literal { value: Box<Expr>, span: Span },
-    Path { qualifier: String, name: String, span: Span },
-    Tuple { qualifier: Option<String>, name: String, elements: Vec<Pattern>, span: Span },
+    Else {
+        span: Span,
+    },
+    Name {
+        name: Ident,
+        span: Span,
+    },
+    Literal {
+        value: Box<Expr>,
+        span: Span,
+    },
+    Path {
+        qualifier: String,
+        name: String,
+        span: Span,
+    },
+    Tuple {
+        qualifier: Option<String>,
+        name: String,
+        elements: Vec<Pattern>,
+        span: Span,
+    },
     Struct {
         qualifier: Option<String>,
         name: String,
@@ -207,8 +234,13 @@ pub enum Pattern {
         inclusive: bool,
         span: Span,
     },
-    Or { alternatives: Vec<Pattern>, span: Span },
-    Error { span: Span },
+    Or {
+        alternatives: Vec<Pattern>,
+        span: Span,
+    },
+    Error {
+        span: Span,
+    },
 }
 
 impl Pattern {
@@ -232,7 +264,9 @@ impl Pattern {
         match self {
             Pattern::Name { name, .. } => vec![name.clone()],
             Pattern::Tuple { elements, .. } => elements.iter().flat_map(Self::binders).collect(),
-            Pattern::Struct { fields, .. } => fields.iter().flat_map(FieldPattern::binders).collect(),
+            Pattern::Struct { fields, .. } => {
+                fields.iter().flat_map(FieldPattern::binders).collect()
+            }
             Pattern::Or { alternatives, .. } => {
                 let mut names = Vec::new();
                 for alternative in alternatives {
@@ -259,7 +293,11 @@ pub enum FieldPattern {
     /// `{ w, h }`: the field is bound to a name of its own.
     Shorthand { name: Ident, span: Span },
     /// `{ w: Pattern::Literal(..) }`: the field is matched against a pattern.
-    Nested { name: Ident, pattern: Box<Pattern>, span: Span },
+    Nested {
+        name: Ident,
+        pattern: Box<Pattern>,
+        span: Span,
+    },
 }
 
 impl FieldPattern {
@@ -306,15 +344,46 @@ pub struct MatchArm {
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum Expr {
-    Int { value: u128, span: Span },
-    Float { value: f64, span: Span },
-    Str { text: String, kind: StrKind, span: Span },
-    Char { value: char, span: Span },
-    Bool { value: bool, span: Span },
-    Ident { name: String, span: Span },
-    Call { callee: Box<Expr>, args: Vec<Expr>, span: Span },
-    Field { base: Box<Expr>, name: Ident, span: Span },
-    Index { base: Box<Expr>, index: Box<Expr>, span: Span },
+    Int {
+        value: u128,
+        span: Span,
+    },
+    Float {
+        value: f64,
+        span: Span,
+    },
+    Str {
+        text: String,
+        kind: StrKind,
+        span: Span,
+    },
+    Char {
+        value: char,
+        span: Span,
+    },
+    Bool {
+        value: bool,
+        span: Span,
+    },
+    Ident {
+        name: String,
+        span: Span,
+    },
+    Call {
+        callee: Box<Expr>,
+        args: Vec<Expr>,
+        span: Span,
+    },
+    Field {
+        base: Box<Expr>,
+        name: Ident,
+        span: Span,
+    },
+    Index {
+        base: Box<Expr>,
+        index: Box<Expr>,
+        span: Span,
+    },
     Range {
         start: Option<Box<Expr>>,
         end: Option<Box<Expr>>,
@@ -386,14 +455,35 @@ pub enum Expr {
         value: Box<Expr>,
         span: Span,
     },
-    Unary { op: UnaryOp, operand: Box<Expr>, span: Span },
-    Binary { op: BinaryOp, lhs: Box<Expr>, rhs: Box<Expr>, span: Span },
-    Cast { value: Box<Expr>, target: Type, span: Span },
+    Unary {
+        op: UnaryOp,
+        operand: Box<Expr>,
+        span: Span,
+    },
+    Binary {
+        op: BinaryOp,
+        lhs: Box<Expr>,
+        rhs: Box<Expr>,
+        span: Span,
+    },
+    Cast {
+        value: Box<Expr>,
+        target: Type,
+        span: Span,
+    },
     /// `x?`: a `Result` or `Option` unwrapped where it stands, the failure
     /// case handed back by the enclosing function.
-    Try { operand: Box<Expr>, span: Span },
-    Paren { inner: Box<Expr>, span: Span },
-    Error { span: Span },
+    Try {
+        operand: Box<Expr>,
+        span: Span,
+    },
+    Paren {
+        inner: Box<Expr>,
+        span: Span,
+    },
+    Error {
+        span: Span,
+    },
 }
 
 impl Expr {
@@ -793,10 +883,13 @@ impl Program {
     }
 
     pub fn methods(&self) -> impl Iterator<Item = &FnDecl> {
-        self.decls.iter().filter_map(|decl| match decl {
-            Decl::Impl(impl_block) => Some(impl_block.methods.iter()),
-            _ => None,
-        }).flatten()
+        self.decls
+            .iter()
+            .filter_map(|decl| match decl {
+                Decl::Impl(impl_block) => Some(impl_block.methods.iter()),
+                _ => None,
+            })
+            .flatten()
     }
 
     pub fn structs(&self) -> impl Iterator<Item = &StructDecl> {

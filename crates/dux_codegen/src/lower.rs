@@ -5790,11 +5790,7 @@ impl Emitter {
     /// A lead whose continuations are missing writes the replacement rune and
     /// steps one byte; a stray continuation byte belongs to no rune on its
     /// own and steps silently.
-    fn decode_runes(
-        &mut self,
-        at: PointerValue<'static>,
-        span: Span,
-    ) -> Option<Typed> {
+    fn decode_runes(&mut self, at: PointerValue<'static>, span: Span) -> Option<Typed> {
         let text = self.load(DuxType::Str, at)?;
         let (data, length) = self.slice_parts(text)?;
         let i64_type = self.context.i64_type();
@@ -5835,14 +5831,16 @@ impl Emitter {
             .ok()?
             .into_int_value();
         let byte_at = |this: &mut Self, position: IntValue<'static>, name: &str| {
-            unsafe { this.builder.build_gep(i8_type, data, &[position], name) }.ok().map(|cell| {
-                let byte = this.builder.build_load(i8_type, cell, name).ok()?;
-                Some(
-                    this.builder
-                        .build_int_cast(byte.into_int_value(), i64_type, "wide")
-                        .ok()?,
-                )
-            })
+            unsafe { this.builder.build_gep(i8_type, data, &[position], name) }
+                .ok()
+                .map(|cell| {
+                    let byte = this.builder.build_load(i8_type, cell, name).ok()?;
+                    Some(
+                        this.builder
+                            .build_int_cast(byte.into_int_value(), i64_type, "wide")
+                            .ok()?,
+                    )
+                })
         };
         let lead = byte_at(self, here, "byte")??;
         let mask = |this: &mut Self, value: IntValue<'static>, bits: u64| {
@@ -5852,7 +5850,12 @@ impl Emitter {
         };
         let ascii = self
             .builder
-            .build_int_compare(IntPredicate::ULT, lead, i64_type.const_int(0x80, false), "ascii")
+            .build_int_compare(
+                IntPredicate::ULT,
+                lead,
+                i64_type.const_int(0x80, false),
+                "ascii",
+            )
             .ok()?;
         let one = self.new_block("runes.one");
         let checks = self.new_block("runes.checks");
@@ -5864,7 +5867,12 @@ impl Emitter {
         let two_head = mask(self, lead, 0xE0)?;
         let is_two = self
             .builder
-            .build_int_compare(IntPredicate::EQ, two_head, i64_type.const_int(0xC0, false), "two")
+            .build_int_compare(
+                IntPredicate::EQ,
+                two_head,
+                i64_type.const_int(0xC0, false),
+                "two",
+            )
             .ok()?;
         let two = self.new_block("runes.two");
         let three_checks = self.new_block("runes.three.checks");
@@ -5876,7 +5884,12 @@ impl Emitter {
         let three_head = mask(self, lead, 0xF0)?;
         let is_three = self
             .builder
-            .build_int_compare(IntPredicate::EQ, three_head, i64_type.const_int(0xE0, false), "three")
+            .build_int_compare(
+                IntPredicate::EQ,
+                three_head,
+                i64_type.const_int(0xE0, false),
+                "three",
+            )
             .ok()?;
         let three = self.new_block("runes.three");
         let four_checks = self.new_block("runes.four.checks");
@@ -5888,7 +5901,12 @@ impl Emitter {
         let four_head = mask(self, lead, 0xF8)?;
         let is_four = self
             .builder
-            .build_int_compare(IntPredicate::EQ, four_head, i64_type.const_int(0xF0, false), "four")
+            .build_int_compare(
+                IntPredicate::EQ,
+                four_head,
+                i64_type.const_int(0xF0, false),
+                "four",
+            )
             .ok()?;
         let four = self.new_block("runes.four");
         let stray = self.new_block("runes.stray");
@@ -5903,7 +5921,12 @@ impl Emitter {
         let stray_head = mask(self, lead, 0xC0)?;
         let is_stray = self
             .builder
-            .build_int_compare(IntPredicate::EQ, stray_head, i64_type.const_int(0x80, false), "stray")
+            .build_int_compare(
+                IntPredicate::EQ,
+                stray_head,
+                i64_type.const_int(0x80, false),
+                "stray",
+            )
             .ok()?;
         let skip = self.new_block("runes.skip");
         let bogus = self.new_block("runes.bogus");
@@ -5918,7 +5941,8 @@ impl Emitter {
                     .build_load(i64_type, written, "written")
                     .ok()?
                     .into_int_value();
-                let cell = unsafe { this.builder.build_gep(i32_type, buffer, &[count], "slot") }.ok()?;
+                let cell =
+                    unsafe { this.builder.build_gep(i32_type, buffer, &[count], "slot") }.ok()?;
                 let small = this
                     .builder
                     .build_int_truncate(rune, i32_type, "rune")
@@ -6014,7 +6038,11 @@ impl Emitter {
             .ok()?;
         let rune = self
             .builder
-            .build_or(self.builder.build_or(high, middle, "rune").ok()?, low, "rune")
+            .build_or(
+                self.builder.build_or(high, middle, "rune").ok()?,
+                low,
+                "rune",
+            )
             .ok()?;
         step(self, Some(rune), 3)?;
         self.builder.position_at_end(bail);
@@ -6432,10 +6460,8 @@ impl Emitter {
                 .collect::<Vec<_>>()
                 .join(", ")
         );
-        let fields: Vec<BasicTypeEnum<'static>> = elems
-            .iter()
-            .map(|ty| ty.llvm(self.context))
-            .collect();
+        let fields: Vec<BasicTypeEnum<'static>> =
+            elems.iter().map(|ty| ty.llvm(self.context)).collect();
         let llvm = self.context.struct_type(&fields, false);
         let info: &'static TupleInfo = Box::leak(Box::new(TupleInfo {
             spelled,
@@ -6540,7 +6566,10 @@ impl Emitter {
             return None;
         };
         let slot = self.alloca(ty, "tuple");
-        let _ = self.builder.build_store(slot, info.llvm.const_zero()).ok()?;
+        let _ = self
+            .builder
+            .build_store(slot, info.llvm.const_zero())
+            .ok()?;
         for (index, value) in values.iter().enumerate() {
             let at = self.tuple_field_address(info, slot, index as u32)?;
             match (info.elems[index].array_info(), value.core) {
@@ -6615,7 +6644,10 @@ impl Emitter {
             self.diagnostics.push(
                 Diagnostic::error(
                     code::TYPE_MISMATCH,
-                    format!("`?` cannot hand a `{}` back from this function", answer.name()),
+                    format!(
+                        "`?` cannot hand a `{}` back from this function",
+                        answer.name()
+                    ),
                 )
                 .with_span(span),
             );
@@ -10239,7 +10271,10 @@ fn typed_of(value: BasicValueEnum<'static>, ty: DuxType) -> Typed {
         Typed::pointer(value.into_pointer_value(), ty)
     } else if ty == DuxType::Str
         || ty.slice_element().is_some()
-        || matches!(ty, DuxType::Struct(_) | DuxType::Enum(_) | DuxType::Tuple(_))
+        || matches!(
+            ty,
+            DuxType::Struct(_) | DuxType::Enum(_) | DuxType::Tuple(_)
+        )
     {
         Typed {
             core: Core::Aggregate(value.into_struct_value()),

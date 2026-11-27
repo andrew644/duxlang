@@ -1,9 +1,5 @@
 # TODO
 
-## Language gaps (the compiler refuses these today, usually with E0007)
-
-- [ ] Debug allocator: guard pages and a per-block allocation location table (M3 gap)
-
 ## C interop (M6 "remaining: reported, none silent")
 
 - [ ] Import `long double` as `c_long_double`

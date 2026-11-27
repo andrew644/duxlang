@@ -10,11 +10,11 @@
 
 use std::collections::{HashMap, HashSet};
 
-use dux_ast::{
-    AssignOp, BinaryOp, Block, Decl, Expr, FieldPattern, ForKind, ImplDecl, MatchArm, Pattern,
-    Param, Program, Stmt, Type, TypeAliasDecl, UnaryOp,
-};
 use crate::sums::{self, Payload, Shape};
+use dux_ast::{
+    AssignOp, BinaryOp, Block, Decl, Expr, FieldPattern, ForKind, ImplDecl, MatchArm, Param,
+    Pattern, Program, Stmt, Type, TypeAliasDecl, UnaryOp,
+};
 
 /// A variant's payload once an instantiation has filled it in.
 use dux_diag::code;
@@ -116,10 +116,16 @@ pub enum Ty {
     Struct(String),
     /// A declared `enum`, with the arguments it was made of: `Shape` carries
     /// none, `Option<i32>` carries the one. Nominal, like a record.
-    Enum { name: String, args: Vec<Ty> },
+    Enum {
+        name: String,
+        args: Vec<Ty>,
+    },
     /// A generic `struct` made concrete: `Pair<i32, string>`. Nominal like a
     /// record, and the arguments say what its fields were filled with.
-    Instance { name: String, args: Vec<Ty> },
+    Instance {
+        name: String,
+        args: Vec<Ty>,
+    },
     /// `return`, `break`, `panic`: a value that cannot arrive, so an arm that
     /// ends in one has whatever type the other arms agree on (DESIGN 4.5).
     Never,
@@ -254,9 +260,7 @@ impl Ty {
                 }
             }
             Ty::FloatConst(_) => Ty::F64,
-            Ty::Tuple(elements) => {
-                Ty::Tuple(elements.iter().map(Ty::defaulted).collect())
-            }
+            Ty::Tuple(elements) => Ty::Tuple(elements.iter().map(Ty::defaulted).collect()),
             other => other.clone(),
         }
     }
@@ -454,7 +458,10 @@ impl Coverage {
                 span,
                 Diagnostic::error(
                     code::NON_EXHAUSTIVE,
-                    format!("a `match` on a `{}` needs an arm for every value", subject.name()),
+                    format!(
+                        "a `match` on a `{}` needs an arm for every value",
+                        subject.name()
+                    ),
                 )
                 .with_note("add a `_ =>` arm for whatever the others leave"),
             );
@@ -715,7 +722,12 @@ impl<'a> Checker<'a> {
                         );
                     }
                 }
-                Decl::TypeAlias(TypeAliasDecl { name, type_params, aliased, .. }) => {
+                Decl::TypeAlias(TypeAliasDecl {
+                    name,
+                    type_params,
+                    aliased,
+                    ..
+                }) => {
                     if type_params.is_empty() {
                         self.aliases.insert(named(&name.name), aliased.clone());
                     }
@@ -888,9 +900,12 @@ impl<'a> Checker<'a> {
             Type::Slice { element, .. } => {
                 Ty::Slice(Box::new(self.resolve_type_in(element, depth + 1, params)))
             }
-            Type::Tuple { elements, .. } => {
-                Ty::Tuple(elements.iter().map(|element| self.resolve_type_in(element, depth + 1, params)).collect())
-            }
+            Type::Tuple { elements, .. } => Ty::Tuple(
+                elements
+                    .iter()
+                    .map(|element| self.resolve_type_in(element, depth + 1, params))
+                    .collect(),
+            ),
             Type::Function { .. } | Type::ConstArgument { .. } => Ty::Opaque,
             Type::Error { .. } => Ty::Opaque,
         }
@@ -924,7 +939,11 @@ impl<'a> Checker<'a> {
             for (param, ty) in record.params.iter().zip(&made_of) {
                 self.instantiation.push((param.clone(), ty.clone()));
             }
-        } else if let Some(Ty::Instance { name: owner, args: known }) = expected {
+        } else if let Some(Ty::Instance {
+            name: owner,
+            args: known,
+        }) = expected
+        {
             if owner == name && known.len() == record.params.len() {
                 for (param, ty) in record.params.iter().zip(known) {
                     made_of.push(ty.clone());
@@ -1067,13 +1086,7 @@ impl<'a> Checker<'a> {
     /// One declared parameter type against what the call passed, binding the
     /// parameters that type mentions. A literal has not chosen a type yet, so
     /// it adopts its default (D17).
-    fn fill(
-        &self,
-        params: &[String],
-        declared: &Type,
-        seen: &Ty,
-        bound: &mut Vec<(String, Ty)>,
-    ) {
+    fn fill(&self, params: &[String], declared: &Type, seen: &Ty, bound: &mut Vec<(String, Ty)>) {
         let seen = seen.defaulted();
         let asks = |name: &str| {
             params.iter().any(|param| param == name)
@@ -1132,7 +1145,14 @@ impl<'a> Checker<'a> {
             .as_ref()
             .map(|ty| self.resolve_type(ty))
             .unwrap_or(Ty::Unit);
-        self.read_body(&declaration.params, &result, &declaration.body, &asked, name, span);
+        self.read_body(
+            &declaration.params,
+            &result,
+            &declaration.body,
+            &asked,
+            name,
+            span,
+        );
     }
 
     /// Read a body once in the types one thing asked it to be, so a body that
@@ -1159,7 +1179,13 @@ impl<'a> Checker<'a> {
         let said: Vec<(&'static str, String, u32)> = self
             .diagnostics
             .iter()
-            .map(|done| (done.code, done.message.clone(), done.span.map_or(0, |s| s.start)))
+            .map(|done| {
+                (
+                    done.code,
+                    done.message.clone(),
+                    done.span.map_or(0, |s| s.start),
+                )
+            })
             .collect();
         let saved_result = std::mem::replace(&mut self.result, result);
         let saved_main = std::mem::replace(&mut self.in_main, false);
@@ -1181,7 +1207,9 @@ impl<'a> Checker<'a> {
         let mut fresh = self.diagnostics.split_off(mark);
         fresh.retain(|late| {
             !said.iter().any(|(code, message, start)| {
-                late.code == *code && late.message == *message && late.span.map_or(0, |s| s.start) == *start
+                late.code == *code
+                    && late.message == *message
+                    && late.span.map_or(0, |s| s.start) == *start
             })
         });
         self.diagnostics.extend(fresh);
@@ -1201,7 +1229,11 @@ impl<'a> Checker<'a> {
 
     fn define(&mut self, name: &str, ty: Ty, is_const: bool) {
         if let Some(scope) = self.scopes.last_mut() {
-            scope.push(Context { name: name.to_string(), ty, is_const });
+            scope.push(Context {
+                name: name.to_string(),
+                ty,
+                is_const,
+            });
         }
     }
 
@@ -1240,7 +1272,8 @@ impl<'a> Checker<'a> {
                     Ty::Enum {
                         name: outer,
                         args: outer_args,
-                    } if (outer == "Result" || outer.ends_with("::Result")) && outer_args.len() == 2 =>
+                    } if (outer == "Result" || outer.ends_with("::Result"))
+                        && outer_args.len() == 2 =>
                     {
                         let wants = &outer_args[1];
                         if wants != error && *wants != Ty::Opaque && *error != Ty::Opaque {
@@ -1271,9 +1304,11 @@ impl<'a> Checker<'a> {
                 if (name.as_str() == "Option" || name.ends_with("::Option")) && args.len() == 1 =>
             {
                 match &self.result {
-                    Ty::Enum { name: outer, args: outer_args }
-                        if (outer == "Option" || outer.ends_with("::Option"))
-                            && outer_args.len() == 1 =>
+                    Ty::Enum {
+                        name: outer,
+                        args: outer_args,
+                    } if (outer == "Option" || outer.ends_with("::Option"))
+                        && outer_args.len() == 1 =>
                     {
                         args[0].clone()
                     }
@@ -1549,7 +1584,11 @@ impl<'a> Checker<'a> {
 
     fn condition_operand(&mut self, operand: &Expr, symbol: &str) {
         let ty = self.infer(operand);
-        self.require_bool(ty, operand.span(), &format!("`{symbol}` needs `bool` operands"));
+        self.require_bool(
+            ty,
+            operand.span(),
+            &format!("`{symbol}` needs `bool` operands"),
+        );
     }
 
     fn require_bool(&mut self, ty: Ty, span: Span, context: &str) {
@@ -1603,13 +1642,9 @@ impl<'a> Checker<'a> {
             );
             return Ty::Opaque;
         }
-        if matches!(
-            left,
-            Ty::Struct(_) | Ty::Instance { .. } | Ty::Array(_)
-        ) || matches!(
-            right,
-            Ty::Struct(_) | Ty::Instance { .. } | Ty::Array(_)
-        ) {
+        if matches!(left, Ty::Struct(_) | Ty::Instance { .. } | Ty::Array(_))
+            || matches!(right, Ty::Struct(_) | Ty::Instance { .. } | Ty::Array(_))
+        {
             if !op.is_comparison() {
                 self.error(
                     code::TYPE_MISMATCH,
@@ -1633,11 +1668,7 @@ impl<'a> Checker<'a> {
             let bad = if !left.is_numeric() { left } else { right };
             self.error(
                 code::TYPE_MISMATCH,
-                format!(
-                    "there is no `{}` on `{}` values",
-                    symbol(op),
-                    bad.name()
-                ),
+                format!("there is no `{}` on `{}` values", symbol(op), bad.name()),
                 span,
             );
             return Ty::Opaque;
@@ -1655,7 +1686,11 @@ impl<'a> Checker<'a> {
             return Ty::Bool;
         }
         if left == Ty::Bool || right == Ty::Bool {
-            self.error(code::TYPE_MISMATCH, "there is no arithmetic on `bool` values", span);
+            self.error(
+                code::TYPE_MISMATCH,
+                "there is no arithmetic on `bool` values",
+                span,
+            );
             return Ty::Opaque;
         }
         if op == BinaryOp::Mod && common.is_float() {
@@ -1697,7 +1732,8 @@ impl<'a> Checker<'a> {
         let same_target = left == right || left == Ty::Ptr || right == Ty::Ptr;
         match op {
             BinaryOp::Add | BinaryOp::Sub
-                if (left.is_pointer() && numeric(&right)) || (numeric(&left) && right.is_pointer()) =>
+                if (left.is_pointer() && numeric(&right))
+                    || (numeric(&left) && right.is_pointer()) =>
             {
                 if !left.is_pointer() {
                     return right.clone();
@@ -1764,12 +1800,20 @@ impl<'a> Checker<'a> {
         }
         if a.is_float() || b.is_float() {
             if a.is_float() && b.is_float() {
-                return if a.width() >= b.width() { a.clone() } else { b.clone() };
+                return if a.width() >= b.width() {
+                    a.clone()
+                } else {
+                    b.clone()
+                };
             }
             return Ty::F64;
         }
         if a.is_signed() == b.is_signed() {
-            return if a.width() >= b.width() { a.clone() } else { b.clone() };
+            return if a.width() >= b.width() {
+                a.clone()
+            } else {
+                b.clone()
+            };
         }
         let (unsigned, signed) = if a.is_signed() { (b, a) } else { (a, b) };
         for width in [8u32, 16, 32, 64] {
@@ -1975,16 +2019,19 @@ impl<'a> Checker<'a> {
         let Some((_, payload)) = shape.variant(variant).map(|(i, p)| (i, p.clone())) else {
             self.report(
                 span,
-                Diagnostic::error(code::UNDECLARED, format!("`{owner}` has no variant `{variant}`"))
-                    .with_note(format!(
-                        "the variants of `{owner}` are {}",
-                        shape
-                            .variants
-                            .iter()
-                            .map(|(name, _)| format!("{owner}::{name}"))
-                            .collect::<Vec<_>>()
-                            .join(", ")
-                    )),
+                Diagnostic::error(
+                    code::UNDECLARED,
+                    format!("`{owner}` has no variant `{variant}`"),
+                )
+                .with_note(format!(
+                    "the variants of `{owner}` are {}",
+                    shape
+                        .variants
+                        .iter()
+                        .map(|(name, _)| format!("{owner}::{name}"))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )),
             );
             for argument in args {
                 let _ = self.infer(argument);
@@ -2160,12 +2207,7 @@ impl<'a> Checker<'a> {
     }
 
     /// The fields a struct-payload variant declares, resolved the same way.
-    fn payload_fields(
-        &self,
-        shape: &Shape,
-        args: &[Ty],
-        payload: &Payload,
-    ) -> Vec<(String, Ty)> {
+    fn payload_fields(&self, shape: &Shape, args: &[Ty], payload: &Payload) -> Vec<(String, Ty)> {
         let bindings: Vec<(String, Ty)> = shape
             .params
             .iter()
@@ -2274,9 +2316,7 @@ impl<'a> Checker<'a> {
                 None => Cover::Whole,
             },
             Pattern::Path { name, .. } => Cover::one(name, Cover::Whole),
-            Pattern::Tuple {
-                name, elements, ..
-            } => {
+            Pattern::Tuple { name, elements, .. } => {
                 let inside = match (self.payload_tree(subject, name), elements.as_slice()) {
                     (Some(payload), [one]) => self.cover_of(one, &payload),
                     _ => Cover::Whole,
@@ -2329,27 +2369,29 @@ impl<'a> Checker<'a> {
                 }
                 covers
             }
-            Pattern::Name { name, span } => {
-                match self.enum_variant_of(subject, &name.name) {
-                    Some(true) => false,
-                    Some(false) => {
-                        self.error(
-                            code::TYPE_MISMATCH,
-                            format!(
-                                "`{}` carries a payload: write `{}(..)` to take it apart",
-                                name.name, name.name
-                            ),
-                            *span,
-                        );
-                        false
-                    }
-                    None => {
-                        self.define(&name.name, subject.clone(), false);
-                        true
-                    }
+            Pattern::Name { name, span } => match self.enum_variant_of(subject, &name.name) {
+                Some(true) => false,
+                Some(false) => {
+                    self.error(
+                        code::TYPE_MISMATCH,
+                        format!(
+                            "`{}` carries a payload: write `{}(..)` to take it apart",
+                            name.name, name.name
+                        ),
+                        *span,
+                    );
+                    false
                 }
-            }
-            Pattern::Path { qualifier, name, span } => {
+                None => {
+                    self.define(&name.name, subject.clone(), false);
+                    true
+                }
+            },
+            Pattern::Path {
+                qualifier,
+                name,
+                span,
+            } => {
                 let Some((_, _, payload)) =
                     self.variant_of_pattern(Some(qualifier), name, subject, *span)
                 else {
@@ -2531,16 +2573,19 @@ impl<'a> Checker<'a> {
         let Some(payload) = shape.variant(variant).map(|(_, payload)| payload.clone()) else {
             self.report(
                 span,
-                Diagnostic::error(code::UNDECLARED, format!("`{owner}` has no variant `{variant}`"))
-                    .with_note(format!(
-                        "the variants of `{owner}` are {}",
-                        shape
-                            .variants
-                            .iter()
-                            .map(|(name, _)| format!("{owner}::{name}"))
-                            .collect::<Vec<_>>()
-                            .join(", ")
-                    )),
+                Diagnostic::error(
+                    code::UNDECLARED,
+                    format!("`{owner}` has no variant `{variant}`"),
+                )
+                .with_note(format!(
+                    "the variants of `{owner}` are {}",
+                    shape
+                        .variants
+                        .iter()
+                        .map(|(name, _)| format!("{owner}::{name}"))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )),
             );
             return None;
         };
@@ -2598,7 +2643,9 @@ impl<'a> Checker<'a> {
             Expr::Int { value, .. } => {
                 let value = *value as i128;
                 match expected {
-                    Some(to) if (to.is_integral() || *to == Ty::Bool) && to.fits(value) => to.clone(),
+                    Some(to) if (to.is_integral() || *to == Ty::Bool) && to.fits(value) => {
+                        to.clone()
+                    }
                     Some(Ty::Opaque) => Ty::Opaque,
                     _ => Ty::IntConst(value),
                 }
@@ -2626,7 +2673,8 @@ impl<'a> Checker<'a> {
                 },
                 _ => Ty::Str,
             },
-            Expr::Ident { name, span } => match self.lookup(name).map(|context| context.ty.clone()) {
+            Expr::Ident { name, span } => match self.lookup(name).map(|context| context.ty.clone())
+            {
                 Some(ty) => ty,
                 None => self.nullary_variant(name, *span, expected),
             },
@@ -2687,7 +2735,7 @@ impl<'a> Checker<'a> {
                         self.check_index(&index, *span);
                         (**target).clone()
                     }
-            _ => {
+                    _ => {
                         self.error(
                             code::TYPE_MISMATCH,
                             format!("there is no indexing on `{}`", base.name()),
@@ -2795,7 +2843,8 @@ impl<'a> Checker<'a> {
                 let declared = self.structs.get(name).cloned();
                 for (field, value) in fields {
                     match &declared {
-                        Some(fields) => match fields.iter().find(|(known, _)| known == &field.name) {
+                        Some(fields) => match fields.iter().find(|(known, _)| known == &field.name)
+                        {
                             Some((_, ty)) => {
                                 let ty = self.resolve_type(ty);
                                 self.expect(value, &ty);
@@ -2818,7 +2867,11 @@ impl<'a> Checker<'a> {
             }
             Expr::InterpString { parts, .. } => {
                 for part in parts {
-                    if let dux_ast::InterpolationPart::Hole { written: Some(expression), .. } = part {
+                    if let dux_ast::InterpolationPart::Hole {
+                        written: Some(expression),
+                        ..
+                    } = part
+                    {
                         let _ = self.infer(expression);
                     }
                 }
@@ -2831,11 +2884,20 @@ impl<'a> Checker<'a> {
                 self.scopes.pop();
                 Ty::Bool
             }
-            Expr::Match { subject, arms, span } => {
+            Expr::Match {
+                subject,
+                arms,
+                span,
+            } => {
                 let subject = self.infer(subject);
                 self.arms(arms, &subject, expected, *span)
             }
-            Expr::If { cond, then_arm, else_arm, span } => {
+            Expr::If {
+                cond,
+                then_arm,
+                else_arm,
+                span,
+            } => {
                 let bound = self.condition(cond);
                 let then_ty = self.expression_in(then_arm, expected);
                 if bound {
@@ -2955,7 +3017,13 @@ impl<'a> Checker<'a> {
             .unwrap_or_else(|| {
                 self.generic_structs
                     .get(owner)
-                    .map(|record| record.fields.iter().map(|(known, _)| known.as_str()).collect())
+                    .map(|record| {
+                        record
+                            .fields
+                            .iter()
+                            .map(|(known, _)| known.as_str())
+                            .collect()
+                    })
                     .unwrap_or_default()
             });
         known.sort_unstable();
@@ -3007,7 +3075,8 @@ impl<'a> Checker<'a> {
                 }
             }
             let named = self.at_home(name, |spelling| {
-                self.functions.contains_key(spelling) || self.generic_functions.contains_key(spelling)
+                self.functions.contains_key(spelling)
+                    || self.generic_functions.contains_key(spelling)
             });
             if named != *name {
                 if let Some(generic) = self.generic_functions.get(named.as_str()).cloned() {
@@ -3156,7 +3225,9 @@ impl<'a> Checker<'a> {
                                     args.len()
                                 ),
                             )
-                            .with_note("a method's receiver is written before the dot, not inside it"),
+                            .with_note(
+                                "a method's receiver is written before the dot, not inside it",
+                            ),
                         );
                         for argument in args {
                             let _ = self.infer(argument);
@@ -3218,7 +3289,11 @@ impl<'a> Checker<'a> {
             .zip(given)
             .map(|(param, given)| (param.clone(), given.clone()))
             .collect();
-        let arguments = given.iter().map(|ty| ty.name()).collect::<Vec<_>>().join(", ");
+        let arguments = given
+            .iter()
+            .map(|ty| ty.name())
+            .collect::<Vec<_>>()
+            .join(", ");
         let asked = format!("{}<{arguments}>.{}", key.0, key.1);
         let mut params = Vec::new();
         for param in &generic.declared {
@@ -3246,7 +3321,14 @@ impl<'a> Checker<'a> {
             read.push(receiver.clone());
         }
         read.extend(generic.declared.iter().cloned());
-        self.read_body(&read, &result, &generic.body, &asked, &format!("{}.{}", key.0, key.1), span);
+        self.read_body(
+            &read,
+            &result,
+            &generic.body,
+            &asked,
+            &format!("{}.{}", key.0, key.1),
+            span,
+        );
         self.instantiation = saved;
         outcome
     }
@@ -3262,14 +3344,12 @@ impl<'a> Checker<'a> {
                     // takes the `c_int`, a `c".."` takes the pointer shape —
                     // and a `string` crosses to any pointer slot: that is
                     // what the boundary converts, not the lattice.
-                    let want = if param.is_pointer()
-                        || option_of_pointer(param)
-                        || param.is_integral()
-                    {
-                        Some(param)
-                    } else {
-                        None
-                    };
+                    let want =
+                        if param.is_pointer() || option_of_pointer(param) || param.is_integral() {
+                            Some(param)
+                        } else {
+                            None
+                        };
                     let got = self.typed(argument, want);
                     if got == Ty::Str && (param.is_pointer() || option_of_pointer(param)) {
                         continue;
@@ -3293,12 +3373,7 @@ impl<'a> Checker<'a> {
 
     // ----------------------------------------------------------- statements
 
-    fn function(
-        &mut self,
-        function: &dux_ast::FnDecl,
-        receiver: Option<&str>,
-        owner: &Ty,
-    ) {
+    fn function(&mut self, function: &dux_ast::FnDecl, receiver: Option<&str>, owner: &Ty) {
         self.result = match &function.return_ty {
             Some(ty) => self.resolve_type(ty),
             None => Ty::Unit,
@@ -3391,8 +3466,18 @@ impl<'a> Checker<'a> {
 
     fn statement(&mut self, statement: &Stmt) {
         match statement {
-            Stmt::Binding { name, ty, value, span } => self.binding(&name.name, ty.as_ref(), value.as_ref(), *span),
-            Stmt::Assign { target, op, value, span } => self.assignment(target, *op, value, *span),
+            Stmt::Binding {
+                name,
+                ty,
+                value,
+                span,
+            } => self.binding(&name.name, ty.as_ref(), value.as_ref(), *span),
+            Stmt::Assign {
+                target,
+                op,
+                value,
+                span,
+            } => self.assignment(target, *op, value, *span),
             Stmt::Expr { expr, .. } => {
                 let _ = self.infer(expr);
             }
@@ -3400,7 +3485,12 @@ impl<'a> Checker<'a> {
             Stmt::Break { .. } | Stmt::Continue { .. } => {}
             Stmt::Defer { stmt, .. } => self.statement(stmt),
             Stmt::Block { block, .. } => self.block(block),
-            Stmt::If { cond, then_branch, else_branch, .. } => {
+            Stmt::If {
+                cond,
+                then_branch,
+                else_branch,
+                ..
+            } => {
                 let bound = self.condition(cond);
                 self.block(then_branch);
                 if bound {
@@ -3438,7 +3528,11 @@ impl<'a> Checker<'a> {
                         }
                         self.statement(step);
                     }
-                    ForKind::In { index, value, iterable } => {
+                    ForKind::In {
+                        index,
+                        value,
+                        iterable,
+                    } => {
                         let is_range = matches!(iterable, Expr::Range { .. });
                         let iterable = self.infer(iterable);
                         let element = match &iterable {
@@ -3461,7 +3555,11 @@ impl<'a> Checker<'a> {
                 }
                 self.scopes.pop();
             }
-            Stmt::Match { subject, arms, span } => {
+            Stmt::Match {
+                subject,
+                arms,
+                span,
+            } => {
                 let subject = self.infer(subject);
                 let _ = self.arms(arms, &subject, None, *span);
             }
@@ -3472,13 +3570,7 @@ impl<'a> Checker<'a> {
     /// Walk the arms of a `match`. Each arm binds its own names, its body must
     /// agree with the others on one type when the `match` is a value, and
     /// together the arms must reach every value of the subject (DESIGN 4.4).
-    fn arms(
-        &mut self,
-        arms: &[MatchArm],
-        subject: &Ty,
-        expected: Option<&Ty>,
-        span: Span,
-    ) -> Ty {
+    fn arms(&mut self, arms: &[MatchArm], subject: &Ty, expected: Option<&Ty>, span: Span) -> Ty {
         let mut joined: Option<Ty> = None;
         let mut coverage = self.coverage(subject);
         for arm in arms {
@@ -3587,8 +3679,14 @@ impl<'a> Checker<'a> {
     }
 
     fn assignment(&mut self, target: &Expr, op: AssignOp, value: &Expr, span: Span) {
-        if let Expr::Ident { name, span: name_span } = target {
-            let existing = self.lookup(name).map(|context| (context.ty.clone(), context.is_const));
+        if let Expr::Ident {
+            name,
+            span: name_span,
+        } = target
+        {
+            let existing = self
+                .lookup(name)
+                .map(|context| (context.ty.clone(), context.is_const));
             match existing {
                 Some((_, true)) => {
                     self.report(
@@ -3711,11 +3809,7 @@ impl<'a> Checker<'a> {
             (None, to) if self.in_main || to.is_integral() => {}
             (None, to) => {
                 let _ = to;
-                self.error(
-                    code::TYPE_MISMATCH,
-                    "`return` needs a value here",
-                    span,
-                );
+                self.error(code::TYPE_MISMATCH, "`return` needs a value here", span);
             }
         }
     }
@@ -3741,7 +3835,11 @@ impl<'a> Checker<'a> {
                     let name = named(&decl.name.name);
                     self.globals.insert(
                         name.clone(),
-                        Context { name, ty: bound, is_const: true },
+                        Context {
+                            name,
+                            ty: bound,
+                            is_const: true,
+                        },
                     );
                 }
                 Decl::Global(decl) => {
@@ -3758,7 +3856,11 @@ impl<'a> Checker<'a> {
                     let name = named(&decl.name.name);
                     self.globals.insert(
                         name.clone(),
-                        Context { name, ty: bound, is_const: false },
+                        Context {
+                            name,
+                            ty: bound,
+                            is_const: false,
+                        },
                     );
                 }
                 _ => {}
@@ -3800,7 +3902,8 @@ impl<'a> Checker<'a> {
                             },
                         );
                     }
-                    self.methods.insert((owner.clone(), method.name.name.clone()), signature);
+                    self.methods
+                        .insert((owner.clone(), method.name.name.clone()), signature);
                 }
                 self.instantiation = saved;
             }
@@ -3871,9 +3974,11 @@ fn float_fold(op: BinaryOp, a: f64, b: f64) -> Option<Ty> {
 /// The two bounds of `[a..b]`, either of which may be missing.
 fn range_bounds(index: &Expr) -> Vec<&Expr> {
     match index {
-        Expr::Range { start, end, .. } => {
-            start.iter().chain(end.iter()).map(|bound| &**bound).collect()
-        }
+        Expr::Range { start, end, .. } => start
+            .iter()
+            .chain(end.iter())
+            .map(|bound| &**bound)
+            .collect(),
         _ => Vec::new(),
     }
 }

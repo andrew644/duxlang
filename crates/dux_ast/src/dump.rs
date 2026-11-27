@@ -52,16 +52,29 @@ fn dump_decl(decl: &Decl, level: usize) -> String {
         Decl::Fn(function) => dump_fn(function, level),
         Decl::Struct(decl) => {
             let params = dump_type_params(&decl.type_params);
-            let mut out = format!("{pad}{}struct {}{params} {{\n", dump_attributes(&decl.attributes), decl.name.name);
+            let mut out = format!(
+                "{pad}{}struct {}{params} {{\n",
+                dump_attributes(&decl.attributes),
+                decl.name.name
+            );
             for field in &decl.fields {
-                out.push_str(&format!("{}{}: {}\n", indent(level + 1), field.name.name, dump_type(&field.ty)));
+                out.push_str(&format!(
+                    "{}{}: {}\n",
+                    indent(level + 1),
+                    field.name.name,
+                    dump_type(&field.ty)
+                ));
             }
             out.push_str(&format!("{pad}}}\n"));
             out
         }
         Decl::Enum(decl) => {
             let params = dump_type_params(&decl.type_params);
-            let mut out = format!("{pad}{}enum {}{params} {{\n", dump_attributes(&decl.attributes), decl.name.name);
+            let mut out = format!(
+                "{pad}{}enum {}{params} {{\n",
+                dump_attributes(&decl.attributes),
+                decl.name.name
+            );
             for variant in &decl.variants {
                 let body = match &variant.body {
                     VariantBody::Empty => String::new(),
@@ -91,15 +104,24 @@ fn dump_decl(decl: &Decl, level: usize) -> String {
             "{pad}{}const {}{} = {}\n",
             dump_attributes(&decl.attributes),
             decl.name.name,
-            decl.ty.as_ref().map(|t| format!(": {}", dump_type(t))).unwrap_or_default(),
+            decl.ty
+                .as_ref()
+                .map(|t| format!(": {}", dump_type(t)))
+                .unwrap_or_default(),
             dump_expr(&decl.value)
         ),
         Decl::Global(decl) => format!(
             "{pad}{}global {}{}{}\n",
             dump_attributes(&decl.attributes),
             decl.name.name,
-            decl.ty.as_ref().map(|t| format!(": {}", dump_type(t))).unwrap_or_default(),
-            decl.value.as_ref().map(|v| format!(" = {}", dump_expr(v))).unwrap_or_default()
+            decl.ty
+                .as_ref()
+                .map(|t| format!(": {}", dump_type(t)))
+                .unwrap_or_default(),
+            decl.value
+                .as_ref()
+                .map(|v| format!(" = {}", dump_expr(v)))
+                .unwrap_or_default()
         ),
         Decl::TypeAlias(decl) => format!(
             "{pad}type {}{} = {}\n",
@@ -146,7 +168,11 @@ fn dump_decl(decl: &Decl, level: usize) -> String {
                     dump_attributes(&function.attributes),
                     function.name.name,
                     params,
-                    function.return_ty.as_ref().map(|t| format!(" -> {}", dump_type(t))).unwrap_or_default()
+                    function
+                        .return_ty
+                        .as_ref()
+                        .map(|t| format!(" -> {}", dump_type(t)))
+                        .unwrap_or_default()
                 ));
             }
             out.push_str(&format!("{pad}}}\n"));
@@ -162,7 +188,8 @@ fn dump_fn(function: &FnDecl, level: usize) -> String {
         .params
         .iter()
         .map(|p| {
-            if p.name.name == "self" && matches!(&p.ty, Type::Named { name, .. } if name == "Self") {
+            if p.name.name == "self" && matches!(&p.ty, Type::Named { name, .. } if name == "Self")
+            {
                 "self".to_string()
             } else {
                 format!("{}: {}", p.name.name, dump_type(&p.ty))
@@ -176,7 +203,11 @@ fn dump_fn(function: &FnDecl, level: usize) -> String {
         function.name.name,
         dump_type_params(&function.type_params),
         params,
-        function.return_ty.as_ref().map(|t| format!(" -> {}", dump_type(t))).unwrap_or_default(),
+        function
+            .return_ty
+            .as_ref()
+            .map(|t| format!(" -> {}", dump_type(t)))
+            .unwrap_or_default(),
         dump_block(&function.body, level + 1)
     )
 }
@@ -215,7 +246,10 @@ fn dump_type(ty: &Type) -> String {
             if args.is_empty() {
                 name.clone()
             } else {
-                format!("{name}<{}>", args.iter().map(dump_type).collect::<Vec<_>>().join(", "))
+                format!(
+                    "{name}<{}>",
+                    args.iter().map(dump_type).collect::<Vec<_>>().join(", ")
+                )
             }
         }
         Type::Pointer { pointee, .. } => format!("*{}", dump_type(pointee)),
@@ -223,12 +257,21 @@ fn dump_type(ty: &Type) -> String {
         Type::Array { element, len, .. } => format!("[{}; {}]", dump_type(element), dump_expr(len)),
         Type::Tuple { elements, .. } => format!(
             "({})",
-            elements.iter().map(dump_type).collect::<Vec<_>>().join(", ")
+            elements
+                .iter()
+                .map(dump_type)
+                .collect::<Vec<_>>()
+                .join(", ")
         ),
-        Type::Function { params, return_ty, .. } => format!(
+        Type::Function {
+            params, return_ty, ..
+        } => format!(
             "fn({}){}",
             params.iter().map(dump_type).collect::<Vec<_>>().join(", "),
-            return_ty.as_ref().map(|t| format!(" -> {}", dump_type(t))).unwrap_or_default()
+            return_ty
+                .as_ref()
+                .map(|t| format!(" -> {}", dump_type(t)))
+                .unwrap_or_default()
         ),
         Type::ConstArgument { value, .. } => dump_expr(value),
         Type::Error { .. } => "<error>".to_string(),
@@ -246,7 +289,9 @@ fn dump_block(block: &Block, level: usize) -> String {
 fn dump_stmt(stmt: &Stmt, level: usize) -> String {
     let pad = indent(level);
     match stmt {
-        Stmt::Binding { name, ty, value, .. } => {
+        Stmt::Binding {
+            name, ty, value, ..
+        } => {
             let suffix = match (ty, value) {
                 (Some(ty), Some(value)) => format!(": {} = {}", dump_type(ty), dump_expr(value)),
                 (Some(ty), None) => format!(": {}", dump_type(ty)),
@@ -255,25 +300,54 @@ fn dump_stmt(stmt: &Stmt, level: usize) -> String {
             };
             format!("{pad}{}{suffix}\n", name.name)
         }
-        Stmt::Assign { target, op, value, .. } => {
-            format!("{pad}{} {} {}\n", dump_expr(target), op.symbol(), dump_expr(value))
+        Stmt::Assign {
+            target, op, value, ..
+        } => {
+            format!(
+                "{pad}{} {} {}\n",
+                dump_expr(target),
+                op.symbol(),
+                dump_expr(value)
+            )
         }
         Stmt::Expr { expr, .. } => format!("{pad}{}\n", dump_expr(expr)),
         Stmt::Return { value, .. } => format!(
             "{pad}return{}\n",
-            value.as_ref().map(|v| format!(" {}", dump_expr(v))).unwrap_or_default()
+            value
+                .as_ref()
+                .map(|v| format!(" {}", dump_expr(v)))
+                .unwrap_or_default()
         ),
         Stmt::Break { .. } => format!("{pad}break\n"),
         Stmt::Continue { .. } => format!("{pad}continue\n"),
         Stmt::Defer { stmt, .. } => {
-            format!("{pad}defer {}
-", dump_stmt(stmt, 0).trim_end())
+            format!(
+                "{pad}defer {}
+",
+                dump_stmt(stmt, 0).trim_end()
+            )
         }
         Stmt::Block { block, .. } => format!("{pad}{{\n{}{pad}}}\n", dump_block(block, level + 1)),
-        Stmt::If { cond, then_branch, else_branch, .. } => {
-            let mut out = format!("{pad}if {} {{\n{}{pad}}}", dump_cond(cond), dump_block(then_branch, level + 1), pad = pad);
+        Stmt::If {
+            cond,
+            then_branch,
+            else_branch,
+            ..
+        } => {
+            let mut out = format!(
+                "{pad}if {} {{\n{}{pad}}}",
+                dump_cond(cond),
+                dump_block(then_branch, level + 1),
+                pad = pad
+            );
             let mut current = else_branch.as_deref();
-            while let Some(Stmt::If { cond, then_branch, else_branch, .. }) = current {
+            while let Some(Stmt::If {
+                cond,
+                then_branch,
+                else_branch,
+                ..
+            }) = current
+            {
                 out.push_str(&format!(
                     " else if {} {{\n{}{pad}}}",
                     dump_cond(cond),
@@ -283,7 +357,11 @@ fn dump_stmt(stmt: &Stmt, level: usize) -> String {
                 current = else_branch.as_deref();
             }
             if let Some(Stmt::Block { block, .. }) = current {
-                out.push_str(&format!(" else {{\n{}{pad}}}", dump_block(block, level + 1), pad = pad));
+                out.push_str(&format!(
+                    " else {{\n{}{pad}}}",
+                    dump_block(block, level + 1),
+                    pad = pad
+                ));
             } else if current.is_some() {
                 out.push_str(" else <error>");
             }
@@ -295,8 +373,14 @@ fn dump_stmt(stmt: &Stmt, level: usize) -> String {
             dump_cond(cond),
             dump_block(body, level + 1)
         ),
-        Stmt::Loop { body, .. } => format!("{pad}loop {{\n{}{pad}}}\n", dump_block(body, level + 1)),
-        Stmt::For { kind, body, span: _ } => match kind {
+        Stmt::Loop { body, .. } => {
+            format!("{pad}loop {{\n{}{pad}}}\n", dump_block(body, level + 1))
+        }
+        Stmt::For {
+            kind,
+            body,
+            span: _,
+        } => match kind {
             ForKind::ThreeClause { init, cond, step } => format!(
                 "{pad}for {}, {}, {} {{\n{}{pad}}}\n",
                 dump_stmt(init, 0).trim_end(),
@@ -304,18 +388,22 @@ fn dump_stmt(stmt: &Stmt, level: usize) -> String {
                 dump_stmt(step, 0).trim_end(),
                 dump_block(body, level + 1)
             ),
-            ForKind::In { index, value, iterable } => format!(
+            ForKind::In {
+                index,
+                value,
+                iterable,
+            } => format!(
                 "{pad}for {}{} in {} {{\n{}{pad}}}\n",
-                index.as_ref().map(|i| format!("{}, ", i.name)).unwrap_or_default(),
+                index
+                    .as_ref()
+                    .map(|i| format!("{}, ", i.name))
+                    .unwrap_or_default(),
                 value.name,
                 dump_expr(iterable),
                 dump_block(body, level + 1)
             ),
         },
-        Stmt::Match { subject, arms, .. } => format!(
-            "{pad}{}\n",
-            dump_match(subject, arms)
-        ),
+        Stmt::Match { subject, arms, .. } => format!("{pad}{}\n", dump_match(subject, arms)),
         Stmt::Error { .. } => format!("{pad}<error>\n"),
     }
 }
@@ -347,13 +435,33 @@ fn dump_pattern(pattern: &Pattern) -> String {
         Pattern::Else { .. } => "else".to_string(),
         Pattern::Name { name, .. } => name.name.clone(),
         Pattern::Literal { value, .. } => dump_expr(value),
-        Pattern::Path { qualifier, name, .. } => format!("{qualifier}::{name}"),
-        Pattern::Tuple { qualifier, name, elements, .. } => format!(
+        Pattern::Path {
+            qualifier, name, ..
+        } => format!("{qualifier}::{name}"),
+        Pattern::Tuple {
+            qualifier,
+            name,
+            elements,
+            ..
+        } => format!(
             "{}{name}({})",
-            qualifier.as_ref().map(|q| format!("{q}::")).unwrap_or_default(),
-            elements.iter().map(dump_pattern).collect::<Vec<_>>().join(", ")
+            qualifier
+                .as_ref()
+                .map(|q| format!("{q}::"))
+                .unwrap_or_default(),
+            elements
+                .iter()
+                .map(dump_pattern)
+                .collect::<Vec<_>>()
+                .join(", ")
         ),
-        Pattern::Struct { qualifier, name, fields, rest, .. } => {
+        Pattern::Struct {
+            qualifier,
+            name,
+            fields,
+            rest,
+            ..
+        } => {
             let mut written = fields
                 .iter()
                 .map(|field| match field {
@@ -368,11 +476,19 @@ fn dump_pattern(pattern: &Pattern) -> String {
             }
             format!(
                 "{}{name} {{ {} }}",
-                qualifier.as_ref().map(|q| format!("{q}::")).unwrap_or_default(),
+                qualifier
+                    .as_ref()
+                    .map(|q| format!("{q}::"))
+                    .unwrap_or_default(),
                 written.join(", ")
             )
         }
-        Pattern::Range { start, end, inclusive, .. } => format!(
+        Pattern::Range {
+            start,
+            end,
+            inclusive,
+            ..
+        } => format!(
             "{}{}{}",
             dump_pattern(start),
             if *inclusive { "..=" } else { ".." },
@@ -415,7 +531,12 @@ fn dump_expr(expr: &Expr) -> String {
         ),
         Expr::Field { base, name, .. } => format!("{}.{}", dump_expr(base), name.name),
         Expr::Index { base, index, .. } => format!("{}[{}]", dump_expr(base), dump_expr(index)),
-        Expr::Range { start, end, inclusive, .. } => format!(
+        Expr::Range {
+            start,
+            end,
+            inclusive,
+            ..
+        } => format!(
             "{}{}{}",
             start.as_ref().map(|e| dump_expr(e)).unwrap_or_default(),
             if *inclusive { "..=" } else { ".." },
@@ -432,7 +553,11 @@ fn dump_expr(expr: &Expr) -> String {
         }
         Expr::ArrayLiteral { elements, .. } => format!(
             "[{}]",
-            elements.iter().map(dump_expr).collect::<Vec<_>>().join(", ")
+            elements
+                .iter()
+                .map(dump_expr)
+                .collect::<Vec<_>>()
+                .join(", ")
         ),
         Expr::RepeatedArray { value, len, .. } => {
             format!("[{}; {}]", dump_expr(value), dump_expr(len))
@@ -470,7 +595,10 @@ fn dump_expr(expr: &Expr) -> String {
                 .iter()
                 .map(|part| match part {
                     InterpolationPart::Text(text) => text.clone(),
-                    InterpolationPart::Hole { written: Some(expr), .. } => {
+                    InterpolationPart::Hole {
+                        written: Some(expr),
+                        ..
+                    } => {
                         format!("${{{}}}", dump_expr(expr))
                     }
                     InterpolationPart::Hole { written: None, .. } => "{}".to_string(),
@@ -478,7 +606,12 @@ fn dump_expr(expr: &Expr) -> String {
                 .collect::<String>();
             format!("$\"{body}\"")
         }
-        Expr::If { cond, then_arm, else_arm, .. } => format!(
+        Expr::If {
+            cond,
+            then_arm,
+            else_arm,
+            ..
+        } => format!(
             "if {} {{ {} }}{}",
             dump_expr(cond),
             dump_expr(then_arm),
@@ -492,10 +625,11 @@ fn dump_expr(expr: &Expr) -> String {
         Expr::Binary { op, lhs, rhs, .. } => {
             format!("({} {} {})", dump_expr(lhs), op.symbol(), dump_expr(rhs))
         }
-        Expr::Cast { value, target, .. } => format!("({} as {})", dump_expr(value), dump_type(target)),
+        Expr::Cast { value, target, .. } => {
+            format!("({} as {})", dump_expr(value), dump_type(target))
+        }
         Expr::Try { operand, .. } => format!("{}?", dump_expr(operand)),
         Expr::Paren { inner, .. } => dump_expr(inner),
         Expr::Error { .. } => "<error>".to_string(),
     }
 }
-

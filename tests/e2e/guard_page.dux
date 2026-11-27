@@ -1,0 +1,12 @@
+//@exit 139
+// The debug allocator maps each block flush against a guard page, so a
+// write past the end of a block faults at the write rather than rotting
+// the heap around it.
+
+fn main() {
+    p := new(i64)
+    *p = 1
+    far := (p as *i64) + 512
+    *far = 7
+    print("this line never runs\n")
+}

@@ -103,7 +103,10 @@ fn type_arguments(args: &[Type]) -> String {
     }
     format!(
         "<{}>",
-        args.iter().map(|arg| Printer.ty(arg)).collect::<Vec<_>>().join(", ")
+        args.iter()
+            .map(|arg| Printer.ty(arg))
+            .collect::<Vec<_>>()
+            .join(", ")
     )
 }
 
@@ -126,7 +129,12 @@ impl Printer {
                     .fields
                     .iter()
                     .map(|field| {
-                        format!("{}{}: {},\n", pad(level + 1), field.name.name, self.ty(&field.ty))
+                        format!(
+                            "{}{}: {},\n",
+                            pad(level + 1),
+                            field.name.name,
+                            self.ty(&field.ty)
+                        )
                     })
                     .collect::<String>();
                 format!("{head} {{\n{body}{p}}}")
@@ -149,7 +157,11 @@ impl Printer {
                             VariantBody::Empty => String::new(),
                             VariantBody::Tuple(types) => format!(
                                 "({})",
-                                types.iter().map(|ty| self.ty(ty)).collect::<Vec<_>>().join(", ")
+                                types
+                                    .iter()
+                                    .map(|ty| self.ty(ty))
+                                    .collect::<Vec<_>>()
+                                    .join(", ")
                             ),
                             VariantBody::Named(fields) => format!(
                                 " {{ {} }}",
@@ -177,8 +189,7 @@ impl Printer {
                 self.attributes_inline(&decl.attributes),
                 decl.name.name,
                 self.ty_annotation(decl.ty.as_ref()),
-                decl
-                    .value
+                decl.value
                     .as_ref()
                     .map(|value| format!(" = {}", self.expr(value, level)))
                     .unwrap_or_default()
@@ -200,10 +211,7 @@ impl Printer {
                     .map(|method| self.function(method, level + 1, false))
                     .collect::<Vec<_>>()
                     .join("\n\n");
-                format!(
-                    "impl {}{params} {{\n{body}\n{p}}}",
-                    decl.type_name.name
-                )
+                format!("impl {}{params} {{\n{body}\n{p}}}", decl.type_name.name)
             }
             Decl::Module(decl) => {
                 let attributes = self.attributes_inline(&decl.attributes);
@@ -215,9 +223,11 @@ impl Printer {
                     .iter()
                     .map(|inner| self.decl(inner, level + 1))
                     .collect::<Vec<_>>()
-                    .join("
+                    .join(
+                        "
 
-");
+",
+                    );
                 format!("{attributes}mod {} {{\n{body}\n{p}}}", decl.name.name)
             }
             Decl::Extern(block) => {
@@ -360,11 +370,21 @@ impl Printer {
             }
             Type::Tuple { elements, .. } => format!(
                 "({})",
-                elements.iter().map(|ty| self.ty(ty)).collect::<Vec<_>>().join(", ")
+                elements
+                    .iter()
+                    .map(|ty| self.ty(ty))
+                    .collect::<Vec<_>>()
+                    .join(", ")
             ),
-            Type::Function { params, return_ty, .. } => format!(
+            Type::Function {
+                params, return_ty, ..
+            } => format!(
                 "fn({}){}",
-                params.iter().map(|ty| self.ty(ty)).collect::<Vec<_>>().join(", "),
+                params
+                    .iter()
+                    .map(|ty| self.ty(ty))
+                    .collect::<Vec<_>>()
+                    .join(", "),
                 return_ty
                     .as_ref()
                     .map(|ty| format!(" -> {}", self.ty(ty)))
@@ -386,7 +406,9 @@ impl Printer {
     fn stmt(&self, stmt: &Stmt, level: usize) -> String {
         let p = pad(level);
         match stmt {
-            Stmt::Binding { name, ty, value, .. } => {
+            Stmt::Binding {
+                name, ty, value, ..
+            } => {
                 let suffix = match (ty, value) {
                     (Some(ty), Some(value)) => {
                         format!(": {} = {}", self.ty(ty), self.expr(value, level))
@@ -397,8 +419,15 @@ impl Printer {
                 };
                 format!("{p}{}{suffix}", name.name)
             }
-            Stmt::Assign { target, op, value, .. } => {
-                format!("{p}{} {} {}", self.expr(target, level), op.symbol(), self.expr(value, level))
+            Stmt::Assign {
+                target, op, value, ..
+            } => {
+                format!(
+                    "{p}{} {} {}",
+                    self.expr(target, level),
+                    op.symbol(),
+                    self.expr(value, level)
+                )
             }
             Stmt::Expr { expr, .. } => format!("{p}{}", self.expr(expr, level)),
             Stmt::Return { value, .. } => format!(
@@ -412,7 +441,12 @@ impl Printer {
             Stmt::Continue { .. } => format!("{p}continue"),
             Stmt::Defer { stmt, .. } => format!("{p}defer {}", self.stmt(stmt, level).trim_start()),
             Stmt::Block { block, .. } => format!("{p}{{\n{}{p}}}", self.block(block, level + 1)),
-            Stmt::If { cond, then_branch, else_branch, .. } => {
+            Stmt::If {
+                cond,
+                then_branch,
+                else_branch,
+                ..
+            } => {
                 let mut out = format!(
                     "{p}if {} {{\n{}",
                     self.condition(cond, level),
@@ -420,7 +454,13 @@ impl Printer {
                 );
                 out.push_str(&format!("{p}}}"));
                 let mut current = else_branch.as_deref();
-                while let Some(Stmt::If { cond, then_branch, else_branch, .. }) = current {
+                while let Some(Stmt::If {
+                    cond,
+                    then_branch,
+                    else_branch,
+                    ..
+                }) = current
+                {
                     out.push_str(&format!(
                         " else if {} {{\n{}{p}}}",
                         self.condition(cond, level),
@@ -431,10 +471,16 @@ impl Printer {
                 if let Some(other) = current {
                     match other {
                         Stmt::Block { block, .. } => {
-                            out.push_str(&format!(" else {{\n{}{p}}}", self.block(block, level + 1)));
+                            out.push_str(&format!(
+                                " else {{\n{}{p}}}",
+                                self.block(block, level + 1)
+                            ));
                         }
                         other => {
-                            out.push_str(&format!(" else {}", self.stmt(other, level).trim_start()));
+                            out.push_str(&format!(
+                                " else {}",
+                                self.stmt(other, level).trim_start()
+                            ));
                         }
                     }
                 }
@@ -456,7 +502,11 @@ impl Printer {
                         self.expr(cond, level),
                         self.stmt(step, level).trim_start()
                     ),
-                    ForKind::In { index, value, iterable } => format!(
+                    ForKind::In {
+                        index,
+                        value,
+                        iterable,
+                    } => format!(
                         "{p}for {}{} in {} {{",
                         index
                             .as_ref()
@@ -509,17 +559,33 @@ impl Printer {
             Pattern::Else { .. } => "else".to_string(),
             Pattern::Name { name, .. } => name.name.clone(),
             Pattern::Literal { value, .. } => self.expr(value, 0),
-            Pattern::Path { qualifier, name, .. } => format!("{qualifier}::{name}"),
-            Pattern::Tuple { qualifier, name, elements, .. } => format!(
+            Pattern::Path {
+                qualifier, name, ..
+            } => format!("{qualifier}::{name}"),
+            Pattern::Tuple {
+                qualifier,
+                name,
+                elements,
+                ..
+            } => format!(
                 "{}{name}({})",
-                qualifier.as_ref().map(|q| format!("{q}::")).unwrap_or_default(),
+                qualifier
+                    .as_ref()
+                    .map(|q| format!("{q}::"))
+                    .unwrap_or_default(),
                 elements
                     .iter()
                     .map(|element| self.pattern(element))
                     .collect::<Vec<_>>()
                     .join(", ")
             ),
-            Pattern::Struct { qualifier, name, fields, rest, .. } => {
+            Pattern::Struct {
+                qualifier,
+                name,
+                fields,
+                rest,
+                ..
+            } => {
                 let mut written = fields
                     .iter()
                     .map(|field| match field {
@@ -534,11 +600,19 @@ impl Printer {
                 }
                 format!(
                     "{}{name} {{ {} }}",
-                    qualifier.as_ref().map(|q| format!("{q}::")).unwrap_or_default(),
+                    qualifier
+                        .as_ref()
+                        .map(|q| format!("{q}::"))
+                        .unwrap_or_default(),
                     written.join(", ")
                 )
             }
-            Pattern::Range { start, end, inclusive, .. } => format!(
+            Pattern::Range {
+                start,
+                end,
+                inclusive,
+                ..
+            } => format!(
                 "{}{}{}",
                 self.pattern(start),
                 if *inclusive { "..=" } else { ".." },
@@ -568,17 +642,19 @@ impl Printer {
                 if block.stmts.is_empty() {
                     return "{}".to_string();
                 }
-                format!(
-                    "{{\n{}{}}}",
-                    self.block(block, level + 1),
-                    pad(level)
-                )
+                format!("{{\n{}{}}}", self.block(block, level + 1), pad(level))
             }
             other => format!("{{ {} }}", self.expr(other, level)),
         }
     }
 
-    fn if_expression(&self, cond: &Expr, then_arm: &Expr, else_arm: Option<&Expr>, level: usize) -> String {
+    fn if_expression(
+        &self,
+        cond: &Expr,
+        then_arm: &Expr,
+        else_arm: Option<&Expr>,
+        level: usize,
+    ) -> String {
         let mut out = format!(
             "if {} {}",
             self.condition(cond, level),
@@ -647,8 +723,7 @@ impl Printer {
                     .map(|start| self.expr(start, level))
                     .unwrap_or_default(),
                 if *inclusive { "..=" } else { ".." },
-                end
-                    .as_ref()
+                end.as_ref()
                     .map(|end| self.expr(end, level))
                     .unwrap_or_default()
             ),
@@ -701,7 +776,11 @@ impl Printer {
                     "{head} {{ {} }}",
                     fields
                         .iter()
-                        .map(|(field, value)| format!("{}: {}", field.name, self.expr(value, level)))
+                        .map(|(field, value)| format!(
+                            "{}: {}",
+                            field.name,
+                            self.expr(value, level)
+                        ))
                         .collect::<Vec<_>>()
                         .join(", ")
                 )

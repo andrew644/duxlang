@@ -22,7 +22,11 @@ impl Span {
     }
 
     pub const fn empty_at(file: FileId, start: u32) -> Self {
-        Self { file, start, len: 0 }
+        Self {
+            file,
+            start,
+            len: 0,
+        }
     }
 
     pub fn merge(self, other: Span) -> Span {
@@ -58,11 +62,7 @@ impl SourceMap {
 
     pub fn add(&mut self, name: impl Into<String>, text: impl Into<String>) -> FileId {
         let name = name.into();
-        if let Some(existing) = self
-            .files
-            .iter()
-            .position(|f| f.name == name)
-        {
+        if let Some(existing) = self.files.iter().position(|f| f.name == name) {
             self.files[existing].text = text.into();
             return FileId(existing as u32);
         }

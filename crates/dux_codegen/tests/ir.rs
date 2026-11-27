@@ -1171,6 +1171,33 @@ fn a_release_build_drops_the_debug_bookkeeping() {
 }
 
 #[test]
+fn the_debug_allocator_arms_a_guard_page_and_tabulates_every_block() {
+    let ir = build("package main\nfn main() {\n    p := new(i32)\n    free(p)\n}\n")
+        .expect("builds")
+        .ir_text();
+    assert!(
+        ir.contains("call ptr @mmap("),
+        "debug blocks come from a private mapping:\n{ir}"
+    );
+    assert!(
+        ir.contains("call i32 @mprotect("),
+        "the page after a block is armed as the guard:\n{ir}"
+    );
+    assert!(
+        ir.contains("call i32 @munmap("),
+        "a released block hands its mapping back:\n{ir}"
+    );
+    assert!(
+        !ir.contains("call ptr @malloc"),
+        "the debug allocator does not lean on malloc:\n{ir}"
+    );
+    assert!(
+        ir.contains("@dux.runtime.table = global [16384 x { ptr, i64, ptr }] zeroinitializer"),
+        "every block's place of birth is tabulated:\n{ir}"
+    );
+}
+
+#[test]
 fn make_zeroes_the_block_it_hands_back() {
     let ir = build(
         "package main
