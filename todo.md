@@ -2,7 +2,6 @@
 
 ## C interop (M6 "remaining: reported, none silent")
 
-- [ ] Import function-like macros
 - [ ] Import global variables from headers
 
 ## M7 — toolchain maturity

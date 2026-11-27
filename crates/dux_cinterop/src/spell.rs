@@ -36,6 +36,16 @@ fn spell_with(
     let mut types: Vec<(String, String)> = Vec::new();
     let mut constants: Vec<(String, String)> = Vec::new();
     let mut emitted: std::collections::HashSet<String> = std::collections::HashSet::new();
+    // A macro that shares a C function's name is that function's alias in
+    // the header's own source; the function's real signature wins, and the
+    // macro says so rather than spelling a second function of one name.
+    let declared_functions: std::collections::HashSet<&str> = decls
+        .iter()
+        .filter_map(|decl| match decl {
+            CDecl::Function(function) => Some(function.name.as_str()),
+            _ => None,
+        })
+        .collect();
     let ctx = Ctx::new(decls);
     for decl in decls {
         match decl {
@@ -98,8 +108,34 @@ fn spell_with(
                 });
             }
             CDecl::Macro(macro_value) => {
-                if let Some(text) = spell_macro(macro_value) {
-                    keep(&mut emitted, &mut constants, macro_value.name.clone(), text);
+                if matches!(&macro_value.value, MacroValue::Function { .. })
+                    && declared_functions.contains(macro_value.name.as_str())
+                {
+                    missed.push(crate::Skipped {
+                        name: macro_value.name.clone(),
+                        reason: "a C function of this name outranks the macro".to_string(),
+                    });
+                    continue;
+                }
+                match spell_macro(macro_value) {
+                    Some(text) => {
+                        keep(&mut emitted, &mut constants, macro_value.name.clone(), text);
+                    }
+                    None => missed.push(crate::Skipped {
+                        name: macro_value.name.clone(),
+                        reason: match &macro_value.value {
+                            MacroValue::Function { params, .. } => {
+                                if params.is_empty() {
+                                    "a macro function with no parameters has no type to infer"
+                                        .to_string()
+                                } else {
+                                    "the macro body is more than an expression over its parameters"
+                                        .to_string()
+                                }
+                            }
+                            _ => "the macro does not fold to a constant".to_string(),
+                        },
+                    }),
                 }
             }
         }
@@ -413,6 +449,120 @@ fn spell_macro(macro_value: &crate::CMacro) -> Option<String> {
             safe(&macro_value.name),
             text
         )),
+        MacroValue::Function { params, body } => {
+            if params.is_empty() || !is_plain_name(&macro_value.name) {
+                return None;
+            }
+            let expression = macro_expression(body, params)?;
+            let written: Vec<String> = (0..params.len()).map(|at| format!("__p{at}: T")).collect();
+            Some(format!(
+                "fn {}<T>({}) -> T {{\n    return {expression};\n}}",
+                safe(&macro_value.name),
+                written.join(", ")
+            ))
+        }
+    }
+}
+
+/// Write a function-like macro's body as a Dux expression: parameters
+/// become positional generic slots, literals keep their values, and the
+/// operators are the ones Dux speaks. Anything the language has no
+/// spelling for - a call, a cast, `sizeof`, a bitwise operator, a name
+/// that is not a parameter - is not an expression, and the macro waits.
+type MacroPieces<'a> = std::iter::Peekable<std::slice::Iter<'a, &'a str>>;
+
+fn macro_expression(body: &[String], params: &[String]) -> Option<String> {
+    let pieces: Vec<&str> = body.iter().map(String::as_str).collect();
+    let mut peek = pieces.iter().peekable();
+    let written = macro_conditional(&mut peek, params)?;
+    peek.peek().is_none().then_some(written)
+}
+
+fn macro_conditional(peek: &mut MacroPieces<'_>, params: &[String]) -> Option<String> {
+    let test = macro_binary(peek, params, &["||"], macro_and)?;
+    if peek.peek().copied().copied() != Some("?") {
+        return Some(test);
+    }
+    peek.next()?;
+    let arm = macro_conditional(peek, params)?;
+    if peek.next().copied() != Some(":") {
+        return None;
+    }
+    let otherwise = macro_conditional(peek, params)?;
+    Some(format!("if {test} {{ {arm} }} else {{ {otherwise} }}"))
+}
+
+fn macro_and(peek: &mut MacroPieces<'_>, params: &[String]) -> Option<String> {
+    macro_binary(peek, params, &["&&"], macro_equality)
+}
+
+fn macro_equality(peek: &mut MacroPieces<'_>, params: &[String]) -> Option<String> {
+    macro_binary(peek, params, &["==", "!="], macro_relation)
+}
+
+fn macro_relation(peek: &mut MacroPieces<'_>, params: &[String]) -> Option<String> {
+    macro_binary(peek, params, &["<", "<=", ">", ">="], macro_additive)
+}
+
+fn macro_additive(peek: &mut MacroPieces<'_>, params: &[String]) -> Option<String> {
+    macro_binary(peek, params, &["+", "-"], macro_multiplicative)
+}
+
+fn macro_multiplicative(peek: &mut MacroPieces<'_>, params: &[String]) -> Option<String> {
+    macro_binary(peek, params, &["*", "/", "%"], macro_unary)
+}
+
+fn macro_binary(
+    peek: &mut MacroPieces<'_>,
+    params: &[String],
+    operators: &[&str],
+    below: fn(&mut MacroPieces<'_>, &[String]) -> Option<String>,
+) -> Option<String> {
+    let mut left = below(peek, params)?;
+    while let Some(operator) = peek
+        .peek()
+        .copied()
+        .copied()
+        .filter(|piece| operators.contains(piece))
+    {
+        peek.next()?;
+        let right = below(peek, params)?;
+        left = format!("({left} {operator} {right})");
+    }
+    Some(left)
+}
+
+fn macro_unary(peek: &mut MacroPieces<'_>, params: &[String]) -> Option<String> {
+    match peek.peek().copied().copied() {
+        Some(operator @ ("-" | "+" | "!")) => {
+            peek.next()?;
+            let inner = macro_unary(peek, params)?;
+            Some(format!("({operator}{inner})"))
+        }
+        _ => macro_atom(peek, params),
+    }
+}
+
+fn macro_atom(peek: &mut MacroPieces<'_>, params: &[String]) -> Option<String> {
+    let piece = peek.next()?;
+    if *piece == "(" {
+        let inside = macro_conditional(peek, params)?;
+        if peek.next().copied() == Some(")") {
+            Some(inside)
+        } else {
+            None
+        }
+    } else if let Some(at) = params.iter().position(|param| param == piece) {
+        Some(format!("__p{at}"))
+    } else {
+        match crate::walk::literal(piece)? {
+            MacroValue::Int(value) => Some(value.to_string()),
+            MacroValue::Float(value) if value.fract() == 0.0 && value.is_finite() => {
+                Some(format!("{value}.0"))
+            }
+            MacroValue::Float(value) => Some(format!("{value}")),
+            MacroValue::Text(_) | MacroValue::Function { .. } => None,
+        }
     }
 }
 

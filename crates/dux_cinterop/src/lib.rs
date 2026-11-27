@@ -138,6 +138,14 @@ pub enum MacroValue {
     Int(i128),
     Float(f64),
     Text(String),
+    /// A function-like macro: the parameter names and the tokens of the
+    /// body, exactly as the header wrote them. Whether that body is
+    /// something Dux can write as a function is the spelling layer's
+    /// decision, not the walker's.
+    Function {
+        params: Vec<String>,
+        body: Vec<String>,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq)]

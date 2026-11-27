@@ -140,8 +140,12 @@ fn the_mapping_table_crosses_what_it_promises() {
     assert!(text.contains("const DUX_TAG: string = \"dux\""), "{text}");
     assert!(text.contains("const DUX_RATIO: f64 = 1.5"), "{text}");
     assert!(
-        !text.contains("DUX_DOUBLED"),
-        "function-like macros wait:\n{text}"
+        text.contains("fn DUX_DOUBLED<T>(__p0: T) -> T"),
+        "a function-like macro crosses as a generic function:\n{text}"
+    );
+    assert!(
+        text.contains("return (__p0 * 2);"),
+        "the body is the macro's own arithmetic, in Dux:\n{text}"
     );
     assert!(text.contains("type time_like = c_long"), "{text}");
     assert!(text.contains("struct point {"), "{text}");
@@ -256,10 +260,6 @@ fn nothing_that_did_not_cross_is_quietly_waiting() {
             .iter()
             .any(|skip| skip.name == "score" && skip.reason.contains("union")),
         "and it says why: {missed:?}"
-    );
-    assert!(
-        named("DUX_DOUBLED"),
-        "a function-like macro is named, not hidden: {missed:?}"
     );
     assert!(
         named("dux_counter"),

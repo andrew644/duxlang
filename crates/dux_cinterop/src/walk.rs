@@ -142,7 +142,7 @@ extern "C" fn visit(cursor: CXCursor, _parent: CXCursor, data: CXClientData) -> 
                 Some(value) => Some(CDecl::Macro(CMacro { name: named, value })),
                 None => {
                     let why = if unsafe { clang::clang_Cursor_isMacroFunctionLike(cursor) } != 0 {
-                        "function-like macros are still waiting"
+                        "its parameter list is not a list of names"
                     } else {
                         "the macro does not fold to a constant"
                     };
@@ -334,11 +334,62 @@ extern "C" fn collect_constants(
 
 fn macro_value(unit: CXTranslationUnit, cursor: CXCursor, _named: &str) -> Option<MacroValue> {
     let extent = unsafe { clang::clang_getCursorExtent(cursor) };
-    if (unsafe { clang::clang_Cursor_isMacroFunctionLike(cursor) }) != 0 {
-        return None;
-    }
     let tokens = tokenize(unit, extent);
+    if (unsafe { clang::clang_Cursor_isMacroFunctionLike(cursor) }) != 0 {
+        return function_macro_shape(&tokens);
+    }
     fold(tokens.iter().map(String::as_str).skip(1))
+}
+
+/// A function-like macro definition reads `NAME ( params ) body`; the
+/// parameter names and the body tokens travel on, and the spelling layer
+/// decides whether the body is a Dux expression. A variadic macro (`...`
+/// among the parameters) has no list to hand on.
+fn function_macro_shape(tokens: &[String]) -> Option<MacroValue> {
+    let piece = |at: usize| {
+        tokens
+            .get(at)
+            .map(String::as_str)
+            .filter(|one| *one != "\u{0}")
+    };
+    let open = match piece(1)? {
+        "(" => 2,
+        _ => return None,
+    };
+    let mut params = Vec::new();
+    let mut at = open;
+    loop {
+        match piece(at)? {
+            ")" => {
+                at += 1;
+                break;
+            }
+            "," => {
+                at += 1;
+            }
+            one if is_identifier(one) => {
+                params.push(one.to_string());
+                at += 1;
+                if matches!(piece(at), Some(",") | Some(")")) {
+                    continue;
+                }
+                return None;
+            }
+            _ => return None,
+        }
+    }
+    let body: Vec<String> = tokens[at..]
+        .iter()
+        .filter(|one| *one != "\u{0}")
+        .map(String::to_string)
+        .collect();
+    Some(MacroValue::Function { params, body })
+}
+
+fn is_identifier(piece: &str) -> bool {
+    !piece.is_empty()
+        && !piece.starts_with(|c: char| c.is_ascii_digit())
+        && piece.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
 fn tokenize(unit: CXTranslationUnit, extent: clang::CXSourceRange) -> Vec<String> {
@@ -458,7 +509,7 @@ fn atom<'a>(peek: &mut std::iter::Peekable<std::slice::Iter<'a, &'a str>>) -> Op
     }
 }
 
-fn literal(piece: &str) -> Option<MacroValue> {
+pub(crate) fn literal(piece: &str) -> Option<MacroValue> {
     let bytes = piece.as_bytes();
     if bytes.len() >= 2
         && (bytes[0] == b'"' || bytes[0] == b'\'')

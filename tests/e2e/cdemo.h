@@ -11,3 +11,5 @@ enum shade {
 };
 
 #define CDEMO_LIMIT 42
+
+#define CD_DOUBLE(x) ((x) * 2)
