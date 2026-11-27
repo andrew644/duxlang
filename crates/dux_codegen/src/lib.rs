@@ -38,12 +38,45 @@ impl OptLevel {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BoundsCheck {
+    /// Check in a debug build and stand aside in a release one.
+    Auto,
+    On,
+    Off,
+}
+
+impl BoundsCheck {
+    pub fn parse(word: &str) -> Option<BoundsCheck> {
+        match word {
+            "auto" => Some(BoundsCheck::Auto),
+            "on" => Some(BoundsCheck::On),
+            "off" => Some(BoundsCheck::Off),
+            _ => None,
+        }
+    }
+
+    /// Whether the running program stops at an index that lands outside its
+    /// view. `Auto` follows the build: a debug build checks, a release one
+    /// trusts the index the compiler cannot see.
+    pub fn enabled(self, debug: bool) -> bool {
+        match self {
+            BoundsCheck::Auto => debug,
+            BoundsCheck::On => true,
+            BoundsCheck::Off => false,
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct Options {
     pub opt_level: OptLevel,
     /// Head every allocation with bookkeeping so a double free is trapped and
     /// unreleased memory is reported at exit. Off in a release build.
     pub debug_allocator: bool,
+    /// Stop the program where an index lands outside its array, slice, or
+    /// string, naming the source line the index was written on.
+    pub bounds_checks: bool,
     /// Compiled C translation units, as LLVM bitcode, linked into the module
     /// before lowering begins. The `#[c_include]` road delivers definitions
     /// this way: what clang compiled is part of the program, not something
@@ -56,6 +89,7 @@ impl Default for Options {
         Self {
             opt_level: OptLevel::None,
             debug_allocator: true,
+            bounds_checks: true,
             bitcode: Vec::new(),
         }
     }
@@ -133,6 +167,7 @@ impl CompiledModule {
         select_main(program)?;
         let mut emitter = Emitter::new(context, sources.clone());
         emitter.debug_allocator = options.debug_allocator;
+        emitter.bounds_checks = options.bounds_checks;
         let diagnostics = emitter.lower(&module, program);
         if !diagnostics.is_empty() {
             return Err(diagnostics);

@@ -1,0 +1,13 @@
+//@exit 2
+//@stderr index out of bounds
+// An index that lands outside its view stops the debug build where the rule
+// broke; the trap message names the line the index was written on.
+
+package main
+
+fn main() {
+    xs: [i64; 3] = [10, 20, 30]
+    i := 3
+    println($"{xs[i]}")
+    println("unreachable")
+}

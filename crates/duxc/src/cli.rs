@@ -1,6 +1,8 @@
 use std::ffi::OsString;
 use std::path::PathBuf;
 
+use dux_driver::BoundsCheck;
+
 pub const USAGE: &str = "\
 dux — a small systems language for games
 
@@ -19,6 +21,8 @@ OPTIONS:
     -o <path>         write the result to <path>
     --out-dir <dir>   scratch directory for objects (default: .dux-cache)
     --release         optimise (default<O2>) instead of -O0
+    -bounds-check=on|off|auto
+                      stop at an out-of-bounds index (auto: debug builds only)
     --emit=ir         write textual LLVM IR instead of linking
     --emit=ast        write the parsed AST dump instead of linking
     --emit=obj        keep the object file
@@ -48,12 +52,14 @@ pub enum Command {
         out: Option<PathBuf>,
         out_dir: PathBuf,
         release: bool,
+        bounds_check: BoundsCheck,
         emit: Emit,
     },
     Run {
         file: PathBuf,
         out_dir: PathBuf,
         release: bool,
+        bounds_check: BoundsCheck,
         args: Vec<String>,
     },
     Fmt {
@@ -72,6 +78,7 @@ pub enum UsageError {
     UnknownCommand(String),
     MissingFile(&'static str),
     BadEmit(String),
+    BadBounds(String),
     MissingValue(String),
     ExpectedOption(String),
 }
@@ -86,6 +93,9 @@ impl UsageError {
             }
             UsageError::BadEmit(value) => {
                 format!("`--emit={value}` is not one of ast, ir, obj, exe")
+            }
+            UsageError::BadBounds(value) => {
+                format!("`-bounds-check={value}` is not one of auto, on, off")
             }
             UsageError::MissingValue(option) => format!("`{option}` expects a value"),
             UsageError::ExpectedOption(text) => format!("unexpected argument `{text}`"),
@@ -114,6 +124,7 @@ pub fn parse<I: IntoIterator<Item = OsString>>(argv: I) -> Result<Command, Usage
             let mut out = None;
             let mut out_dir = PathBuf::from(dux_defaults::OUT_DIR);
             let mut release = false;
+            let mut bounds_check = BoundsCheck::Auto;
             let mut emit = Emit::Exe;
             let mut index = 0;
             while index < rest.len() {
@@ -124,6 +135,9 @@ pub fn parse<I: IntoIterator<Item = OsString>>(argv: I) -> Result<Command, Usage
                     "--out-dir" => out_dir = PathBuf::from(value(rest, &mut index, "--out-dir")?),
                     "--release" => release = true,
                     "--help" | "-h" => return Ok(Command::Help),
+                    other if is_bounds_check(other) => {
+                        bounds_check = parse_bounds_check(other)?
+                    }
                     other if other.starts_with("--emit=") => {
                         emit = match other.trim_start_matches("--emit=") {
                             "ir" | "llvm-ir" => Emit::Ir,
@@ -149,6 +163,7 @@ pub fn parse<I: IntoIterator<Item = OsString>>(argv: I) -> Result<Command, Usage
                 out,
                 out_dir,
                 release,
+                bounds_check,
                 emit,
             })
         }
@@ -156,6 +171,7 @@ pub fn parse<I: IntoIterator<Item = OsString>>(argv: I) -> Result<Command, Usage
             let mut file = None;
             let mut out_dir = PathBuf::from(dux_defaults::OUT_DIR);
             let mut release = false;
+            let mut bounds_check = BoundsCheck::Auto;
             let mut args = Vec::new();
             let mut index = 0;
             while index < rest.len() {
@@ -168,6 +184,9 @@ pub fn parse<I: IntoIterator<Item = OsString>>(argv: I) -> Result<Command, Usage
                 match arg {
                     "--out-dir" => out_dir = PathBuf::from(value(rest, &mut index, "--out-dir")?),
                     "--release" => release = true,
+                    other if is_bounds_check(other) => {
+                        bounds_check = parse_bounds_check(other)?
+                    }
                     other if file.is_none() && !other.starts_with('-') => {
                         file = Some(PathBuf::from(other))
                     }
@@ -178,6 +197,7 @@ pub fn parse<I: IntoIterator<Item = OsString>>(argv: I) -> Result<Command, Usage
                 file: file.ok_or(UsageError::MissingFile("run"))?,
                 out_dir,
                 release,
+                bounds_check,
                 args,
             })
         }
@@ -233,6 +253,17 @@ fn value(rest: &[String], index: &mut usize, option: &str) -> Result<String, Usa
     Ok(taken)
 }
 
+fn is_bounds_check(arg: &str) -> bool {
+    arg == "-bounds-check" || arg.starts_with("-bounds-check=")
+}
+
+fn parse_bounds_check(arg: &str) -> Result<BoundsCheck, UsageError> {
+    let word = arg
+        .split_once('=')
+        .map_or("", |(_, word)| word);
+    BoundsCheck::parse(word).ok_or_else(|| UsageError::BadBounds(word.to_string()))
+}
+
 pub mod dux_defaults {
     pub const OUT_DIR: &str = ".dux-cache";
 }
@@ -274,6 +305,7 @@ mod tests {
                 out: None,
                 out_dir: PathBuf::from(".dux-cache"),
                 release: false,
+                bounds_check: BoundsCheck::Auto,
                 emit: Emit::Ast,
             })
         );
@@ -295,6 +327,7 @@ mod tests {
                 out: Some(PathBuf::from("out/app")),
                 out_dir: PathBuf::from(".dux-cache"),
                 release: true,
+                bounds_check: BoundsCheck::Auto,
                 emit: Emit::Object,
             })
         );
@@ -309,6 +342,7 @@ mod tests {
                 out: None,
                 out_dir: PathBuf::from(".dux-cache"),
                 release: false,
+                bounds_check: BoundsCheck::Auto,
                 emit: Emit::Exe,
             }
         );
@@ -328,6 +362,31 @@ mod tests {
         };
         assert_eq!(file, PathBuf::from("app.dux"));
         assert_eq!(args, vec!["-x", "--release", "tail"]);
+    }
+
+    #[test]
+    fn bounds_check_parses_and_rejects_nonsense() {
+        let Command::Run { bounds_check, .. } =
+            parse(argv(&["run", "app.dux", "-bounds-check=on"])).unwrap()
+        else {
+            panic!("expected run");
+        };
+        assert_eq!(bounds_check, BoundsCheck::On);
+        assert_eq!(
+            parse(argv(&["build", "app.dux", "-bounds-check=off"])),
+            Ok(Command::Build {
+                file: PathBuf::from("app.dux"),
+                out: None,
+                out_dir: PathBuf::from(".dux-cache"),
+                release: false,
+                bounds_check: BoundsCheck::Off,
+                emit: Emit::Exe,
+            })
+        );
+        assert_eq!(
+            parse(argv(&["run", "app.dux", "-bounds-check=wonky"])),
+            Err(UsageError::BadBounds("wonky".to_string()))
+        );
     }
 
     #[test]

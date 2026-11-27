@@ -1,7 +1,7 @@
 mod cli;
 
 use cli::{Command, Emit, USAGE};
-use dux_driver::{BuildRequest, Emit as DriverEmit, Optimization};
+use dux_driver::{BoundsCheck, BuildRequest, Emit as DriverEmit, Optimization};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -40,15 +40,25 @@ fn main() -> ExitCode {
             out,
             out_dir,
             release,
+            bounds_check,
             emit,
-        } => build(&file, out.as_deref(), &out_dir, release, emit, &mut err),
+        } => build(
+            &file,
+            out.as_deref(),
+            &out_dir,
+            release,
+            bounds_check,
+            emit,
+            &mut err,
+        ),
         Command::Run {
             file,
             out_dir,
             release,
+            bounds_check,
             args,
         } => {
-            let request = request(&file, &out_dir, release, DriverEmit::Execute);
+            let request = request(&file, &out_dir, release, bounds_check, DriverEmit::Execute);
             let mut stdout = std::io::stdout();
             match dux_driver::run(&request, &args, &mut stdout) {
                 Ok(code) => ExitCode::from(exit_of(code)),
@@ -280,6 +290,7 @@ fn build(
     out: Option<&Path>,
     out_dir: &Path,
     release: bool,
+    bounds_check: BoundsCheck,
     emit: Emit,
     err: &mut impl Write,
 ) -> ExitCode {
@@ -289,7 +300,7 @@ fn build(
         Emit::Ir => DriverEmit::LlvmIr,
         Emit::Ast => DriverEmit::Ast,
     };
-    let request = request(file, out_dir, release, driver_emit);
+    let request = request(file, out_dir, release, bounds_check, driver_emit);
     match dux_driver::build(&request, out) {
         Ok(artifact) => {
             let written = match (out, emit) {
@@ -313,12 +324,14 @@ fn request<'a>(
     file: &'a Path,
     out_dir: &Path,
     release: bool,
+    bounds_check: BoundsCheck,
     emit: DriverEmit,
 ) -> BuildRequest<'a> {
     BuildRequest {
         source: file,
         out_dir: out_dir.to_path_buf(),
         emit,
+        bounds_check,
         opt_level: if release {
             Optimization::Balanced
         } else {

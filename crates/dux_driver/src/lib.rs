@@ -6,6 +6,7 @@ use dux_source::FileId;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
+pub use dux_codegen::BoundsCheck;
 pub use dux_codegen::OptLevel as Optimization;
 pub use dux_source::SourceMap;
 
@@ -334,6 +335,7 @@ pub struct BuildRequest<'a> {
     pub out_dir: std::path::PathBuf,
     pub emit: Emit,
     pub opt_level: OptLevel,
+    pub bounds_check: BoundsCheck,
 }
 
 #[derive(Debug)]
@@ -355,6 +357,9 @@ fn compile(request: &BuildRequest) -> Result<(Analyzed, CompiledModule, BuiltArt
     let bitcode = build_c_bitcode(&analyzed.c_units, &request.out_dir)?;
     let options = Options {
         debug_allocator: request.opt_level == dux_codegen::OptLevel::None,
+        bounds_checks: request
+            .bounds_check
+            .enabled(request.opt_level == dux_codegen::OptLevel::None),
         opt_level: request.opt_level,
         bitcode,
     };

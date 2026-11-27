@@ -499,6 +499,28 @@ fn missing_return_on_one_path_is_reported() {
 }
 
 #[test]
+fn bounds_checks_wrap_indexing_and_can_stand_aside() {
+    let source = "package main\nfn at(xs: []i64, i: i64) -> i64 {\n    return xs[i]\n}\nfn main() {\n    xs: [i64; 3] = [1, 2, 3]\n    println($\"{at(xs[0..3], 1)}\")\n}";
+    let checked = build(source).expect("the checked build compiles");
+    assert!(
+        checked.ir_text().contains("index out of bounds"),
+        "a debug build stops at an index that lands outside"
+    );
+    let unchecked = build_with(
+        source,
+        Options {
+            bounds_checks: false,
+            ..Options::default()
+        },
+    )
+    .expect("the unchecked build compiles");
+    assert!(
+        !unchecked.ir_text().contains("index out of bounds"),
+        "standing aside removes the trap"
+    );
+}
+
+#[test]
 fn milestone_gaps_report_e0007_with_the_milestone_in_the_message() {
     let cases = [
         (

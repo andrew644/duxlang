@@ -930,6 +930,9 @@ pub(crate) struct Emitter {
     hash: Option<HashRuntime>,
     /// Head allocations with bookkeeping and report leaks at exit.
     pub(crate) debug_allocator: bool,
+    /// Stop the program where an index lands outside its array, slice, or
+    /// string, naming the line the index was written on.
+    pub(crate) bounds_checks: bool,
     /// Functions that carry the hidden `context` parameter: the ones that
     /// allocate, directly or through a call.
     allocating: HashSet<String>,
@@ -999,6 +1002,7 @@ impl Emitter {
             runtime: None,
             hash: None,
             debug_allocator: true,
+            bounds_checks: true,
             allocating: HashSet::new(),
             context_slot: None,
             context_saves: Vec::new(),
@@ -3687,6 +3691,52 @@ impl Emitter {
         self.dead = true;
     }
 
+    /// The debug bounds check: when the answer says the index landed outside
+    /// its view, the program stops where it broke the rule, and the message
+    /// names the line the index was written on. A checked index stays whole
+    /// for the paths that stay inside.
+    fn bounds_guard(
+        &mut self,
+        module: &Module<'static>,
+        within: IntValue<'static>,
+        span: Span,
+        what: &str,
+    ) {
+        if !self.bounds_checks || self.dead {
+            return;
+        }
+        let carries_on = self.new_block("bounds.ok");
+        let broken = self.new_block("bounds.trap");
+        if self
+            .builder
+            .build_conditional_branch(within, carries_on, broken)
+            .is_err()
+        {
+            return;
+        }
+        self.builder.position_at_end(broken);
+        let file = self.sources.name_of(span.file).to_string();
+        let line = self.sources.line_col(span.file, span.start).0;
+        self.trap(
+            module,
+            &format!("dux: {what} out of bounds at {file}:{line}\n"),
+        );
+        self.builder.position_at_end(carries_on);
+        self.dead = false;
+    }
+
+    /// `index < len`, unsigned: a negative index is a very large one and
+    /// lands outside like any other.
+    fn index_reaches_into(
+        &mut self,
+        index: IntValue<'static>,
+        len: IntValue<'static>,
+    ) -> Option<IntValue<'static>> {
+        self.builder
+            .build_int_compare(IntPredicate::ULT, index, len, "within")
+            .ok()
+    }
+
     /// A block that rebinds `context` gets the outer value back on exit, so
     /// `context = arena.ctx()` lasts exactly as long as the block that wrote
     /// it. The saved pointer lives in the entry block, where every slot of the
@@ -5322,12 +5372,16 @@ impl Emitter {
                 );
                 return None;
             }
-            let (_, data, _) = self.view_elements(base)?;
+            let (_, data, text_len) = self.view_elements(base)?;
             let index_value = self.expr(module, index, None)?;
             if index_value.ty == DuxType::Error {
                 return None;
             }
             let index64 = self.index_to_i64(index_value, index.span())?;
+            let within = self.index_reaches_into(index64.int_value()?, text_len);
+            if let Some(within) = within {
+                self.bounds_guard(module, within, index.span(), "byte index");
+            }
             let at = unsafe {
                 self.builder.build_gep(
                     DuxType::U8.llvm(self.context),
@@ -5340,12 +5394,16 @@ impl Emitter {
             return Some((DuxType::U8, at));
         }
         if let Some(element) = base.ty.slice_element() {
-            let (data, _) = self.slice_parts(base)?;
+            let (data, len) = self.slice_parts(base)?;
             let index_value = self.expr(module, index, None)?;
             if index_value.ty == DuxType::Error {
                 return None;
             }
             let index64 = self.index_to_i64(index_value, index.span())?;
+            let within = self.index_reaches_into(index64.int_value()?, len);
+            if let Some(within) = within {
+                self.bounds_guard(module, within, index.span(), "index");
+            }
             let at = unsafe {
                 self.builder.build_gep(
                     element.llvm(self.context),
@@ -5383,6 +5441,11 @@ impl Emitter {
         let index64 = self.index_to_i64(index_value, index.span())?;
         let at = if is_array {
             let info = base.ty.array_info()?;
+            let count = self.context.i64_type().const_int(info.len, false);
+            let within = self.index_reaches_into(index64.int_value()?, count);
+            if let Some(within) = within {
+                self.bounds_guard(module, within, index.span(), "index");
+            }
             let array_ty = info.elem.llvm(self.context).array_type(info.len as u32);
             let zero = self.context.i64_type().const_zero();
             unsafe {
@@ -6144,6 +6207,18 @@ impl Emitter {
         };
         let from = from.int_value()?;
         let to = to.int_value()?;
+        if self.bounds_checks {
+            let in_order = self
+                .builder
+                .build_int_compare(IntPredicate::ULE, from, to, "order")
+                .ok()?;
+            let inside = self
+                .builder
+                .build_int_compare(IntPredicate::ULE, to, len, "inside")
+                .ok()?;
+            let within = self.builder.build_and(in_order, inside, "within").ok()?;
+            self.bounds_guard(module, within, range.span(), "index range");
+        }
         let data = unsafe {
             self.builder
                 .build_gep(element.llvm(self.context), data, &[from], "view.head")
@@ -7692,8 +7767,12 @@ impl Emitter {
         lhs: &Expr,
         rhs: &Expr,
     ) -> Option<Typed> {
-        let start = self.builder.get_insert_block()?;
         let left = self.condition(module, lhs);
+        // `left` lives wherever its evaluation came to rest: a bounds check
+        // inside the left condition opens a fresh block, and the branch that
+        // consumes `left` is written there, so that block is the predecessor
+        // the phi sees — not the block the short-circuit began in.
+        let left_block = self.builder.get_insert_block()?;
         let rhs_block = self.new_block("sc.rhs");
         let done = self.new_block("sc.done");
         if op == BinaryOp::And {
@@ -7710,7 +7789,7 @@ impl Emitter {
             .builder
             .build_phi(self.context.bool_type(), "sc.result")
             .ok()?;
-        phi.add_incoming(&[(&left, start), (&right, right_block)]);
+        phi.add_incoming(&[(&left, left_block), (&right, right_block)]);
         Some(Typed::int(
             phi.as_basic_value().into_int_value(),
             DuxType::Bool,
