@@ -5,6 +5,7 @@ const FIXTURE_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../tests/e2e"
 const EXAMPLE_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../example");
 const SCRATCH_DIR: &str = env!("CARGO_TARGET_TMPDIR");
 const TESTSRC_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../tests/testsrc");
+const PROJECTS_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../tests/projects");
 
 #[derive(Debug)]
 struct Spec {
@@ -586,6 +587,55 @@ fn dux_test(tag: &str, args: &[&str]) -> (String, String, i32) {
         String::from_utf8_lossy(&run.stderr).into_owned(),
         run.status.code().unwrap_or(-1),
     )
+}
+
+#[test]
+fn a_manifest_grows_the_module_roots_and_vouches_for_its_cdeps() {
+    let project = Path::new(PROJECTS_DIR).join("adventure");
+    let out_dir = Path::new(SCRATCH_DIR).join("manifest-project");
+    let _ = std::fs::remove_dir_all(&out_dir);
+    let run = Command::new(env!("CARGO_BIN_EXE_duxc"))
+        .arg("run")
+        .arg(&project)
+        .arg("--out-dir")
+        .arg(&out_dir)
+        .output()
+        .expect("the compiler runs");
+    assert_eq!(
+        run.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&run.stdout),
+        "hello adventure bytes=15\nroom=28 bound=57\n",
+        "the vendored module and the manifest's zlib both answered"
+    );
+}
+
+#[test]
+fn a_manifest_that_vouches_for_a_missing_package_says_so() {
+    let project = Path::new(PROJECTS_DIR).join("stray");
+    let out_dir = Path::new(SCRATCH_DIR).join("manifest-stray");
+    let _ = std::fs::remove_dir_all(&out_dir);
+    let run = Command::new(env!("CARGO_BIN_EXE_duxc"))
+        .arg("run")
+        .arg(&project)
+        .arg("--out-dir")
+        .arg(&out_dir)
+        .output()
+        .expect("the compiler runs");
+    assert_ne!(run.status.code(), Some(0));
+    let said = String::from_utf8_lossy(&run.stderr).into_owned();
+    assert!(
+        said.contains("definitely-not-a-package"),
+        "the manifest's promise is what failed: {said}"
+    );
+    assert!(
+        !said.contains("should not get here"),
+        "the program never ran: {said}"
+    );
 }
 
 #[test]

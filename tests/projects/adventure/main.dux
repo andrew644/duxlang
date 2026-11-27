@@ -1,0 +1,19 @@
+package main
+
+// The manifest found `greet` a directory away and vouched for zlib: no
+// per-module `#[c_pkgconfig]` is written below, yet the header is found,
+// the -D it asks for is said, and -lz reaches the link.
+
+import "greet"
+
+#[c_include("zlib.h")]
+mod z;
+
+fn main() {
+    word := greet.hello("adventure")
+    room := z.compressBound(word.bytes().len() as c_ulong)
+    bound := z.compressBound(greet.twice(21) as c_ulong)
+    println($"{word} bytes={}", word.bytes().len())
+    println($"room={room} bound={}", bound)
+    del(word)
+}

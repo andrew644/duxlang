@@ -1,0 +1,9 @@
+// A vendored module: the manifest lends its directory to the module roots,
+// and `import "greet"` finds it a directory away from the program.
+fn hello(name: string) -> string {
+    return $"hello {name}"
+}
+
+fn twice(n: i32) -> i32 {
+    return n + n
+}

@@ -4,7 +4,10 @@ use dux_ast::{
 use dux_codegen::{CompiledModule, OptLevel, Options};
 use dux_diag::{code, render, Diagnostic, Severity};
 use dux_parser::parse;
+pub mod manifest;
+
 use dux_source::{FileId, Span};
+pub use manifest::{find_manifest, parse_manifest, Manifest};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
@@ -84,6 +87,7 @@ pub fn report(sources: &SourceMap, diagnostics: &[Diagnostic], stderr: &mut impl
 }
 
 pub fn analyze(path: &std::path::Path) -> Result<Analyzed, Failure> {
+    let path = &entry_file(path);
     let text = std::fs::read_to_string(path).map_err(|e| {
         Failure::bare(vec![Diagnostic::error(
             code::SOURCE_IO,
@@ -119,6 +123,13 @@ pub fn analyze(path: &std::path::Path) -> Result<Analyzed, Failure> {
         &mut diagnostics,
         &mut c_namespaces,
     );
+    if let Some((_, manifest)) = find_manifest(path) {
+        for package in manifest.cdep_packages() {
+            if let Err(diagnostic) = pkg_config(package, "cflags") {
+                diagnostics.push(diagnostic);
+            }
+        }
+    }
     let syntax_clean = diagnostics
         .iter()
         .all(|d| d.severity != Severity::Error || d.code == code::UNSUPPORTED_IN_BUILD);
@@ -178,17 +189,36 @@ fn read_prelude(
 }
 
 /// Where `import "a/b"` looks: a module path is resolved against the module
-/// root — every directory above the file that was named, nearest first — and
-/// then against the standard library root, which `$DUX_STDLIB` names.
+/// root — every directory above the file that was named, nearest first; the
+/// `[deps]` directories of the nearest `dux.mod`, wherever it lives; and the
+/// standard library root, which `$DUX_STDLIB` names.
 pub fn module_roots(entry: &Path) -> Vec<PathBuf> {
     let mut roots: Vec<PathBuf> = entry
         .parent()
         .map(|dir| dir.ancestors().map(|root| root.to_path_buf()).collect())
         .unwrap_or_default();
+    if let Some((at, manifest)) = find_manifest(entry) {
+        let home = at.parent().unwrap_or(Path::new("."));
+        for root in manifest.dep_roots(home) {
+            if !roots.contains(&root) {
+                roots.push(root);
+            }
+        }
+    }
     if let Some(library) = std::env::var_os("DUX_STDLIB") {
         roots.push(PathBuf::from(library));
     }
     roots
+}
+
+/// A program may be named by its file or by its directory; a directory is
+/// entered through `main.dux`.
+fn entry_file(path: &Path) -> PathBuf {
+    if path.is_dir() {
+        path.join("main.dux")
+    } else {
+        path.to_path_buf()
+    }
 }
 
 /// The module every program is read on top of.
@@ -435,7 +465,7 @@ pub fn build(
             }
         }
         Emit::Execute => {
-            link(&artifact, &libraries(&analyzed.program))?;
+            link(&artifact, &libraries(&analyzed.program, request.source))?;
             if let Some(path) = out_override {
                 std::fs::copy(&artifact.executable, path).map_err(|e| io_failure(path, e))?;
             }
@@ -570,7 +600,7 @@ pub fn run_tests(
             }
         };
         let artifact = package(&module, &request, &format!("{stem}-{name}"))?;
-        link(&artifact, &libraries(&program))?;
+        link(&artifact, &libraries(&program, source))?;
         let output = std::process::Command::new(&artifact.executable)
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
@@ -901,13 +931,24 @@ fn fill_c_modules(
             .map(|flag| flag.to_string())
             .collect();
         let mut include_paths = vec![home.to_string_lossy().into_owned()];
-        for package in module
+        let mut packages: Vec<String> = module
             .attributes
             .iter()
             .filter(|attribute| attribute.name == "c_pkgconfig")
             .filter_map(|attribute| attribute.string_argument())
-        {
-            match pkg_config(package, "cflags") {
+            .map(|package| package.to_string())
+            .collect();
+        // A `[cdeps]` in the manifest is the program saying what it assumes
+        // about C once, for every header the program imports.
+        if let Some((_, manifest)) = find_manifest(entry) {
+            for package in manifest.cdep_packages() {
+                if !packages.contains(&package.to_string()) {
+                    packages.push(package.to_string());
+                }
+            }
+        }
+        for package in packages {
+            match pkg_config(&package, "cflags") {
                 Ok(tokens) => {
                     for token in tokens {
                         if let Some(dir) = token.strip_prefix("-I") {
@@ -978,7 +1019,7 @@ fn fill_c_modules(
 
 /// The libraries the program's `extern` blocks asked for, in the order they
 /// were declared and named once each.
-fn libraries(program: &Program) -> Vec<String> {
+fn libraries(program: &Program, entry: &Path) -> Vec<String> {
     let mut named: Vec<String> = Vec::new();
     for entry in program.scoped() {
         let Decl::Extern(block) = entry.decl else {
@@ -1027,6 +1068,17 @@ fn libraries(program: &Program) -> Vec<String> {
             }
         }
     }
+    if let Some((_, manifest)) = find_manifest(entry) {
+        for package in manifest.cdep_packages() {
+            if let Ok(tokens) = pkg_config(package, "libs") {
+                for token in tokens {
+                    if !named.contains(&token) {
+                        named.push(token);
+                    }
+                }
+            }
+        }
+    }
     named
 }
 
@@ -1035,7 +1087,7 @@ fn linker_command() -> String {
 }
 
 fn output_stem(source: &std::path::Path) -> String {
-    source
+    entry_file(source)
         .file_stem()
         .map(|s| s.to_string_lossy().to_string())
         .unwrap_or_else(|| "dux_program".to_string())
